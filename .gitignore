@@ -1,3 +1,46 @@
-target/
-dist/
-build.log
+# Kết quả build của Rust. `target` có thể là thư mục thật hoặc một lối tắt sang ổ khác,
+# nên không ghi dấu / ở cuối.
+/target
+**/*.rs.bk
+*.pdb
+
+# Bản chạy được, và những gì Bến tự ghi ra cạnh ben.exe: cài đặt, nhật ký, trạng thái
+# taskbar, danh sách ứng dụng ghim (có đường dẫn trên máy của từng người).
+/dist/
+*.exe
+ben.ini
+ben-*.ini
+pins.txt
+*.state
+
+# Nhật ký (của Bến, của build.bat) và file tạm.
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Ảnh chụp màn hình lỡ lưu ở thư mục gốc. Ảnh cho tài liệu để trong docs/.
+/*.png
+/*.jpg
+/*.jpeg
+
+# Trình soạn thảo và hệ điều hành.
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Cài đặt riêng từng máy của trợ lý lập trình.
+.claude/settings.local.json
+.claude/worktrees/
+
+# Không bao giờ đưa lên: biến môi trường, khoá, chứng thư ký số.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
