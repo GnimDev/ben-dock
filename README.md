@@ -15,7 +15,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
   - Bottom-left, **weather:** temperature and sky for where the computer is. The location, rounded to about 10 km, is sent to Open-Meteo.
   - Bottom-right, **system:** CPU and memory in use. Click the very corner of the screen to show the desktop.
 - **Floating windows:** new windows open centered at up to 70% of the screen instead of maximized.
-- **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon.
+- **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon, and when you minimize a window with its own button or the keyboard.
 - **Themes:** four glass materials, light/dark mode, accent tint.
 - **Multiple monitors:** each monitor gets its own dock and island.
 

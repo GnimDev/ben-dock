@@ -628,6 +628,11 @@ pub struct App {
     fx: Option<Fx>,
     /// After a restore effect ends, how long to keep its picture up while the real window appears.
     fx_release: Option<Release>,
+    /// Whether Windows' own minimise animation is on (true) or switched off (false) for each
+    /// open window, as the app last set it (see `keep_windows_still`), and the window the
+    /// effect was playing for then.
+    transitions: HashMap<isize, bool>,
+    fx_busy: Option<isize>,
 
     tracker: WindowTracker,
     taskbar: Taskbar,
@@ -748,6 +753,8 @@ impl App {
             preview_screen: 0,
             fx: None,
             fx_release: None,
+            transitions: HashMap::new(),
+            fx_busy: None,
             tracker: WindowTracker::default(),
             taskbar: Taskbar::new(),
             tracking_mouse: 0,
@@ -1245,12 +1252,17 @@ impl App {
                 let window = HWND(id as *mut _);
                 // Unless the app started this minimise itself (then its own effect is playing).
                 if self.fx.as_ref().and_then(|f| f.window()) != Some(window) {
-                    if system::window_animations_on() {
+                    // Windows' animation is off for this window (see `keep_windows_still`) or
+                    // for all of them: the app's effect is all there is. (Another window's
+                    // effect is playing, as when many are minimised at once: this one just goes.)
+                    let still = self.transitions.get(&id) == Some(&false);
+                    if still || !system::window_animations_on() {
+                        if self.fx.as_ref().and_then(|f| f.window()).is_none() {
+                            self.play_effect(window, false);
+                        }
+                    } else {
                         // Windows is flying the window to its icon, which swallows it as it lands.
                         self.swallow(window, 0.11, 1.0);
-                    } else {
-                        // Windows' own animation is switched off: the app's effect is all there is.
-                        self.play_effect(window, false);
                     }
                 }
                 self.refresh_due = true;
@@ -1363,6 +1375,39 @@ impl App {
     fn swallow(&mut self, window: HWND, delay: f32, strength: f32) {
         if let Some((s, index)) = self.owner_of(window) {
             self.screens[s].dock.items[index].gulp(delay, strength);
+        }
+    }
+
+    /// True when the app plays its own effect (shrink, genie, drop) as windows are minimised.
+    fn own_effect(&self) -> bool {
+        matches!(self.cfg.minimize_effect.round() as i32, 1..=3)
+    }
+
+    /// Windows animates a window as it is minimised with its own button, the keyboard or
+    /// Alt+Tab, and the app is only told once that has begun, too late to put its own effect
+    /// in place of it. So while the app plays its own effect, Windows' animation is switched
+    /// off for every open window that is not minimised (the minimise is then over at once, and
+    /// the app's effect plays over where the window was, see `Event::Minimized`). A minimised
+    /// window has Windows' animation back on, for the way out again by other means.
+    fn keep_windows_still(&mut self, open: &[HWND]) {
+        // The window the effect is playing for is the effect's (see `Fx::start`); when that
+        // changes, what was set may have been undone, so it is all set again.
+        let busy = self.fx.as_ref().and_then(|f| f.window()).map(|w| w.0 as isize);
+        if busy != self.fx_busy {
+            self.fx_busy = busy;
+            self.transitions.clear();
+        }
+        let own = self.own_effect();
+        for &w in open {
+            let id = w.0 as isize;
+            if busy == Some(id) {
+                continue;
+            }
+            let on = !(own && !shell::is_minimized(w));
+            if self.transitions.get(&id) != Some(&on) {
+                shell::set_transitions(w, on);
+                self.transitions.insert(id, on);
+            }
         }
     }
 
@@ -2550,11 +2595,13 @@ impl App {
 
         // Remember where every open window is, for the minimise effect.
         let mut seen = Vec::new();
+        let mut open = Vec::new();
         for screen in &self.screens {
             for item in &screen.dock.items {
                 for &w in &item.windows {
                     let id = w.0 as isize;
                     seen.push(id);
+                    open.push(w);
                     if !shell::is_minimized(w) {
                         if let Some(whole) = shell::window_rect(w) {
                             self.rects.insert(id, (whole, shell::frame_rect(w).unwrap_or(whole)));
@@ -2565,6 +2612,8 @@ impl App {
         }
         self.rects.retain(|id, _| seen.contains(id));
         self.homes.retain(|id, _| seen.contains(id));
+        self.transitions.retain(|id, _| seen.contains(id));
+        self.keep_windows_still(&open);
         self.publish_min_rects();
 
         // If the previewed app's windows changed, rebuild the preview (or close it).
@@ -2673,6 +2722,10 @@ impl App {
     pub fn update(&mut self, dt: f32) -> bool {
         self.run_demo();
         self.passes += 1;
+        // An effect started or ended: Windows' animation is set up for the windows again.
+        if self.fx.as_ref().and_then(|f| f.window()).map(|w| w.0 as isize) != self.fx_busy {
+            self.refresh_due = true;
+        }
         // Windows often reports several changes at once (an app opening three windows): read
         // them together, a few times a second at most.
         if self.refresh_due && self.last_refresh.elapsed().as_secs_f32() >= REFRESH_EVERY {
@@ -3055,8 +3108,13 @@ impl App {
 
     /// Undoes everything the app changed in Windows. Called once, on exit.
     pub fn shutdown(&mut self) {
-        // From here on Explorer's answer stands again.
+        // From here on Explorer's answer stands again, and so does Windows' own animation.
         MIN_RECTS.with(|table| table.borrow_mut().clear());
+        for (id, on) in std::mem::take(&mut self.transitions) {
+            if !on {
+                shell::set_transitions(HWND(id as *mut _), true);
+            }
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ID);
             let _ = DeregisterShellHookWindow(self.hwnd);
