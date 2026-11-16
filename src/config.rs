@@ -413,7 +413,7 @@ impl Config {
 }
 
 /// Pinned apps, one per line: an exe path, or `shell:AppsFolder\<id>` for a
-/// Store app. Returns `None` when the file does not exist yet (first run).
+/// Store app. A line of `---` is a divider between them. Returns `None` when the file does not exist yet (first run).
 pub fn load_pins() -> Option<Vec<String>> {
     let text = std::fs::read_to_string(pins_path()).ok()?;
     Some(
@@ -426,7 +426,7 @@ pub fn load_pins() -> Option<Vec<String>> {
 }
 
 pub fn save_pins(pins: &[String]) {
-    let mut text = String::from("# Ứng dụng ghim trong Bến, mỗi dòng một ứng dụng (đường dẫn .exe hoặc shell:AppsFolder\\...)\n");
+    let mut text = String::from("# Ứng dụng ghim trong Bến, mỗi dòng một ứng dụng (đường dẫn .exe hoặc shell:AppsFolder\\...)\n# Một dòng --- là một vách ngăn giữa các ứng dụng\n");
     for p in pins {
         text.push_str(p);
         text.push('\n');

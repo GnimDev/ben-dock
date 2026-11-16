@@ -12,6 +12,7 @@ use crate::bubble::{self, Bubble, Entry};
 use crate::config::{self, Config};
 use crate::corner::{self, Corner, Kind};
 use crate::dock::{self, Dock, Released, LAUNCHER_KEY};
+use crate::dropzone;
 use crate::fx::{self, Fx};
 use crate::gfx::Gfx;
 use crate::island::{self, Action, Alert, Island, Page, Row};
@@ -91,6 +92,8 @@ mod cmd {
     pub const OPEN: usize = 1;
     pub const PIN: usize = 2;
     pub const CLOSE: usize = 3;
+    pub const DIVIDER: usize = 4;
+    pub const REMOVE_DIVIDER: usize = 5;
     pub const TASKBAR: usize = 10;
     pub const AUTOSTART: usize = 11;
     pub const SETTINGS: usize = 12;
@@ -182,6 +185,13 @@ pub enum Event {
     LeftUp(isize, i32, i32),
     MiddleUp(isize, i32, i32),
     RightUp(isize, i32, i32),
+    /// Something a dock can hold is dragged over it from another program (see `dropzone.rs`),
+    /// at this column of the screen.
+    DragIn(isize, i32),
+    /// It left the dock again.
+    DragOut(isize),
+    /// It was dropped on the dock.
+    Dropped(isize),
     Tick,
     Shell(usize, isize),
     AppBar(usize),
@@ -427,13 +437,21 @@ fn new_dock_window() -> Result<HWND> {
 
 // ------------------------------------------------------------------- menus
 
-/// The menu of a dock icon (`item` = name, how many windows, pinned), or of the dock itself.
-fn dock_menu(item: Option<(&str, usize, bool)>, taskbar_shown: bool, autostart: bool) -> Vec<Entry> {
+/// The menu of a dock icon (`item` = name, how many windows, pinned), of a divider the user put
+/// in the dock (`divider`), or of the dock itself.
+fn dock_menu(item: Option<(&str, usize, bool)>, divider: bool, taskbar_shown: bool, autostart: bool) -> Vec<Entry> {
     let mut rows = Vec::new();
+    if divider {
+        rows.push(Entry::item(cmd::REMOVE_DIVIDER, "Gỡ vách ngăn"));
+        rows.push(Entry::separator());
+    }
     if let Some((name, windows, pinned)) = item {
         rows.push(Entry::header(name));
         rows.push(Entry::item(cmd::OPEN, if windows == 0 { "Mở" } else { "Mở cửa sổ mới" }));
         rows.push(Entry::item(cmd::PIN, if pinned { "Gỡ khỏi dock" } else { "Giữ trong dock" }));
+        if pinned {
+            rows.push(Entry::item(cmd::DIVIDER, "Thêm vách ngăn phía sau"));
+        }
         if windows > 0 {
             rows.push(Entry::item(cmd::CLOSE, if windows > 1 { "Đóng tất cả cửa sổ" } else { "Đóng cửa sổ" }));
         }
@@ -498,6 +516,12 @@ enum Act {
     SweepDock,
     RestOnIcon,
     LeaveDock,
+    /// An app is dragged onto the dock from outside: it touches the glass,
+    DragIn,
+    /// is pushed in until the glass lets it through,
+    PushIn,
+    /// and is taken out again, so the tour leaves the pinned apps as they were.
+    DragOut,
     AlertVolume,
     AlertTrack,
     AlertNotice,
@@ -515,21 +539,24 @@ const DEMO: &[(f32, Act)] = &[
     (2.0, Act::SweepDock),
     (5.0, Act::RestOnIcon),
     (7.5, Act::LeaveDock),
-    (8.0, Act::AlertVolume),
-    (10.5, Act::AlertTrack),
-    (13.0, Act::AlertNotice),
-    (18.5, Act::OpenIsland),
-    (21.0, Act::OpenPage(Page::Wifi)),
-    (23.5, Act::OpenPage(Page::Sound)),
-    (26.0, Act::OpenPage(Page::Bluetooth)),
-    (28.5, Act::OpenPage(Page::Battery)),
-    (31.0, Act::OpenPage(Page::Calendar)),
-    (33.5, Act::CloseIsland),
-    (34.0, Act::OpenMenu),
-    (36.5, Act::CloseMenu),
-    (37.0, Act::OpenTray),
-    (40.5, Act::CloseTray),
-    (41.5, Act::End),
+    (8.0, Act::DragIn),
+    (9.4, Act::PushIn),
+    (12.0, Act::DragOut),
+    (12.5, Act::AlertVolume),
+    (15.0, Act::AlertTrack),
+    (17.5, Act::AlertNotice),
+    (23.0, Act::OpenIsland),
+    (25.5, Act::OpenPage(Page::Wifi)),
+    (28.0, Act::OpenPage(Page::Sound)),
+    (30.5, Act::OpenPage(Page::Bluetooth)),
+    (33.0, Act::OpenPage(Page::Battery)),
+    (35.5, Act::OpenPage(Page::Calendar)),
+    (38.0, Act::CloseIsland),
+    (38.5, Act::OpenMenu),
+    (41.0, Act::CloseMenu),
+    (41.5, Act::OpenTray),
+    (45.0, Act::CloseTray),
+    (46.0, Act::End),
 ];
 
 /// The picture of a window that has flown back out is kept up until the real window is there.
@@ -668,6 +695,8 @@ pub struct App {
     preview_left: Option<Instant>,
     /// App that was just clicked: no preview for it until the cursor has moved off its icon.
     preview_block: Option<String>,
+    /// The screen whose dock an app's tile, dragged out of the tray, is over.
+    tray_drag: Option<usize>,
     hooks: Vec<HWINEVENTHOOK>,
     /// Last error from updating the visuals, so a repeating error is logged once.
     shown_error: Option<windows::core::Error>,
@@ -758,6 +787,7 @@ impl App {
             resting_on: None,
             preview_left: None,
             preview_block: None,
+            tray_drag: None,
             hooks: Vec::new(),
             shown_error: None,
             bench: None,
@@ -850,6 +880,7 @@ impl App {
     fn make_screen(&self, monitor: Monitor, window: HWND, owned: bool) -> Result<Screen> {
         let theme = theme::build(&self.cfg, system::system_is_dark(), system::accent_color(), monitor.scale());
         let dock = Dock::new(window, owned, &self.scene, &self.cfg, &theme, &self.motion, &monitor)?;
+        dropzone::accept(window);
         let mut appbar = AppBar::new(window);
         if self.cfg.reserve_space {
             appbar.register(WM_APPBAR_CALLBACK);
@@ -1044,7 +1075,7 @@ impl App {
         if !matches!(ev, Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude | Event::Weather) {
             self.busy();
         }
-        if matches!(ev, Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Corner(..) | Event::Bubble(_) | Event::Launcher(_)) {
+        if matches!(ev, Event::DragIn(..) | Event::DragOut(_) | Event::Dropped(_) | Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Corner(..) | Event::Bubble(_) | Event::Launcher(_)) {
             self.last_input = Instant::now();
         }
         match ev {
@@ -1093,8 +1124,27 @@ impl App {
                 let Some(s) = self.screen_of_dock(window) else { return };
                 self.close_bubble();
                 self.close_preview();
-                let index = self.screens[s].dock.app_at(x as f32, y as f32);
+                let dock = &self.screens[s].dock;
+                let index = dock.app_at(x as f32, y as f32).or(dock.divider_at(x as f32, y as f32));
                 self.show_dock_menu(s, index);
+            }
+            Event::DragIn(window, x) => {
+                let Some(s) = self.screen_of_dock(window) else { return };
+                self.close_bubble();
+                self.close_preview();
+                let dock = &mut self.screens[s].dock;
+                dock.drag_in(&dropzone::carried(), (x - dock.win_x) as f32, &self.motion);
+            }
+            Event::DragOut(window) => {
+                let Some(s) = self.screen_of_dock(window) else { return };
+                self.screens[s].dock.drag_out();
+                self.refresh_due = true;
+            }
+            Event::Dropped(window) => {
+                let Some(s) = self.screen_of_dock(window) else { return };
+                if self.screens[s].dock.drop_in(&dropzone::carried(), &self.motion) {
+                    self.share_pins(s);
+                }
             }
             Event::Tick => {
                 self.refresh_due = true;
@@ -1267,6 +1317,7 @@ impl App {
                     shell::launch_soon(&target);
                     self.refresh_due = true;
                 }
+                self.carry_from_tray(input);
             }
             Event::Config(done) => {
                 if let Some(cfg) = settings::current() {
@@ -1946,6 +1997,42 @@ impl App {
         self.refresh_due = true;
     }
 
+    /// Follows an app's tile as it is dragged out of the tray: over a dock it joins the dock's
+    /// icons, and let go there it is pinned.
+    fn carry_from_tray(&mut self, input: launcher::Input) {
+        let Some(launcher) = self.launcher.as_mut() else { return };
+        let let_go = matches!(input, launcher::Input::Click(..));
+        let carried = if let_go { launcher.take_carried() } else { launcher.carried() };
+        let mut pt = POINT::default();
+        let have_cursor = unsafe { GetCursorPos(&mut pt) }.is_ok();
+        // Over a dock: on its glass, or a little above it, where the swollen icons reach.
+        let over = carried.as_ref().filter(|_| have_cursor).and_then(|_| {
+            self.screens.iter().position(|screen| {
+                let glass = screen.dock.panel_on_screen();
+                let reach = screen.dock.m.icon as i32;
+                pt.x >= glass.left - reach && pt.x < glass.right + reach && pt.y >= glass.top - reach && pt.y < screen.monitor.rect.bottom
+            })
+        });
+        if let Some(s) = self.tray_drag.filter(|&s| Some(s) != over) {
+            if let Some(screen) = self.screens.get_mut(s) {
+                screen.dock.drag_out();
+            }
+            self.tray_drag = None;
+            self.refresh_due = true;
+        }
+        let (Some(target), Some(s)) = (carried, over) else { return };
+        let dock = &mut self.screens[s].dock;
+        if let_go {
+            self.tray_drag = None;
+            if dock.drop_in(&[target], &self.motion) {
+                self.share_pins(s);
+            }
+        } else {
+            dock.drag_in(&[target], (pt.x - dock.win_x) as f32, &self.motion);
+            self.tray_drag = Some(s);
+        }
+    }
+
     fn click(&mut self, s: usize, index: usize) {
         if self.screens[s].dock.items[index].key == LAUNCHER_KEY {
             self.toggle_launcher(s);
@@ -2158,7 +2245,8 @@ impl App {
         let dock = &self.screens[s].dock;
         // The tray button is not an app: it only gets the dock's own menu.
         let index = index.filter(|&i| !dock.items[i].is_special());
-        let entries = dock_menu(index.map(|i| (dock.items[i].name.as_str(), dock.items[i].windows.len(), dock.items[i].pinned)), !self.taskbar.hidden, system::autostart_enabled());
+        let divider = index.map(|i| dock.items[i].is_divider()).unwrap_or(false);
+        let entries = dock_menu(index.filter(|_| !divider).map(|i| (dock.items[i].name.as_str(), dock.items[i].windows.len(), dock.items[i].pinned)), divider, !self.taskbar.hidden, system::autostart_enabled());
         // Standing on the icon at its largest, or at the cursor on the dock's own glass.
         let (center, bottom) = match index {
             Some(i) => (dock.icon_anchor(i).0, dock.top_line()),
@@ -2210,6 +2298,18 @@ impl App {
             cmd::PIN => {
                 if let Some((s, i)) = target {
                     self.screens[s].dock.toggle_pin(i);
+                    self.share_pins(s);
+                }
+            }
+            cmd::DIVIDER => {
+                if let Some((s, i)) = target {
+                    self.screens[s].dock.add_divider(i, &self.motion);
+                    self.share_pins(s);
+                }
+            }
+            cmd::REMOVE_DIVIDER => {
+                if let Some((s, i)) = target {
+                    self.screens[s].dock.remove_divider(i);
                     self.share_pins(s);
                 }
             }
@@ -2265,11 +2365,17 @@ impl App {
             let add = |flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
                 let _ = AppendMenuW(menu, flags, id, PCWSTR(wide(text).as_ptr()));
             };
-            if let Some(item) = index.map(|i| &self.screens[s].dock.items[i]) {
+            if index.map(|i| self.screens[s].dock.items[i].is_divider()).unwrap_or(false) {
+                add(MF_STRING, cmd::REMOVE_DIVIDER, "Gỡ vách ngăn");
+                add(MF_SEPARATOR, 0, "");
+            } else if let Some(item) = index.map(|i| &self.screens[s].dock.items[i]) {
                 add(MF_STRING | MF_GRAYED, 0, &item.name);
                 add(MF_SEPARATOR, 0, "");
                 add(MF_STRING, cmd::OPEN, if item.windows.is_empty() { "Mở" } else { "Mở cửa sổ mới" });
                 add(MF_STRING, cmd::PIN, if item.pinned { "Gỡ khỏi dock" } else { "Giữ trong dock" });
+                if item.pinned {
+                    add(MF_STRING, cmd::DIVIDER, "Thêm vách ngăn phía sau");
+                }
                 if !item.windows.is_empty() {
                     add(MF_STRING, cmd::CLOSE, if item.windows.len() > 1 { "Đóng tất cả cửa sổ" } else { "Đóng cửa sổ" });
                 }
@@ -2838,6 +2944,23 @@ impl App {
                 }
             }
             Act::LeaveDock => self.demo_cursor = None,
+            Act::DragIn => {
+                // An app that is unlikely to be in the dock already, held at the top edge of
+                // the glass, between two icons.
+                let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+                let x = icon.map(|i| dock.icon_rect(i).2 + (dock.m.slot - dock.m.icon) * 0.5).unwrap_or(dock.m.win_w as f32 * 0.5);
+                self.demo_cursor = Some((x, dock.m.panel_top - 1.0));
+                self.screens[0].dock.drag_in(&[format!("{windir}\\System32\\Taskmgr.exe")], x, &self.motion);
+            }
+            Act::PushIn => {
+                if let Some((x, _)) = self.demo_cursor {
+                    self.demo_cursor = Some((x, dock.m.panel_top + dock.m.panel_h * 0.5));
+                }
+            }
+            Act::DragOut => {
+                self.screens[0].dock.drag_out();
+                self.demo_cursor = None;
+            }
             Act::AlertVolume => self.alert(Alert::Volume { level: 0.62, muted: false }),
             Act::AlertTrack => self.alert(Alert::Track { title: "Bài hát đang phát".to_string(), artist: "Nghệ sĩ".to_string(), art: self.playing.as_ref().and_then(|track| track.art.clone()) }),
             Act::AlertNotice => {

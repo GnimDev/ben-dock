@@ -23,7 +23,7 @@ use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::UI::Composition::CompositionDrawingSurface;
 
@@ -37,6 +37,8 @@ const PAINTS_PER_FRAME: usize = 12;
 pub enum Input {
     Move(i32, i32),
     Leave,
+    /// The mouse button went down.
+    Press(i32, i32),
     Click(i32, i32),
     /// Mouse wheel; positive = away from the user.
     Wheel(i32),
@@ -99,6 +101,10 @@ pub struct Launcher {
     /// The point the sheet grows out of, in its own coordinates.
     root: (f32, f32),
     cursor: Option<(f32, f32)>,
+    /// The tile the mouse button went down on, and where (sheet pixels).
+    held: Option<(usize, f32, f32)>,
+    /// The app whose tile is being dragged out of the tray, towards a dock.
+    carrying: Option<String>,
     label_font: Option<IDWriteTextFormat>,
     search_font: Option<IDWriteTextFormat>,
     icon_font: Option<IDWriteTextFormat>,
@@ -127,7 +133,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             send(Input::Leave);
             return LRESULT(0);
         }
+        WM_LBUTTONDOWN => {
+            // A tile can be dragged out of the tray: keep hearing from the mouse out there.
+            unsafe {
+                SetCapture(hwnd);
+            }
+            send(Input::Press(x, y));
+            return LRESULT(0);
+        }
         WM_LBUTTONUP => {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
             send(Input::Click(x, y));
             return LRESULT(0);
         }
@@ -222,6 +239,8 @@ impl Launcher {
                 margin: 0.0,
                 root: (0.0, 0.0),
                 cursor: None,
+                held: None,
+                carrying: None,
                 label_font: None,
                 search_font: None,
                 icon_font: None,
@@ -367,6 +386,18 @@ impl Launcher {
             self.open = false;
             self.show.set(0.0);
         }
+        self.held = None;
+        self.carrying = None;
+    }
+
+    /// The app whose tile is being dragged out of the tray.
+    pub fn carried(&self) -> Option<String> {
+        self.carrying.clone()
+    }
+
+    /// The same, as the mouse button comes up: the drag is over.
+    pub fn take_carried(&mut self) -> Option<String> {
+        self.carrying.take()
     }
 
     fn turn_page(&mut self, by: i32) {
@@ -381,9 +412,28 @@ impl Launcher {
             return None;
         }
         match input {
-            Input::Move(x, y) => self.cursor = Some((x as f32 - self.margin, y as f32 - self.margin)),
+            Input::Move(x, y) => {
+                let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
+                self.cursor = Some((x, y));
+                // A press on a tile turns into a drag once the cursor has clearly moved.
+                if let (Some((tile, px, py)), None) = (self.held, &self.carrying) {
+                    if (x - px).abs().max((y - py).abs()) >= 6.0 * self.scale {
+                        self.carrying = self.tiles.get(tile).map(|t| t.target.clone());
+                    }
+                }
+            }
             Input::Leave => self.cursor = None,
+            Input::Press(x, y) => {
+                let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
+                self.held = self.tile_at(x, y).map(|tile| (tile, x, y));
+                self.carrying = None;
+            }
             Input::Click(x, y) => {
+                self.held = None;
+                if self.carrying.is_some() {
+                    // The end of a drag, not a click: the app sees where it was let go.
+                    return None;
+                }
                 let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
                 if let Some(target) = self.tile_at(x, y).map(|i| self.tiles[i].target.clone()) {
                     self.close();

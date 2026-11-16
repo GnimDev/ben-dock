@@ -17,14 +17,16 @@ use crate::config::{self, Config};
 use crate::gfx::Gfx;
 use crate::layout::{layout, Magnifier, Slot};
 use crate::motion::{hop_shape, Glide, Motion};
-use crate::scene::{rgba, Bead, Glass, Layer, Pill, Scene, Sprite, Stage};
+use crate::scene::{faded, rgba, Bead, Glass, Layer, Pill, Scene, Skin, Sprite, Stage};
 use crate::shade::Shade;
 use crate::shell::{self, AppWindow, IconPixels};
 use crate::spring::Spring;
+use crate::surface::{Surface, Weight};
 use crate::system::Monitor;
 use crate::text;
 use crate::theme::Theme;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::Result;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -34,6 +36,27 @@ use windows::UI::Composition::CompositionDrawingSurface;
 
 /// Identity of the dock's own tray button (not an app, never written to pins.txt).
 pub const LAUNCHER_KEY: &str = "::launcher";
+
+/// A divider the user put between pinned apps, as it is written in pins.txt.
+pub const DIVIDER: &str = "---";
+/// An icon pushed in from outside meets the glass as it would the skin of a drop of water
+/// (see `Intake`). How far the skin lets it sink before it gives, as a share of the glass's
+/// height; for how long it has to be strained, in seconds; and how far into the glass the
+/// cursor has to be, as a share of its height.
+const SINK: f32 = 0.44;
+const HOLD: f32 = 0.4;
+const GIVE: f32 = 0.3;
+/// How far the icons beside it have moved apart meanwhile, from the first touch to just
+/// before the skin gives (1 = room for the whole icon).
+const GAP: (f32, f32) = (0.16, 0.5);
+/// How much of a wave's height an icon standing in the water goes up and down with.
+const RIDE: f32 = 0.55;
+/// Drops thrown up when the skin gives: how many, and how fast they fall (pixels per second
+/// squared, at a display scale of 1).
+const DROPS: usize = 6;
+const GRAVITY: f32 = 1300.0;
+/// Counts the dividers made, so that each has a key of its own.
+static DIVIDERS: AtomicU32 = AtomicU32::new(0);
 
 /// Every size the dock uses, in physical pixels for the current display scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -145,6 +168,9 @@ pub struct Item {
     pub target: String,
     pub name: String,
     pub pinned: bool,
+    /// Being dragged in from outside (a file from Explorer, an app from the tray): it stands
+    /// among the pinned apps, but is not one of them until it is dropped.
+    ghost: bool,
     /// Open windows, front-most first.
     pub windows: Vec<HWND>,
     /// The icon pre-scaled to a few sizes between "at rest" and "fully magnified", smallest first.
@@ -180,6 +206,70 @@ pub struct Item {
     gulp: Spring,
     /// A gulp still to come: seconds to go, and how strong (below zero: letting go).
     gulp_in: Option<(f32, f32)>,
+    /// Where the skin of the glass holds the icon, while it is pushed in from outside.
+    held: Held,
+    /// How far the water lifts the icon as a wave passes under it, in pixels.
+    ride: f32,
+}
+
+/// Where an icon is while it is pushed in from outside and the skin of the glass holds it
+/// (see `Intake`). Worked out again every frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Held {
+    /// 1 = held outside the glass, 0 = in its place in the dock. On its way in it swings a
+    /// little past its place before it rests.
+    out: f32,
+    /// Its bottom edge out there, in window coordinates.
+    bottom: f32,
+    /// Its size out there (1 = whole).
+    size: f32,
+    /// Its width and height out there: pressed a little flat against the skin.
+    shape: (f32, f32),
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Held { out: 0.0, bottom: 0.0, size: 1.0, shape: (1.0, 1.0) }
+    }
+}
+
+/// An icon being pushed into the glass from outside, as into a drop of water. The skin holds
+/// it out and dents under it; the harder it is pushed, the further the skin stretches and the
+/// more the whole drop swells. Strained long enough, the skin gives: the icon slips through
+/// to its place, the dent springs back, drops fly up, and waves run along the surface.
+struct Intake {
+    /// The item this is about.
+    key: String,
+    /// How far the bottom edge of the icon is below the resting top edge of the glass, in
+    /// pixels (above it: negative).
+    sink: Spring,
+    /// For how long the skin has been strained, in seconds.
+    strained: f32,
+    /// The skin has given.
+    through: bool,
+    /// 1 = held outside by the skin, 0 = in its place.
+    out: Spring,
+    /// The icon's size while it is held out: it swells into view under the cursor, and
+    /// shrinks away there if it is taken back.
+    size: Spring,
+    /// Where the skin last held it.
+    last: Held,
+}
+
+impl Intake {
+    fn new(key: String, motion: &Motion) -> Self {
+        // It arrives from above the edge.
+        Intake { key, sink: Spring::with(-2.0, motion.calm()), strained: 0.0, through: false, out: Spring::with(1.0, motion.medium()), size: Spring::with(0.0, motion.small()), last: Held::default() }
+    }
+}
+
+/// A drop of water in the air.
+struct Droplet {
+    bead: Bead,
+    /// Its centre, in window coordinates, and its speed.
+    at: (f32, f32),
+    speed: (f32, f32),
+    size: f32,
 }
 
 impl Item {
@@ -202,6 +292,15 @@ impl Item {
         Item::blank(Kind::Separator, motion)
     }
 
+    /// A divider the user put between pinned apps. It is kept in pins.txt with them.
+    fn divider(present: bool, motion: &Motion) -> Self {
+        let mut item = Item::blank(Kind::Separator, motion);
+        item.presence.snap(if present { 1.0 } else { 0.0 });
+        item.presence.set(1.0);
+        let key = format!("{DIVIDER}{}", DIVIDERS.fetch_add(1, Ordering::Relaxed));
+        Item { key, target: DIVIDER.to_string(), pinned: true, ..item }
+    }
+
     fn blank(kind: Kind, motion: &Motion) -> Self {
         Item {
             kind,
@@ -209,6 +308,7 @@ impl Item {
             target: String::new(),
             name: String::new(),
             pinned: false,
+            ghost: false,
             windows: Vec::new(),
             surfaces: Vec::new(),
             level: None,
@@ -226,6 +326,8 @@ impl Item {
             hop: (1.0, 1.0),
             gulp: Spring::with(0.0, motion.jelly()),
             gulp_in: None,
+            held: Held::default(),
+            ride: 0.0,
         }
     }
 
@@ -235,6 +337,11 @@ impl Item {
 
     pub fn is_app(&self) -> bool {
         self.kind == Kind::App
+    }
+
+    /// A divider the user put there (not the one before the open apps, which is the dock's own).
+    pub fn is_divider(&self) -> bool {
+        self.kind == Kind::Separator && self.pinned
     }
 
     /// Makes the icon hop: `Some(n)` times, or until its app has a window.
@@ -309,6 +416,21 @@ pub struct Dock {
     edge_right: Spring,
     /// 1 while the cursor is over the dock: the glass thickens a touch.
     swell: Spring,
+    /// The glass straining as an icon is pushed in from outside: like a drop of water it
+    /// swells (towards 1) the further its skin is stretched, and wobbles back to rest.
+    strain: Spring,
+    /// The icon that is being pushed in from outside, until it is in its place.
+    intake: Option<Intake>,
+    /// The top edge of the glass, which behaves like water while that goes on, and the
+    /// outline the glass wears while its edge is not level.
+    surface: Surface,
+    skin: Option<Skin>,
+    edge: Vec<(f32, f32)>,
+    /// Where the skin has just given: drops fly up from here.
+    splash: Option<f32>,
+    spray: Vec<Droplet>,
+    /// Counts the drops, so that no two splashes are alike.
+    sprayed: u32,
     /// 0 = flat, 1 = fully magnified.
     mag: Spring,
     cursor_x: f32,
@@ -362,6 +484,14 @@ impl Dock {
             edge_left: Spring::with(m.win_w as f32 * 0.5, motion.medium()),
             edge_right: Spring::with(m.win_w as f32 * 0.5, motion.medium()),
             swell: Spring::with(0.0, motion.small()),
+            strain: Spring::with(0.0, motion.jelly()),
+            intake: None,
+            surface: Surface::default(),
+            skin: None,
+            edge: Vec::new(),
+            splash: None,
+            spray: Vec::new(),
+            sprayed: 0,
             mag: Spring::with(0.0, motion.small()),
             cursor_x: m.win_w as f32 * 0.5,
             hovering: false,
@@ -392,6 +522,10 @@ impl Dock {
             self.items.push(Item::launcher_button(motion));
         }
         for target in pins {
+            if target == DIVIDER {
+                self.items.push(Item::divider(true, motion));
+                continue;
+            }
             let key = shell::key_for_target(&target);
             if self.items.iter().any(|i| i.key == key) {
                 continue;
@@ -412,10 +546,18 @@ impl Dock {
         for item in self.items.iter_mut().filter(|i| i.is_app() && !i.is_special()) {
             if item.pinned && !keys.contains(&item.key) {
                 item.pinned = false;
+                item.ghost = false;
             }
         }
         let mut pinned = Vec::new();
         for (key, target) in keys.iter().zip(pins) {
+            if target == DIVIDER {
+                pinned.push(match self.items.iter().position(|i| i.is_divider()) {
+                    Some(at) => self.items.remove(at),
+                    None => Item::divider(false, motion),
+                });
+                continue;
+            }
             match self.items.iter().position(|i| i.is_app() && &i.key == key) {
                 Some(at) => {
                     let mut item = self.items.remove(at);
@@ -427,8 +569,9 @@ impl Dock {
         }
         // The tray button, the pinned apps in their order, the divider, then whatever else is open.
         let mut rest = std::mem::take(&mut self.items);
+        rest.retain(|i| !i.is_divider());
         let button = rest.iter().position(|i| i.key == LAUNCHER_KEY).map(|at| rest.remove(at));
-        let divider = rest.iter().position(|i| i.kind == Kind::Separator).map(|at| rest.remove(at)).unwrap_or_else(|| Item::separator(motion));
+        let divider = rest.iter().position(|i| i.kind == Kind::Separator && !i.pinned).map(|at| rest.remove(at)).unwrap_or_else(|| Item::separator(motion));
         self.items.extend(button);
         self.items.extend(pinned);
         self.items.push(divider);
@@ -440,7 +583,7 @@ impl Dock {
     }
 
     pub fn save_pins(&self) {
-        let pins: Vec<String> = self.items.iter().filter(|i| i.is_app() && i.pinned && !i.is_special()).map(|i| i.target.clone()).collect();
+        let pins: Vec<String> = self.items.iter().filter(|i| i.pinned && !i.ghost && !i.is_special()).map(|i| i.target.clone()).collect();
         config::save_pins(&pins);
     }
 
@@ -548,19 +691,23 @@ impl Dock {
         }
         let mut pinned = 0;
         let mut unpinned = 0;
+        let held_out = self.intake.as_ref().map(|i| !i.through).unwrap_or(false);
         for item in self.items.iter_mut().filter(|i| i.is_app()) {
             let running = !item.windows.is_empty();
             item.running.set(if running { 1.0 } else { 0.0 });
             item.active.set(if item.windows.contains(&front) { 1.0 } else { 0.0 });
             let stays = item.pinned || running || item.bounce.is_some();
-            item.presence.set(if stays { 1.0 } else { 0.0 });
+            // An icon the skin of the glass still holds out has only part of its room yet.
+            if !(item.ghost && held_out) {
+                item.presence.set(if stays { 1.0 } else { 0.0 });
+            }
             if item.pinned {
                 pinned += 1;
             } else if stays {
                 unpinned += 1;
             }
         }
-        if let Some(sep) = self.items.iter_mut().find(|i| i.kind == Kind::Separator) {
+        if let Some(sep) = self.items.iter_mut().find(|i| i.kind == Kind::Separator && !i.pinned) {
             sep.presence.set(if pinned > 0 && unpinned > 0 { 1.0 } else { 0.0 });
         }
     }
@@ -573,7 +720,7 @@ impl Dock {
         item.pinned = !item.pinned;
         if item.pinned {
             // Pinned apps live to the left of the separator.
-            let sep = self.items.iter().position(|i| i.kind == Kind::Separator).unwrap_or(self.items.len());
+            let sep = self.items.iter().position(|i| i.kind == Kind::Separator && !i.pinned).unwrap_or(self.items.len());
             self.items.insert(sep, item);
         } else {
             self.items.push(item);
@@ -582,6 +729,163 @@ impl Dock {
         self.pressed = None;
         self.label_index = None;
         self.save_pins();
+    }
+
+    /// Puts a divider after the pinned app at `index`.
+    pub fn add_divider(&mut self, index: usize, motion: &Motion) {
+        if !self.items.get(index).map(|i| i.pinned).unwrap_or(false) {
+            return;
+        }
+        self.items.insert(index + 1, Item::divider(false, motion));
+        self.hovered = None;
+        self.pressed = None;
+        self.label_index = None;
+        self.save_pins();
+    }
+
+    /// Takes away the divider at `index`.
+    pub fn remove_divider(&mut self, index: usize) {
+        if !self.items.get(index).map(|i| i.is_divider()).unwrap_or(false) {
+            return;
+        }
+        self.items.remove(index);
+        self.hovered = None;
+        self.pressed = None;
+        self.label_index = None;
+        self.save_pins();
+    }
+
+    // ------------------------------------------------ dragged in from outside
+
+    /// Something is being dragged over the dock from outside (files from Explorer, an app from
+    /// the tray). The first of `targets` that is not pinned yet joins the pinned apps and
+    /// follows the cursor, as if it had been picked up in the dock. `x`: the cursor, in window
+    /// coordinates.
+    pub fn drag_in(&mut self, targets: &[String], x: f32, motion: &Motion) {
+        if self.items.iter().any(|i| i.ghost) {
+            return;
+        }
+        let find = |items: &[Item], target: &str| {
+            let key = shell::key_for_target(target);
+            items.iter().position(|i| i.is_app() && i.key == key)
+        };
+        let Some(target) = targets.iter().find(|target| !find(&self.items, target).map(|at| self.items[at].pinned).unwrap_or(false)) else { return };
+        let item = match find(&self.items, target) {
+            // Open but not pinned: its own icon is the one that moves.
+            Some(at) => {
+                if at < self.slots.len() {
+                    self.slots.remove(at);
+                }
+                self.items.remove(at)
+            }
+            None => Item::app(shell::key_for_target(target), target.clone(), true, false, motion),
+        };
+        // It comes in where the pinned apps end; from there it changes places like any dragged icon.
+        let at = self.items.iter().position(|i| i.kind == Kind::Separator && !i.pinned).unwrap_or(self.items.len());
+        let edge = self.slots.get(at).map(|s| s.left).or(self.slots.last().map(|s| s.right)).unwrap_or(x);
+        self.items.insert(at, Item { pinned: true, ghost: true, ..item });
+        self.slots.insert(at.min(self.slots.len()), Slot { left: edge, right: edge, scale: 1.0 });
+        self.pressed = Some(at);
+        self.press_x = x;
+        self.drag = Some(0.0);
+        self.hovered = None;
+        self.label_index = None;
+        if !motion.reduced() {
+            // The glass does not let it in at once: its skin holds the icon out, with only a
+            // little room made for it, until it gives (see `Intake`).
+            let item = &mut self.items[at];
+            item.presence.set(GAP.0);
+            self.intake = Some(Intake::new(item.key.clone(), motion));
+        }
+    }
+
+    /// The skin of the glass gives: the icon it held out slips through to its place, thin
+    /// and tall for a moment, and the glass wobbles back.
+    fn let_in(&mut self) {
+        let Some(intake) = self.intake.as_mut().filter(|i| !i.through) else { return };
+        intake.through = true;
+        intake.out.set(0.0);
+        self.strain.set(0.0);
+        let key = intake.key.clone();
+        if let Some(index) = self.items.iter().position(|i| i.is_app() && i.key == key) {
+            let item = &mut self.items[index];
+            item.presence.set(1.0);
+            item.gulp(0.0, -1.3);
+            // Where it went through, the water splashes (see `flow`).
+            self.splash = self.slots.get(index).map(|slot| slot.center() + item.shift.pos);
+        }
+    }
+
+    /// What was being dragged in left the dock again, or was given up.
+    pub fn drag_out(&mut self) {
+        let Some(at) = self.items.iter().position(|i| i.ghost) else { return };
+        self.pressed = None;
+        self.drag = None;
+        self.label_index = None;
+        self.strain.set(0.0);
+        let item = &mut self.items[at];
+        item.ghost = false;
+        item.pinned = false;
+        if item.windows.is_empty() {
+            // It shrinks away where it stands: in the dock, or outside it if the skin of the
+            // glass still held it (see `flow`).
+            item.presence.set(0.0);
+            return;
+        }
+        // An open app goes back among the open ones.
+        self.intake = None;
+        item.presence.set(1.0);
+        let was_at = self.slots.get(at).map(|s| s.center() + item.shift.pos);
+        let mut item = self.items.remove(at);
+        if at < self.slots.len() {
+            self.slots.remove(at);
+        }
+        if let (Some(was_at), Some(last)) = (was_at, self.slots.last().copied()) {
+            item.shift.pos = was_at - last.right;
+            item.shift.vel = 0.0;
+            self.slots.push(Slot { left: last.right, right: last.right, scale: 1.0 });
+        }
+        self.items.push(item);
+    }
+
+    /// What was dragged in was dropped on the dock: it stays where it is, and the rest of
+    /// `targets` are pinned after it (now saved). Returns false if nothing changed.
+    pub fn drop_in(&mut self, targets: &[String], motion: &Motion) -> bool {
+        // Dropped while the glass was still holding out: it gives now.
+        self.let_in();
+        self.pressed = None;
+        self.drag = None;
+        let ghost = self.items.iter().position(|i| i.ghost);
+        let mut at = match ghost {
+            Some(at) => {
+                self.items[at].ghost = false;
+                at + 1
+            }
+            None => self.items.iter().position(|i| i.kind == Kind::Separator && !i.pinned).unwrap_or(self.items.len()),
+        };
+        let mut changed = ghost.is_some();
+        for target in targets {
+            let key = shell::key_for_target(target);
+            let item = match self.items.iter().position(|i| i.is_app() && i.key == key) {
+                Some(i) if self.items[i].pinned => continue,
+                Some(i) => {
+                    if i < at {
+                        at -= 1;
+                    }
+                    self.items.remove(i)
+                }
+                None => Item::app(key, target.clone(), true, false, motion),
+            };
+            self.items.insert(at, Item { pinned: true, ..item });
+            at += 1;
+            changed = true;
+        }
+        if changed {
+            self.hovered = None;
+            self.label_index = None;
+            self.save_pins();
+        }
+        changed
     }
 
     pub fn index_of(&self, key: &str) -> Option<usize> {
@@ -604,6 +908,12 @@ impl Dock {
         }
         let (_, top, _, _) = self.icon_rect(index);
         (y >= top.min(self.m.panel_top) - 2.0).then_some(index)
+    }
+
+    /// Index of the divider (one the user put there) at a point in window coordinates.
+    pub fn divider_at(&self, x: f32, y: f32) -> Option<usize> {
+        let index = self.slots.iter().position(|s| x >= s.left && x < s.right)?;
+        (self.items.get(index)?.is_divider() && y >= self.m.panel_top - 2.0).then_some(index)
     }
 
     /// (left, top, right, bottom) of an item's icon as shown this frame, in window coordinates.
@@ -659,7 +969,8 @@ impl Dock {
 
     /// The mouse button went down at a point in window coordinates.
     pub fn press(&mut self, x: f32, y: f32) -> Option<usize> {
-        self.pressed = self.app_at(x, y);
+        // A divider can be picked up and moved like an icon.
+        self.pressed = self.app_at(x, y).or(self.divider_at(x, y));
         self.press_x = x;
         self.drag = None;
         self.pressed
@@ -788,12 +1099,19 @@ impl Dock {
             }
         }
 
+        // While its skin holds an icon out, the glass swells steadily; let go, it wobbles
+        // (see `flow`, which says how far it is strained).
+        let held_out = self.intake.as_ref().map(|i| !i.through).unwrap_or(false);
+        self.strain.tune(if held_out { motion.calm() } else { motion.jelly() });
+        self.strain.step(dt);
+
         // Drop apps that have finished sliding out.
         let before = self.items.len();
         self.items.retain(|item| !(item.is_app() && !item.pinned && item.presence.target == 0.0 && item.presence.pos < 0.004));
         let removed = self.items.len() != before;
         if removed {
-            self.pressed = None;
+            // What is being dragged in from outside keeps following the cursor.
+            self.pressed = self.items.iter().position(|i| i.ghost);
             self.label_index = None;
         }
 
@@ -844,9 +1162,12 @@ impl Dock {
         self.edge_right.step(dt);
         let (shown_left, shown_right) = (self.edge_left.pos.min(left), self.edge_right.pos.max(right));
         let thicken = self.swell.pos.clamp(0.0, 1.2) * 1.5 * m.scale * squash;
-        self.panel = (shown_left, m.panel_top - thicken, shown_right - shown_left, m.panel_h + thicken * 2.0);
+        // Strained, the whole drop swells: wider, rounder, and most of all upwards, towards
+        // what is pushing in. Giving, it swings a little the other way.
+        let bulge = self.strain.pos.clamp(-0.5, 1.3) * 9.0 * m.scale * squash;
+        self.panel = (shown_left - bulge, m.panel_top - thicken - bulge * 1.2, shown_right - shown_left + bulge * 2.0, m.panel_h + thicken * 2.0 + bulge * 1.6);
         let (px, py, pw, ph) = self.panel;
-        let radius = (m.radius + thicken).min(ph * 0.5);
+        let radius = (m.radius + thicken + bulge.max(0.0)).min(ph * 0.5);
 
         // The drop of light sits under the icon the cursor is on.
         let lens_target = self.hovered.filter(|_| cfg.lens).and_then(|i| self.slots.get(i).copied()).map(|slot| {
@@ -864,8 +1185,13 @@ impl Dock {
         if let Some(shade) = self.shade.as_mut() {
             shade.set_offset(0.0, slide)?;
         }
-        self.glass.set_rect(scene, px, py, pw, ph, radius)?;
-        self.show_lens(theme, squash, radius)?;
+        // While an icon is pushed in from outside, and for a moment after, the glass is a
+        // drop of water: its top edge dents and waves run along it. The glass gets room above
+        // its resting edge for the highest of them, and is cut to the line they make.
+        let raise = (self.flow(scene, theme, motion, cy, radius, dt)? - 0.05).max(0.0).ceil();
+        self.glass.set_rect(scene, px, py - raise, pw, ph + raise, radius)?;
+        self.wear_skin(scene, gfx, raise)?;
+        self.show_lens(theme, squash, radius, raise)?;
         self.show_items(scene, cfg, theme)?;
         self.show_label(scene, gfx, theme, motion)?;
         self.update_region(hide);
@@ -876,6 +1202,11 @@ impl Dock {
             || self.pressed.is_some()
             || !self.mag.settled(1e-3)
             || !self.swell.settled(1e-3)
+            || self.intake.is_some()
+            || self.splash.is_some()
+            || !self.spray.is_empty()
+            || !self.surface.calm()
+            || !self.strain.settled(1e-3)
             || !self.edge_left.settled(0.05)
             || !self.edge_right.settled(0.05)
             || !self.label_alpha.settled(1e-3)
@@ -886,6 +1217,184 @@ impl Dock {
     /// True right after an item was dropped from the dock, so the app re-reads the windows.
     pub fn count(&self) -> usize {
         self.items.len()
+    }
+
+    /// The glass as a drop of water (see `surface.rs` and `Intake`). Moves the icon that is
+    /// being pushed in from outside, the surface it presses on, the icons standing in the
+    /// water and the drops in the air. `cy`: the cursor's row. `radius`: of the glass's
+    /// corners. Returns how far the highest wave stands above the resting edge.
+    fn flow(&mut self, scene: &Scene, theme: &Theme, motion: &Motion, cy: f32, radius: f32, dt: f32) -> Result<f32> {
+        let m = self.m;
+        let (px, py, pw, ph) = self.panel;
+        for item in &mut self.items {
+            item.held = Held::default();
+            item.ride = 0.0;
+        }
+        if self.intake.is_none() && self.splash.is_none() && self.spray.is_empty() && self.surface.calm() {
+            return Ok(0.0);
+        }
+        // The water follows the settings for motion: as quick as the springs are, and as
+        // ready to come to rest.
+        let jelly = motion.jelly();
+        let (pace, damping) = (jelly.omega / 30.0, 8.2 * jelly.zeta);
+        let squash = motion.squash();
+        self.surface.span(px + radius, px + pw - radius, 3.0 * m.scale, m.win_w as f32);
+
+        let mut weight = None;
+        let mut gives = false;
+        if let Some(mut intake) = self.intake.take() {
+            let index = self.items.iter().position(|i| i.is_app() && i.key == intake.key);
+            if let Some((index, slot)) = index.and_then(|i| self.slots.get(i).map(|slot| (i, *slot))) {
+                let item = &mut self.items[index];
+                intake.out.tune(motion.medium());
+                intake.size.tune(motion.small());
+                let mut keep = true;
+                if intake.through {
+                    // Through the skin: it settles into its place.
+                    intake.out.step(dt);
+                    item.held = Held { out: intake.out.pos, ..intake.last };
+                    keep = !intake.out.settled(1e-3);
+                } else {
+                    // Taken back out of the dock, it shrinks away where the skin held it.
+                    let taken_back = item.presence.target == 0.0;
+                    if !taken_back {
+                        let icon = m.icon * slot.scale;
+                        let deepest = SINK * ph;
+                        // Centred on the cursor, the icon would reach this far below the edge
+                        // of the glass. The skin lets it sink less and less willingly, and
+                        // never further than `deepest`; above the edge it is free.
+                        let wants = if cy.is_finite() { cy + icon * 0.5 - py } else { 0.0 };
+                        let pressing = wants > 0.0;
+                        intake.sink.tune(if pressing { motion.calm() } else { motion.follow() });
+                        intake.sink.set(if pressing { deepest * (1.0 - (-wants / deepest).exp()) } else { wants.max(-icon * 1.5) });
+                        intake.sink.step(dt);
+                        let sunk = intake.sink.pos;
+                        let strain = (sunk / deepest).clamp(0.0, 1.0);
+                        intake.strained = if sunk > 0.0 { intake.strained + dt * pace } else { 0.0 };
+                        // The further the skin is stretched, the more the whole drop swells
+                        // and the further the icons beside it move apart.
+                        self.strain.set(strain);
+                        item.presence.set(GAP.0 + (GAP.1 - GAP.0) * strain);
+                        if sunk > 0.0 {
+                            // What presses on the water is round underneath and a little wider
+                            // than the icon. It stays off the round ends of the glass, where
+                            // there is no edge to dent.
+                            let round = icon * 0.62 + 4.0 * m.scale;
+                            let (first, last) = (px + radius + round * 0.7, px + pw - radius - round * 0.7);
+                            if first < last {
+                                weight = Some(Weight { x: (slot.center() + item.shift.pos).clamp(first, last), depth: sunk, radius: round });
+                            }
+                        }
+                        // Strained for long enough, with the cursor well inside, the skin gives.
+                        gives = intake.strained >= HOLD && wants >= icon * 0.5 + GIVE * ph;
+                        // The icon stands on the skin, pressed a little flat against it.
+                        intake.last = Held { out: 1.0, bottom: py + sunk + m.scale, size: 1.0, shape: (1.0 + 0.10 * strain * squash, 1.0 - 0.13 * strain * squash) };
+                    }
+                    intake.size.set(if taken_back { 0.0 } else { 1.0 });
+                    intake.size.step(dt);
+                    item.held = Held { size: intake.size.pos.max(0.0), ..intake.last };
+                }
+                if keep {
+                    self.intake = Some(intake);
+                }
+            }
+        }
+        if gives {
+            self.let_in();
+        }
+        if let Some(x) = self.splash.take() {
+            self.splash_at(scene, x, squash)?;
+        }
+        self.surface.advance(dt * pace, damping, weight);
+
+        // The icons stand in the water: a wave passing under one lifts it.
+        let Dock { items, slots, surface, .. } = self;
+        for (item, slot) in items.iter_mut().zip(slots.iter()) {
+            if item.is_app() {
+                item.ride = surface.height(slot.center() + item.shift.pos) * RIDE;
+            }
+        }
+
+        // The drops in the air rise, fall, and are water again where they land.
+        let (top, bottom, edge) = (faded(theme.dock.rim, 0.6), faded(theme.dock.rim, 0.2), theme.dock.rim);
+        let fall = dt * pace;
+        let mut index = 0;
+        while index < self.spray.len() {
+            let drop = &mut self.spray[index];
+            drop.speed.1 += GRAVITY * m.scale * fall;
+            drop.at.0 += drop.speed.0 * fall;
+            drop.at.1 += drop.speed.1 * fall;
+            // Past the ends of the glass there is nothing to land on.
+            let water = if drop.at.0 > px && drop.at.0 < px + pw { py - self.surface.height(drop.at.0) } else { m.win_h as f32 };
+            if drop.speed.1 > 0.0 && drop.at.1 >= water {
+                // A small ring where it lands.
+                self.surface.push(drop.at.0, 7.0 * m.scale, -22.0 * drop.size);
+                self.spray.remove(index);
+                continue;
+            }
+            drop.bead.place(drop.at.0 - drop.size * 0.5, drop.at.1 - drop.size * 0.5, drop.size, drop.size, drop.size * 0.5)?;
+            drop.bead.set_colors(top, bottom, edge)?;
+            drop.bead.set_opacity(1.0)?;
+            index += 1;
+        }
+
+        if self.surface.calm() {
+            // Level again, to the last fraction of a pixel.
+            self.surface.still();
+        }
+        Ok(self.surface.crest())
+    }
+
+    /// The skin of the glass has given at `x`: the dent it leaves springs up, the icons on
+    /// either side are pushed apart by the water that is pushed aside, and drops fly up.
+    fn splash_at(&mut self, scene: &Scene, x: f32, squash: f32) -> Result<()> {
+        let m = self.m;
+        let (_, py, _, _) = self.panel;
+        self.surface.push(x, 26.0 * m.scale, 150.0 * m.scale * squash);
+        for (item, slot) in self.items.iter_mut().zip(&self.slots) {
+            let away = slot.center() - x;
+            // Not the icon that came through itself.
+            if away.abs() >= m.slot * 0.5 {
+                item.shift.vel += away.signum() * 420.0 * m.scale * squash * (-away.abs() / (2.2 * m.slot)).exp();
+            }
+        }
+        let content = self.layer.content()?;
+        for _ in 0..DROPS {
+            // Not left to chance, but no two drops alike, and no two splashes.
+            let mut next = || {
+                self.sprayed = self.sprayed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((self.sprayed >> 8) & 0xffff) as f32 / 65535.0
+            };
+            let (side, up, big) = (next() - 0.5, next(), next());
+            let size = ((2.5 + 3.0 * big) * m.scale).round().max(2.0);
+            let mut bead = scene.bead_in(&content)?;
+            bead.set_opacity(0.0)?;
+            self.spray.push(Droplet { bead, at: (x + side * 14.0 * m.scale, py), speed: (side * 220.0 * m.scale, -(150.0 + 140.0 * up) * m.scale), size });
+        }
+        Ok(())
+    }
+
+    /// Cuts the glass to its top edge while that is not level (`raise`: the room it has above
+    /// its resting edge), and gives it its own outline back once the water is calm.
+    fn wear_skin(&mut self, scene: &Scene, gfx: &Gfx, raise: f32) -> Result<()> {
+        if self.surface.calm() {
+            return match self.skin.as_mut() {
+                Some(skin) => skin.take_off(&self.glass),
+                None => Ok(()),
+            };
+        }
+        let (px, ..) = self.panel;
+        self.surface.points(&mut self.edge);
+        for point in &mut self.edge {
+            *point = (point.0 - px, raise - point.1);
+        }
+        if self.skin.is_none() {
+            self.skin = Some(scene.skin(gfx)?);
+        }
+        match self.skin.as_mut() {
+            Some(skin) => skin.wear(&self.glass, raise, &self.edge),
+            None => Ok(()),
+        }
     }
 
     /// Handles dragging an icon sideways. Returns the icons that changed places this frame, as
@@ -912,7 +1421,7 @@ impl Dock {
         // among pinned apps, open ones among open ones.
         loop {
             let pinned = self.items[index].pinned;
-            let same_group = |item: &Item| item.is_app() && !item.is_special() && item.pinned == pinned && item.presence.target > 0.5;
+            let same_group = |item: &Item| (item.is_app() || item.is_divider()) && !item.is_special() && item.pinned == pinned && item.presence.target > 0.5;
             let right = index + 1 < self.items.len() && index + 1 < self.slots.len() && same_group(&self.items[index + 1]) && centre > self.slots[index + 1].center();
             let left = index > 0 && same_group(&self.items[index - 1]) && centre < self.slots[index - 1].center();
             let other = if right {
@@ -945,7 +1454,10 @@ impl Dock {
     fn update_region(&mut self, hide: &Spring) {
         let m = self.m;
         let hidden = hide.target == 1.0 && hide.pos > 0.97;
-        let lively = self.mag.pos > 0.001 || self.label_alpha.pos > 0.001 || self.items.iter().any(|i| i.bounce.is_some());
+        // (The same while an icon is pushed in from outside: it stands above the glass, and so
+        // do the waves and the drops it makes.)
+        let watery = self.intake.is_some() || !self.spray.is_empty() || !self.surface.calm();
+        let lively = watery || self.mag.pos > 0.001 || self.label_alpha.pos > 0.001 || self.items.iter().any(|i| i.bounce.is_some());
         let (px, _, pw, _) = self.panel;
         let wanted = if hidden {
             (0, 0, 0, 0)
@@ -984,7 +1496,8 @@ impl Dock {
 
     // --------------------------------------------------------------- visuals
 
-    fn show_lens(&mut self, theme: &Theme, squash: f32, radius: f32) -> Result<()> {
+    /// `raise`: how far the glass reaches above its resting edge this frame (see `update`).
+    fn show_lens(&mut self, theme: &Theme, squash: f32, radius: f32, raise: f32) -> Result<()> {
         if !self.lens_at.visible() {
             return self.lens.set_opacity(0.0);
         }
@@ -993,7 +1506,7 @@ impl Dock {
         let press = self.pressed.and_then(|i| self.items.get(i)).map(|i| i.press.pos.clamp(0.0, 1.0)).unwrap_or(0.0);
         let squeeze = 1.0 - 0.07 * press;
         let (w, h) = (s.w * squeeze, s.h * squeeze);
-        let (x, y) = (s.x + (s.w - w) * 0.5, s.y + (s.h - h) * 0.5);
+        let (x, y) = (s.x + (s.w - w) * 0.5, s.y + (s.h - h) * 0.5 + raise);
         // Concentric with the glass it lies in.
         let r = (radius - self.m.lens_inset).max(4.0 * self.m.scale).min(h * 0.5);
         self.lens.place(x, y, w, h, r)?;
@@ -1025,7 +1538,7 @@ impl Dock {
                 let line = item.mark.as_mut().unwrap();
                 let inset = m.panel_h * 0.26;
                 let w = (2.0 * m.scale).round().max(1.0);
-                line.place((cx - w * 0.5).round(), m.panel_top + inset, w, m.panel_h - inset * 2.0, w * 0.5)?;
+                line.place((cx + item.shift.pos - w * 0.5).round(), m.panel_top + inset, w, m.panel_h - inset * 2.0, w * 0.5)?;
                 line.set_color(theme.divider)?;
                 line.set_opacity(presence)?;
                 continue;
@@ -1050,7 +1563,7 @@ impl Dock {
 
             let (mut l, mut t, r, b) = icon_rect_of(&m, slot, item);
             let (mut w, mut h) = (r - l, b - t);
-            if (w - m.icon).abs() < 0.02 && (h - m.icon).abs() < 0.02 && item.bounce_y == 0.0 {
+            if (w - m.icon).abs() < 0.02 && (h - m.icon).abs() < 0.02 && item.bounce_y == 0.0 && item.ride == 0.0 && item.held.out == 0.0 {
                 // Standing still: sit on whole pixels so the icon is shown 1:1, perfectly sharp.
                 l = l.round();
                 t = t.round();
@@ -1066,7 +1579,9 @@ impl Dock {
                 }
             }
             sprite.place(l, t, w, h)?;
-            sprite.set_opacity(presence * (1.0 - 0.16 * item.press.pos.clamp(0.0, 1.0)))?;
+            // (An icon the skin of the glass holds out is as solid as it is large out there.)
+            let solid = presence + (item.held.size.clamp(0.0, 1.0) - presence) * item.held.out.clamp(0.0, 1.0);
+            sprite.set_opacity(solid * (1.0 - 0.16 * item.press.pos.clamp(0.0, 1.0)))?;
 
             // Running mark: a small drop under the icon that lengthens and takes the accent
             // colour while the app is in front.
@@ -1145,6 +1660,7 @@ impl Dock {
 impl Drop for Dock {
     fn drop(&mut self) {
         if self.owned {
+            crate::dropzone::forget(self.hwnd);
             unsafe {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -1155,13 +1671,22 @@ impl Drop for Dock {
 fn icon_rect_of(m: &Metrics, slot: Slot, item: &Item) -> (f32, f32, f32, f32) {
     // Presence may run a little past 1 as the icon pops in; pressing sinks it, dragging lifts it.
     let presence = item.presence.pos.clamp(0.0, 1.12);
+    // An icon pushed in from outside, which the skin of the glass still holds out, is out
+    // there: at its own size, pressed a little flat. On its way to its place it is, for a
+    // moment, as small as the room it has so far: it squeezes through.
+    let held = item.held;
+    let out = held.out.clamp(0.0, 1.0);
+    let presence = presence + (held.size - presence) * out;
     let touch = (1.0 - 0.14 * item.press.pos.clamp(-0.4, 1.0)) * (1.0 + 0.08 * item.lift.pos.clamp(0.0, 1.2));
     let size = m.icon * slot.scale * presence * touch;
     // Swallowing a window the icon spreads sideways and flattens; letting one go it stretches up.
     let gulp = item.gulp.pos.clamp(-0.6, 0.8);
-    let (w, h) = (size * item.hop.0 * (1.0 + 0.5 * gulp), size * item.hop.1 * (1.0 - 0.34 * gulp));
+    let (w, h) = (size * item.hop.0 * (1.0 + 0.5 * gulp) * (1.0 + (held.shape.0 - 1.0) * out), size * item.hop.1 * (1.0 - 0.34 * gulp) * (1.0 + (held.shape.1 - 1.0) * out));
     let cx = slot.center() + item.shift.pos;
-    let bottom = m.baseline - item.bounce_y;
+    // A wave under the icon lifts it. Landing in its place from outside, it swings a little
+    // below it first.
+    let rest = m.baseline - item.bounce_y - item.ride;
+    let bottom = rest + (held.bottom - rest) * held.out;
     (cx - w * 0.5, bottom - h, cx + w * 0.5, bottom)
 }
 

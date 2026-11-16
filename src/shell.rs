@@ -3,13 +3,13 @@
 
 use crate::util::{from_wide, wide};
 use std::collections::HashMap;
-use windows::core::{BOOL, GUID, PCWSTR, PWSTR};
+use windows::core::{Interface, BOOL, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, IDataObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToString};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU};
@@ -22,6 +22,12 @@ pub const APPS_FOLDER: &str = "shell:AppsFolder\\";
 
 /// PKEY_AppUserModel_ID: the identity Windows uses to group taskbar buttons.
 const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
+
+/// PKEY_Link_TargetParsingPath: what a shortcut points at.
+const PKEY_LINK_TARGET: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xb9b4b3fc_2b51_4a42_b5d8_324146afcf25), pid: 2 };
+
+/// How the shell spells the folder of all apps (`shell:AppsFolder`) in a full name.
+const APPS_FOLDER_ID: &str = "::{4234d49b-0245-4df3-b780-3893943456e1}\\";
 
 /// One open window, attributed to an app.
 #[derive(Clone, Debug)]
@@ -514,6 +520,45 @@ pub fn scan_apps(window: HWND, message: u32) -> AppScan {
         crate::log!("could not start reading the app list: {e}");
     }
     AppScan { wanted, found }
+}
+
+/// What a drag from another program carries (files and shortcuts from Explorer, apps from
+/// the Start menu), as launch targets.
+pub fn targets_in(data: &IDataObject) -> Vec<String> {
+    let mut targets = Vec::new();
+    unsafe {
+        let Ok(items) = SHCreateShellItemArrayFromDataObject::<_, IShellItemArray>(data) else { return targets };
+        for index in 0..items.GetCount().unwrap_or(0) {
+            let Ok(item) = items.GetItemAt(index) else { continue };
+            let text = |kind: SIGDN| {
+                item.GetDisplayName(kind).ok().and_then(|p| {
+                    let s = p.to_string().ok();
+                    CoTaskMemFree(Some(p.0 as *const _));
+                    s
+                })
+            };
+            let Some(full) = text(SIGDN_DESKTOPABSOLUTEPARSING) else { continue };
+            if full.to_lowercase().starts_with(APPS_FOLDER_ID) {
+                // An app from the list of all apps: the same target the tray and the windows use.
+                if let Some(id) = text(SIGDN_PARENTRELATIVEPARSING).filter(|id| !id.is_empty()) {
+                    targets.push(format!("{APPS_FOLDER}{id}"));
+                }
+                continue;
+            }
+            let Some(path) = text(SIGDN_FILESYSPATH) else { continue };
+            // A shortcut to a file stands for that file, so that the app's windows gather
+            // under the icon. (What the shortcut passes to the app is not kept.)
+            let pointed = path.to_lowercase().ends_with(".lnk").then(|| item.cast::<IShellItem2>().ok()).flatten().and_then(|item| {
+                item.GetString(&PKEY_LINK_TARGET).ok().and_then(|p| {
+                    let s = p.to_string().ok();
+                    CoTaskMemFree(Some(p.0 as *const _));
+                    s
+                })
+            });
+            targets.push(pointed.filter(|p| std::path::Path::new(p).is_file()).unwrap_or(path));
+        }
+    }
+    targets
 }
 
 /// The "all apps" list also holds uninstallers, read-me files and links to websites. Leave
