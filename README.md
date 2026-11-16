@@ -2,6 +2,8 @@
 
 A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock along the bottom edge and a dynamic island along the top edge of every monitor. Written in Rust, drawn with Windows Composition.
 
+## Download
+- https://github.com/GnimDev/ben-dock/releases/tag/test
 ## Features
 
 - **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. The first icon opens an app launcher with search.
