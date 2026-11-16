@@ -25,19 +25,20 @@ use crate::gfx::{color, rect, Gfx};
 use crate::shell::IconPixels;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use windows::core::{implement, Interface, Result, GUID, HSTRING, PCWSTR};
+use windows::core::{implement, Interface, Ref, Result, GUID, HSTRING, PCWSTR};
 use windows::Foundation::{IPropertyValue, PropertyValue, Size, TimeSpan};
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::Graphics::Effects::{IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl};
+use windows::Graphics::{IGeometrySource2D, IGeometrySource2D_Impl};
 use windows::System::DispatcherQueueController;
-use windows::Win32::Foundation::{E_BOUNDS, E_INVALIDARG, HWND, POINT};
+use windows::Win32::Foundation::{E_BOUNDS, E_INVALIDARG, E_NOTIMPL, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::System::WinRT::Composition::{ICompositionDrawingSurfaceInterop, ICompositionGraphicsDeviceInterop, ICompositorDesktopInterop, ICompositorInterop};
 use windows::Win32::System::WinRT::Graphics::Direct2D::{
-    IGraphicsEffectD2D1Interop, IGraphicsEffectD2D1Interop_Impl, GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
+    IGeometrySource2DInterop, IGeometrySource2DInterop_Impl, IGraphicsEffectD2D1Interop, IGraphicsEffectD2D1Interop_Impl, GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
 };
 use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT};
 use windows::UI::Color;
@@ -1069,6 +1070,121 @@ impl Slice {
 impl Drop for Slice {
     fn drop(&mut self) {
         let _ = self.parent.Remove(&self.visual);
+    }
+}
+
+/// The outline of a piece of glass whose top edge is not straight: the dock's glass while
+/// its surface moves like water (see `surface.rs`). A glass that wears one is cut to it and
+/// its rim follows it; when it is taken off, the glass has its own rounded outline again.
+pub struct Skin {
+    factory: ID2D1Factory,
+    /// What the glass is cut to, the dark hairline around that, and the bright line inside it.
+    clip: CompositionPathGeometry,
+    outline: CompositionPathGeometry,
+    rim: CompositionPathGeometry,
+    worn: bool,
+}
+
+impl Scene {
+    /// An outline for a piece of glass to wear (see `Skin`).
+    pub fn skin(&self, gfx: &Gfx) -> Result<Skin> {
+        let c = &self.compositor;
+        Ok(Skin { factory: unsafe { gfx.d2d.GetFactory()? }, clip: c.CreatePathGeometry()?, outline: c.CreatePathGeometry()?, rim: c.CreatePathGeometry()?, worn: false })
+    }
+}
+
+impl Skin {
+    /// Shapes `glass`, which has just been given its rectangle. `top`: its top edge from the
+    /// left round corner to the right one, as points in the glass's own coordinates.
+    /// `shoulder`: how far below the top of the rectangle the round corners begin, which is
+    /// where the edge lies when it is straight (the room above is for waves).
+    pub fn wear(&mut self, glass: &Glass, shoulder: f32, top: &[(f32, f32)]) -> Result<()> {
+        let Some([_, _, w, h, radius]) = glass.last else { return Ok(()) };
+        let radius = radius.min((h - shoulder) * 0.5).max(0.0);
+        // The rim's visual starts one pixel above and to the left of the glass, and its two
+        // lines lie half a pixel outside and half a pixel inside the shape (see `Glass::set_rect`).
+        self.clip.SetPath(&self.path(w, h, radius, shoulder, top, 0.0, 0.0)?)?;
+        self.outline.SetPath(&self.path(w, h, radius, shoulder, top, 0.5, 1.0)?)?;
+        self.rim.SetPath(&self.path(w, h, radius, shoulder, top, -0.5, 1.0)?)?;
+        if !self.worn {
+            let (clip, outline, rim) = Self::parts(glass)?;
+            clip.SetGeometry(&self.clip)?;
+            outline.SetGeometry(&self.outline)?;
+            rim.SetGeometry(&self.rim)?;
+            self.worn = true;
+        }
+        Ok(())
+    }
+
+    /// Gives `glass` its own rounded outline back.
+    pub fn take_off(&mut self, glass: &Glass) -> Result<()> {
+        if !self.worn {
+            return Ok(());
+        }
+        self.worn = false;
+        let (clip, outline, rim) = Self::parts(glass)?;
+        clip.SetGeometry(&glass.clip_geo)?;
+        outline.SetGeometry(&glass.outline_geo)?;
+        rim.SetGeometry(&glass.rim_geo)
+    }
+
+    /// What cuts a glass to its shape, and the two lines of its rim.
+    fn parts(glass: &Glass) -> Result<(CompositionGeometricClip, CompositionSpriteShape, CompositionSpriteShape)> {
+        let lines = glass.rim.Shapes()?;
+        Ok((glass.body.Clip()?.cast()?, lines.GetAt(0)?.cast()?, lines.GetAt(1)?.cast()?))
+    }
+
+    /// The outline `grow` pixels outside the shape, in coordinates that start `shift` pixels
+    /// above and to the left of the glass.
+    fn path(&self, w: f32, h: f32, radius: f32, shoulder: f32, top: &[(f32, f32)], grow: f32, shift: f32) -> Result<CompositionPath> {
+        let at = |x: f32, y: f32| Vector2 { X: x + shift, Y: y + shift };
+        let r = (radius + grow).max(0.0);
+        let (x0, y0, x1, y1) = (-grow, shoulder - grow, w + grow, h + grow);
+        let arc = |x: f32, y: f32| D2D1_ARC_SEGMENT { point: at(x, y), size: D2D_SIZE_F { width: r, height: r }, rotationAngle: 0.0, sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE, arcSize: D2D1_ARC_SIZE_SMALL };
+        unsafe {
+            let geometry = self.factory.CreatePathGeometry()?;
+            let sink = geometry.Open()?;
+            // Clockwise from where the top edge leaves the left corner.
+            sink.BeginFigure(at(x0 + r, y0), D2D1_FIGURE_BEGIN_FILLED);
+            if top.len() > 2 {
+                // Each point between the two ends bends the line, which passes halfway between
+                // it and the next: a smooth curve through however many points there are.
+                let bends: Vec<Vector2> = top[1..top.len() - 1].iter().map(|&(x, y)| at(x.clamp(x0 + r, x1 - r), y - grow)).collect();
+                let mut curves: Vec<D2D1_QUADRATIC_BEZIER_SEGMENT> = bends.windows(2).map(|p| D2D1_QUADRATIC_BEZIER_SEGMENT { point1: p[0], point2: Vector2 { X: (p[0].X + p[1].X) * 0.5, Y: (p[0].Y + p[1].Y) * 0.5 } }).collect();
+                curves.push(D2D1_QUADRATIC_BEZIER_SEGMENT { point1: bends[bends.len() - 1], point2: at(x1 - r, y0) });
+                sink.AddQuadraticBeziers(&curves);
+            } else {
+                sink.AddLine(at(x1 - r, y0));
+            }
+            sink.AddArc(&arc(x1, y0 + r));
+            sink.AddLine(at(x1, y1 - r));
+            sink.AddArc(&arc(x1 - r, y1));
+            sink.AddLine(at(x0 + r, y1));
+            sink.AddArc(&arc(x0, y1 - r));
+            sink.AddLine(at(x0, y0 + r));
+            sink.AddArc(&arc(x0 + r, y0));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            let source: IGeometrySource2D = PathSource { geometry: geometry.cast()? }.into();
+            CompositionPath::Create(&source)
+        }
+    }
+}
+
+/// Hands a Direct2D shape to the compositor. This is the same contract Win2D's geometry class implements.
+#[implement(IGeometrySource2D, IGeometrySource2DInterop)]
+struct PathSource {
+    geometry: ID2D1Geometry,
+}
+
+impl IGeometrySource2D_Impl for PathSource_Impl {}
+
+impl IGeometrySource2DInterop_Impl for PathSource_Impl {
+    fn GetGeometry(&self) -> Result<ID2D1Geometry> {
+        Ok(self.geometry.clone())
+    }
+    fn TryGetGeometryUsingFactory(&self, _factory: Ref<ID2D1Factory>) -> Result<ID2D1Geometry> {
+        Err(E_NOTIMPL.into())
     }
 }
 

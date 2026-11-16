@@ -23,6 +23,7 @@ mod camera;
 mod config;
 mod dates;
 mod dock;
+mod dropzone;
 mod fx;
 mod gfx;
 mod island;
@@ -36,6 +37,7 @@ mod settings;
 mod shade;
 mod shell;
 mod spring;
+mod surface;
 mod system;
 mod text;
 mod theme;
@@ -50,6 +52,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, ResetEvent, SetEvent, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -109,6 +112,10 @@ fn run() -> Result<()> {
         // Draw at the display's real resolution instead of being upscaled (blurry) by Windows.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        // For things dragged onto the dock from other programs.
+        if let Err(e) = OleInitialize(None) {
+            log!("OleInitialize failed ({e}); nothing can be dropped on the dock");
+        }
 
         let cfg = config::Config::load();
         log!("Bến {} starting; settings: {:?}", env!("CARGO_PKG_VERSION"), cfg);
