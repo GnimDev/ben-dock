@@ -740,7 +740,14 @@ impl Island {
         self.hwnd
     }
 
-    /// Puts the island at the top centre of `monitor` and, with `reserve_space`, keeps
+    /// Explorer has restarted and forgotten the strip of the screen kept free for the
+    /// island: it is asked for again the next time the island is placed.
+    pub fn forget_strip(&mut self) {
+        self.appbar = AppBar::new(self.hwnd);
+        self.placed = None;
+    }
+
+    /// Puts the island at the top centre of `monitor` and, with `reserve_island`, keeps
     /// maximised windows from sliding under it.
     pub fn place(&mut self, monitor: &Monitor, cfg: &Config, theme: &Theme) {
         let s = monitor.scale();
@@ -750,13 +757,13 @@ impl Island {
         let (win_w, win_h) = (px(OPEN_W) + 2.0 * margin, top + px(OPEN_H_MOST) + margin);
         let strip = (top + px(cfg.island_height) + px(4.0)) as i32;
         // Asking the shell for the same strip again would only make it notify every other bar.
-        let key = (monitor.rect, strip, cfg.reserve_space, win_w as i32);
+        let key = (monitor.rect, strip, cfg.reserve_island, win_w as i32);
         if self.placed == Some(key) {
             return;
         }
         self.placed = Some(key);
         let mut y = monitor.rect.top;
-        if cfg.reserve_space {
+        if cfg.reserve_island {
             self.appbar.register(WM_ISLAND_APPBAR);
             if let Some(granted) = self.appbar.reserve_top(monitor.rect, strip) {
                 y = granted.top;

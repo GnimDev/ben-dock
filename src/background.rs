@@ -18,7 +18,7 @@
 use crate::shell::{self, IconPixels};
 use crate::util::{from_wide, wide};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -46,6 +46,36 @@ const LOOK_EVERY: u32 = 250;
 const SWEEP_EVERY: u32 = 8;
 /// How long the real taskbar gets to answer what is passed on to it, in milliseconds.
 const PATIENCE: u32 = 3000;
+/// The stand-in's window while there is one (0: none), and whether it has been put out of
+/// the way on purpose for a moment (see `past`).
+static STAND_IN_WINDOW: AtomicIsize = AtomicIsize::new(0);
+static ASIDE: AtomicBool = AtomicBool::new(false);
+
+/// Asks the shell something on this program's own behalf (a strip of the screen for the
+/// dock or the island, the taskbar's auto-hide setting) with the stand-in out of the way.
+///
+/// The shell's own functions find the taskbar the way every program does, so they would
+/// find the stand-in. What another program sends through it the taskbar acts on; what this
+/// program sends to its own stand-in the taskbar does not (found by trying: with the
+/// stand-in in front, a strip Bến asked for was never kept free, and one another program
+/// asked for was). So for the length of `ask` the stand-in goes behind every window, and
+/// the taskbar is found first. Other programs find it too for that moment, which does no
+/// harm: an icon changed just then is noted the next time it changes.
+pub fn past<R>(ask: impl FnOnce() -> R) -> R {
+    let stand_in = HWND(STAND_IN_WINDOW.load(Ordering::Acquire) as *mut _);
+    if stand_in.is_invalid() || ASIDE.swap(true, Ordering::AcqRel) {
+        return ask();
+    }
+    unsafe {
+        let _ = SetWindowPos(stand_in, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    let answer = ask();
+    unsafe {
+        let _ = SetWindowPos(stand_in, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    ASIDE.store(false, Ordering::Release);
+    answer
+}
 
 /// What `WM_COPYDATA` carries.
 #[repr(C)]
@@ -457,7 +487,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Explorer puts its taskbar back on top now and then; programs must go on
                 // finding this window first.
                 let class = wide(TASKBAR_CLASS);
-                if FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()).ok() != Some(hwnd) {
+                if !ASIDE.load(Ordering::Acquire) && FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()).ok() != Some(hwnd) {
                     let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
                 HOME.with_borrow_mut(|home| {
@@ -555,6 +585,7 @@ pub fn start(window: HWND, message: u32) -> Option<Background> {
                 return;
             };
             HOME.set(Some(Home { list: Vec::new(), serial: 0, looks: 0, out, told, window, message }));
+            STAND_IN_WINDOW.store(hwnd.0 as isize, Ordering::Release);
             let _ = sender.send(Some(GetCurrentThreadId()));
             // The programs that are running already say what they have when they are asked
             // the way Explorer asks them after it has restarted.
@@ -566,6 +597,7 @@ pub fn start(window: HWND, message: u32) -> Option<Background> {
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 DispatchMessageW(&msg);
             }
+            STAND_IN_WINDOW.store(0, Ordering::Release);
             let _ = DestroyWindow(hwnd);
             HOME.set(None);
         }

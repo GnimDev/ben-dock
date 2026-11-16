@@ -218,16 +218,21 @@ fn taskbar_windows() -> Vec<HWND> {
     out
 }
 
+/// Asks the shell about a bar: the taskbar itself, or a strip of the screen kept free for
+/// the dock or the island. (Past the taskbar's stand-in, which would take the question
+/// otherwise: see `background::past`.)
+fn ask_shell(message: u32, data: &mut APPBARDATA) -> usize {
+    crate::background::past(|| unsafe { SHAppBarMessage(message, data) })
+}
+
 fn taskbar_state(tray: HWND) -> u32 {
     let mut data = APPBARDATA { cbSize: std::mem::size_of::<APPBARDATA>() as u32, hWnd: tray, ..Default::default() };
-    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+    ask_shell(ABM_GETSTATE, &mut data) as u32
 }
 
 fn set_taskbar_state(tray: HWND, state: u32) {
     let mut data = APPBARDATA { cbSize: std::mem::size_of::<APPBARDATA>() as u32, hWnd: tray, lParam: LPARAM(state as isize), ..Default::default() };
-    unsafe {
-        SHAppBarMessage(ABM_SETSTATE, &mut data);
-    }
+    ask_shell(ABM_SETSTATE, &mut data);
 }
 
 /// Hides the Windows taskbar while the dock is running.
@@ -326,7 +331,7 @@ impl AppBar {
         }
         let mut data = self.data();
         data.uCallbackMessage = callback_message;
-        self.registered = unsafe { SHAppBarMessage(ABM_NEW, &mut data) } != 0;
+        self.registered = ask_shell(ABM_NEW, &mut data) != 0;
         if !self.registered {
             crate::log!("could not reserve screen space for the dock (ABM_NEW failed)");
         }
@@ -353,25 +358,21 @@ impl AppBar {
         } else {
             RECT { left: monitor.left, right: monitor.right, bottom: monitor.bottom, top: monitor.bottom - height }
         };
-        unsafe {
-            // The shell moves the rectangle clear of other bars (for example a visible taskbar).
-            SHAppBarMessage(ABM_QUERYPOS, &mut data);
-            if top {
-                data.rc.bottom = data.rc.top + height;
-            } else {
-                data.rc.top = data.rc.bottom - height;
-            }
-            SHAppBarMessage(ABM_SETPOS, &mut data);
+        // The shell moves the rectangle clear of other bars (for example a visible taskbar).
+        ask_shell(ABM_QUERYPOS, &mut data);
+        if top {
+            data.rc.bottom = data.rc.top + height;
+        } else {
+            data.rc.top = data.rc.bottom - height;
         }
+        ask_shell(ABM_SETPOS, &mut data);
         Some(data.rc)
     }
 
     pub fn remove(&mut self) {
         if self.registered {
             let mut data = self.data();
-            unsafe {
-                SHAppBarMessage(ABM_REMOVE, &mut data);
-            }
+            ask_shell(ABM_REMOVE, &mut data);
             self.registered = false;
         }
     }

@@ -359,6 +359,11 @@ impl Corner {
         self.kind
     }
 
+    /// True for a corner beside the island, false for one beside the dock.
+    pub fn at_top(&self) -> bool {
+        self.kind.top()
+    }
+
     /// Puts the corner in its corner of `monitor`: the top ones level with the island, the
     /// bottom ones on the dock's own line (`bottom_line` is the bottom of the dock's strip).
     pub fn place(&mut self, monitor: &Monitor, cfg: &Config, theme: &Theme, bottom_line: i32) {

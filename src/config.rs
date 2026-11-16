@@ -29,6 +29,9 @@ pub struct Config {
     /// Corner radius as a percentage of the panel height (50 = a capsule).
     pub corner_radius: f32,
     pub margin_bottom: f32,
+    /// With the dock's strip of the screen kept free: how far above the dock a maximised
+    /// window ends.
+    pub reserve_gap: f32,
     pub magnification: f32,
     pub spread: f32,
     /// The drop of light that follows the cursor.
@@ -63,9 +66,13 @@ pub struct Config {
     pub click_minimize: bool,
     pub hide_on_fullscreen: bool,
     pub show_on_desktop: bool,
+    /// Over a maximised window the dock stays in view; so does the island.
     pub show_when_maximized: bool,
+    pub island_when_maximized: bool,
     pub hide_taskbar: bool,
-    pub reserve_space: bool,
+    /// Maximised windows are kept off the dock's strip of the screen; off the island's.
+    pub reserve_dock: bool,
+    pub reserve_island: bool,
     pub launcher: bool,
     pub launcher_icon: f32,
     /// A tap of the Windows key opens the app tray instead of the Start menu.
@@ -125,6 +132,7 @@ impl Default for Config {
             padding: 9.0,
             corner_radius: 50.0,
             margin_bottom: 10.0,
+            reserve_gap: 10.0,
             magnification: 1.6,
             spread: 2.4,
             lens: true,
@@ -150,8 +158,10 @@ impl Default for Config {
             hide_on_fullscreen: true,
             show_on_desktop: true,
             show_when_maximized: false,
+            island_when_maximized: false,
             hide_taskbar: true,
-            reserve_space: false,
+            reserve_dock: false,
+            reserve_island: false,
             launcher: true,
             launcher_icon: 56.0,
             win_key: true,
@@ -256,9 +266,10 @@ pub const PARAMS: &[Param] = &[
     param!("corner_system", "Bốn góc", "Máy tính (dưới phải)", "Viên kính ở góc dưới bên phải: bộ xử lý và bộ nhớ đang dùng. Bấm vào đúng góc màn hình để hiện màn hình nền", Kind::Toggle, true, flag!(corner_system)),
     param!("icon_size", "Dock", "Cỡ icon", "Cỡ icon khi đứng yên (điểm ảnh, trước khi nhân tỉ lệ màn hình)", n(24.0, 96.0, 1.0), true, num!(icon_size)),
     param!("gap", "Dock", "Khoảng cách giữa icon", "Khoảng cách giữa các icon", n(0.0, 30.0, 1.0), true, num!(gap)),
-    param!("padding", "Dock", "Lề trong", "Khoảng cách từ icon tới mép dock", n(4.0, 24.0, 1.0), true, num!(padding)),
+    param!("padding", "Dock", "Khoảng cách icon tới viền dock", "Khoảng cách từ icon tới viền của dock (lề trong)", n(0.0, 24.0, 1.0), true, num!(padding)),
     param!("corner_radius", "Dock", "Độ bo góc", "Độ bo góc của dock, tính theo % chiều cao (50 = bo tròn thành viên thuốc)", n(0.0, 50.0, 1.0), true, num!(corner_radius)),
     param!("margin_bottom", "Dock", "Cách mép dưới màn hình", "Khoảng cách từ dock tới mép dưới màn hình", n(0.0, 40.0, 1.0), true, num!(margin_bottom)),
+    param!("reserve_gap", "Dock", "Cách cửa sổ phóng to", "Khi bật \"Cửa sổ phóng to không che dock\": khoảng cách từ viền trên của dock tới chỗ cửa sổ phóng to dừng lại", n(0.0, 40.0, 1.0), true, num!(reserve_gap)),
     param!("magnification", "Dock", "Độ phóng to", "Icon dưới con trỏ to gấp mấy lần. 1.0 = không phóng to", n(1.0, 2.5, 0.05), true, num!(magnification)),
     param!("spread", "Dock", "Độ lan", "Phóng to lan ra mấy icon ở mỗi bên con trỏ", n(1.0, 6.0, 0.1), true, num!(spread)),
     param!("lens", "Dock", "Giọt sáng theo chuột", "Giọt sáng trượt theo con trỏ giữa các icon", Kind::Toggle, true, flag!(lens)),
@@ -271,9 +282,11 @@ pub const PARAMS: &[Param] = &[
     param!("click_minimize", "Hành vi", "Bấm icon app đang ở trước để thu nhỏ", "Bấm vào icon của ứng dụng đang ở trước thì thu nhỏ nó", Kind::Toggle, true, flag!(click_minimize)),
     param!("hide_on_fullscreen", "Hành vi", "Ẩn khi có app toàn màn hình", "Dock và đảo trượt khỏi màn hình khi có ứng dụng chiếm toàn màn hình", Kind::Toggle, true, flag!(hide_on_fullscreen)),
     param!("show_on_desktop", "Hành vi", "Luôn hiện ở màn hình chính", "Dock, đảo và các góc luôn hiện khi không có cửa sổ nào phóng to. Tắt: chúng ẩn đi, chỉ để lại một thanh trắng ở mép dưới màn hình; rê chuột vào thanh đó thì hiện ra", Kind::Toggle, true, flag!(show_on_desktop)),
-    param!("show_when_maximized", "Hành vi", "Luôn hiện khi có cửa sổ phóng to", "Dock và đảo vẫn hiện khi có cửa sổ phóng to (các góc thì luôn ẩn). Tắt: chúng ẩn đi, chỉ để lại một thanh trắng ở mép dưới màn hình; rê chuột vào thanh đó thì hiện ra, rời đi 2 giây thì ẩn lại, đảo còn lại giờ phút thêm 8 giây", Kind::Toggle, true, flag!(show_when_maximized)),
+    param!("show_when_maximized", "Hành vi", "Dock luôn hiện khi có cửa sổ phóng to", "Dock vẫn hiện khi có cửa sổ phóng to. Tắt: dock ẩn đi, chỉ để lại một thanh trắng ở mép dưới màn hình; rê chuột vào thanh đó thì dock hiện ra, rời đi 2 giây thì ẩn lại", Kind::Toggle, true, flag!(show_when_maximized)),
+    param!("island_when_maximized", "Hành vi", "Đảo luôn hiện khi có cửa sổ phóng to", "Đảo vẫn hiện khi có cửa sổ phóng to. Tắt: đảo ẩn đi; nó hiện lại khi rê chuột vào dock (hoặc vào thanh trắng ở mép dưới), khi đổi âm lượng, cắm sạc, đổi bài; chuột rời đi 2 giây thì đảo thu lại còn giờ phút thêm 8 giây rồi ẩn", Kind::Toggle, true, flag!(island_when_maximized)),
     param!("hide_taskbar", "Hành vi", "Ẩn taskbar của Windows", "Ẩn taskbar của Windows khi Bến chạy (thoát Bến thì taskbar trở lại)", Kind::Toggle, true, flag!(hide_taskbar)),
-    param!("reserve_space", "Hành vi", "Cửa sổ phóng to không che dock và đảo", "Giữ chỗ ở mép trên và mép dưới để cửa sổ phóng to không che dock và đảo. Chỉ nên bật cùng với \"Luôn hiện khi có cửa sổ phóng to\"", Kind::Toggle, true, flag!(reserve_space)),
+    param!("reserve_dock", "Hành vi", "Cửa sổ phóng to không che dock", "Giữ chỗ ở mép dưới màn hình để cửa sổ phóng to dừng lại phía trên dock. Khi đó dock và hai góc dưới (thời tiết, máy tính) luôn hiện, kể cả khi có cửa sổ phóng to", Kind::Toggle, true, flag!(reserve_dock)),
+    param!("reserve_island", "Hành vi", "Cửa sổ phóng to không che đảo", "Giữ chỗ ở mép trên màn hình để cửa sổ phóng to bắt đầu phía dưới đảo. Khi đó đảo và hai góc trên (Claude, thông báo) luôn hiện, kể cả khi có cửa sổ phóng to", Kind::Toggle, true, flag!(reserve_island)),
     param!("launcher", "Hành vi", "Nút khay ứng dụng trong dock", "Icon đầu tiên của dock mở khay tất cả ứng dụng", Kind::Toggle, true, flag!(launcher)),
     param!("launcher_icon", "Hành vi", "Cỡ icon trong khay ứng dụng", "Cỡ icon trong khay ứng dụng (điểm ảnh)", n(40.0, 96.0, 4.0), true, num!(launcher_icon)),
     param!("win_key", "Hành vi", "Phím Windows mở khay ứng dụng", "Bấm phím Windows một mình thì mở khay ứng dụng của Bến thay cho menu Start (gõ ngay để tìm ứng dụng). Phím Windows bấm cùng phím khác (Win+D, Win+E...) vẫn như cũ, và Ctrl+Esc vẫn mở menu Start. Cần bật nút khay ứng dụng", Kind::Toggle, true, flag!(win_key)),
@@ -407,6 +420,13 @@ pub fn parse(text: &str) -> (Config, usize) {
         if old && !CARRIED_OVER.contains(&key.as_str()) {
             continue;
         }
+        // (One setting used to keep maximised windows off the dock and the island both.)
+        if key == "reserve_space" {
+            if let Some(v) = parse_value(value) {
+                (c.reserve_dock, c.reserve_island) = (v >= 0.5, v >= 0.5);
+            }
+            continue;
+        }
         match (PARAMS.iter().find(|p| p.key == key), parse_value(value)) {
             (Some(p), Some(v)) => {
                 (p.set)(&mut c, p.clean(v));
@@ -415,6 +435,11 @@ pub fn parse(text: &str) -> (Config, usize) {
             (Some(_), None) => crate::log!("ben.ini: '{value}' is not a valid value for {key}"),
             (None, _) => crate::log!("ben.ini: unknown key '{key}'"),
         }
+    }
+    // (And one setting kept the dock and the island in view over a maximised window: a file
+    // from then says nothing of the island, which goes on doing what the dock does.)
+    if !lines.iter().any(|(key, _)| key == "island_when_maximized") {
+        c.island_when_maximized = c.show_when_maximized;
     }
     (c, missing)
 }
@@ -536,6 +561,26 @@ mod tests {
         assert_eq!(c.icon_size, 96.0);
         assert_eq!(c.elastic, 0.25);
         assert_eq!(c.magnification, Config::default().magnification);
+    }
+
+    #[test]
+    fn settings_that_were_split_in_two_keep_what_they_said() {
+        // One setting kept maximised windows off the dock and the island both.
+        let (c, missing) = parse("style = 0\nreserve_space = true\n");
+        assert!(missing > 0);
+        assert!(c.reserve_dock && c.reserve_island);
+        // The two that replace it have the last word.
+        let (c, _) = parse("style = 0\nreserve_space = true\nreserve_island = false\n");
+        assert!(c.reserve_dock && !c.reserve_island);
+        // One setting kept the dock and the island in view over a maximised window.
+        let (c, _) = parse("style = 0\nshow_when_maximized = true\n");
+        assert!(c.show_when_maximized && c.island_when_maximized);
+        let (c, _) = parse("style = 0\nshow_when_maximized = true\nisland_when_maximized = false\n");
+        assert!(c.show_when_maximized && !c.island_when_maximized);
+        // What is written now reads back as it is, whichever way the two are set.
+        let mut c = Config::default();
+        (c.show_when_maximized, c.island_when_maximized, c.reserve_dock, c.reserve_island) = (true, false, false, true);
+        assert_eq!(parse(&c.to_ini()).0, c);
     }
 
     #[test]

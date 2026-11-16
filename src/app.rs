@@ -671,16 +671,18 @@ struct Screen {
     filled: bool,
     covered: bool,
     showing: bool,
-    /// The dock and island are tucked out of view until the cursor comes for them (see `update`).
+    /// The dock or the island is tucked out of view until the cursor comes for it (see `update`).
     auto: bool,
     /// When the cursor left the dock it had brought back (None: it is there), and when the
     /// island stopped being shown whole (None: it is).
     dock_left: Option<Instant>,
     island_left: Option<Instant>,
-    /// 0 = shown, 1 = out of view: the dock, the island and the corners each.
+    /// 0 = shown, 1 = out of view: the dock, the island, the corners beside the island and
+    /// the corners beside the dock each.
     hide: Spring,
     hide_island: Spring,
-    hide_corners: Spring,
+    hide_corners_top: Spring,
+    hide_corners_bottom: Spring,
 }
 
 pub struct App {
@@ -1025,7 +1027,7 @@ impl App {
         let dock = Dock::new(window, owned, &self.scene, &self.cfg, &theme, &self.motion, &monitor)?;
         dropzone::accept(window);
         let mut appbar = AppBar::new(window);
-        if self.cfg.reserve_space {
+        if self.cfg.reserve_dock {
             appbar.register(WM_APPBAR_CALLBACK);
         }
         // Everything rises into view when it first appears.
@@ -1034,7 +1036,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners: hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners_top: hide, hide_corners_bottom: hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -1286,7 +1288,7 @@ impl App {
     /// it, and no maximised window covers it (or one does, but strips along the edges are
     /// kept free for the dock and the island, and the desktop shows there).
     fn desktop_seen(&self) -> bool {
-        self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && (!screen.covered || self.cfg.reserve_space))
+        self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && (!screen.covered || self.cfg.reserve_dock || self.cfg.reserve_island))
     }
 
     /// Starts or stops the timer that looks at the cursor and the sound for the wallpaper.
@@ -1331,9 +1333,10 @@ impl App {
             // hidden, otherwise just above the taskbar.
             if reserve {
                 let mut bottom = if self.taskbar.hidden { monitor.rect.bottom } else { monitor.work.bottom };
-                if self.cfg.reserve_space {
+                if self.cfg.reserve_dock {
+                    // The dock, the room under it, and the room kept between it and a maximised window.
                     let m = dock::metrics(&self.cfg, monitor.scale(), monitor.width());
-                    let height = (m.panel_h + m.margin * 2.0).ceil() as i32;
+                    let height = (m.panel_h + m.margin + (self.cfg.reserve_gap * monitor.scale()).round()).ceil() as i32;
                     if let Some(strip) = screen.appbar.reserve(monitor.rect, height) {
                         bottom = strip.bottom;
                     }
@@ -1602,8 +1605,11 @@ impl App {
                 }
                 for screen in &mut self.screens {
                     screen.appbar = AppBar::new(screen.dock.hwnd());
-                    if self.cfg.reserve_space {
+                    if self.cfg.reserve_dock {
                         screen.appbar.register(WM_APPBAR_CALLBACK);
+                    }
+                    if let Some(island) = screen.island.as_mut() {
+                        island.forget_strip();
                     }
                 }
                 unsafe {
@@ -2944,9 +2950,9 @@ impl App {
                 self.taskbar.restore();
             }
         }
-        if cfg.reserve_space != old.reserve_space {
+        if cfg.reserve_dock != old.reserve_dock {
             for screen in &mut self.screens {
-                if cfg.reserve_space {
+                if cfg.reserve_dock {
                     screen.appbar.register(WM_APPBAR_CALLBACK);
                 } else {
                     screen.appbar.remove();
@@ -3260,21 +3266,33 @@ impl App {
             if s == 0 && fake.is_some() {
                 cursor = fake;
             }
-            // What stays in view on this screen. A full-screen app sends everything away. With
-            // a maximised window showing (or without one: both are settings) the dock and the
-            // island are tucked away: the cursor at the bar on the bottom edge brings them
-            // back, the dock goes again two seconds after the cursor has left, and the island
-            // stays eight seconds more as the time alone. The corners never show over a
-            // maximised window.
-            let auto = !scripted && !screen.filled && if screen.covered { !self.cfg.show_when_maximized } else { !self.cfg.show_on_desktop };
+            // What stays in view on this screen whatever the cursor does. A full-screen app
+            // sends everything away. On the desktop one setting says it for all. Over a
+            // maximised window the dock and the island have a setting each, and whatever has
+            // its strip of the screen kept free stays as well: the dock and the corners
+            // beside it, the island and the corners beside it. The other corners never show
+            // over a maximised window.
+            //
+            // What does not stay is tucked away: the cursor at the bar on the bottom edge (or
+            // on the dock, if that stayed) brings it back, the dock goes again two seconds
+            // after the cursor has left, and the island stays eight seconds more as the time
+            // alone.
+            let (dock_stays, island_stays, top_stays, bottom_stays) = if screen.covered {
+                (self.cfg.show_when_maximized || self.cfg.reserve_dock, self.cfg.island_when_maximized || self.cfg.reserve_island, self.cfg.reserve_island, self.cfg.reserve_dock)
+            } else {
+                let all = self.cfg.show_on_desktop;
+                (all, all, all, all)
+            };
+            let auto = !scripted && !screen.filled && !(dock_stays && island_stays);
             let was_mini = screen.island.as_ref().is_some_and(|island| island.is_mini());
             let mut mini = false;
-            let (dock_away, island_away, corners_away) = if screen.filled {
+            // (`awake`: the cursor is there for what was tucked away, or was until a moment ago.)
+            let (dock_away, island_away, awake) = if screen.filled {
                 // It leaves as it is.
                 mini = was_mini;
-                (true, true, true)
+                (true, true, false)
             } else if !auto {
-                (false, false, screen.covered)
+                (false, false, true)
             } else {
                 let (left, top, right, bottom) = screen.dock.bar_zone();
                 let at_bar = cursor.is_some_and(|(cx, cy)| cx >= left && cx < right && cy >= top && cy <= bottom);
@@ -3299,27 +3317,31 @@ impl App {
                 }
                 let lingering = !full && screen.island_left.is_some_and(|at| now.duration_since(at) < TUCK_ISLAND);
                 // Gone, it stays as it left: the time alone, if it was that.
-                mini = lingering || (!full && was_mini);
+                mini = !island_stays && (lingering || (!full && was_mini));
                 // Neither wait ends with an event: note when to look again.
-                let waits = [screen.dock_left.filter(|_| dock_shown).map(|at| at + TUCK_DOCK), screen.island_left.filter(|_| lingering).map(|at| at + TUCK_ISLAND)];
+                let waits = [screen.dock_left.filter(|_| dock_shown).map(|at| at + TUCK_DOCK), screen.island_left.filter(|_| lingering && !island_stays).map(|at| at + TUCK_ISLAND)];
                 for at in waits.into_iter().flatten() {
                     due = Some(due.map_or(at, |soonest| soonest.min(at)));
                 }
-                (!dock_shown, !full && !lingering, screen.covered || !dock_shown)
+                (!dock_stays && !dock_shown, !island_stays && !full && !lingering, dock_shown)
             };
+            // The corners: those that stay, stay; the others are out of view over a maximised
+            // window, and come and go with the dock where everything is tucked away.
+            let corners_away = [top_stays, bottom_stays].map(|stays| screen.filled || (!stays && (screen.covered || !awake)));
             screen.auto = auto;
-            screen.dock.set_bar(auto);
+            // (The bar is what a tucked-away dock leaves behind: none while the dock stays.)
+            screen.dock.set_bar(auto && !dock_stays);
             // The bubble that shows the desktop has nothing to do when the desktop is showing.
             screen.dock.set_desk(self.cfg.desktop_button && screen.showing);
             if let Some(island) = screen.island.as_mut() {
                 island.set_mini(mini);
             }
-            if corners_away {
-                for corner in &mut screen.corners {
+            for corner in &mut screen.corners {
+                if corners_away[if corner.at_top() { 0 } else { 1 }] {
                     corner.collapse();
                 }
             }
-            for (spring, away) in [(&mut screen.hide, dock_away), (&mut screen.hide_island, island_away), (&mut screen.hide_corners, corners_away)] {
+            for (spring, away) in [(&mut screen.hide, dock_away), (&mut screen.hide_island, island_away), (&mut screen.hide_corners_top, corners_away[0]), (&mut screen.hide_corners_bottom, corners_away[1])] {
                 spring.set(if away { 1.0 } else { 0.0 });
                 // Coming back into view it bounces a little; leaving, it just goes.
                 spring.tune(if away { self.motion.calm() } else { self.motion.medium() });
@@ -3373,7 +3395,8 @@ impl App {
                     Kind::Weather => corner::Show { there: true, glyph: 0, text: &sky_text, sub: sky_words, busy: false },
                     Kind::System => corner::Show { there: true, glyph: PULSE, text: &vital_text, sub: &vital_sub, busy: false },
                 };
-                match corner.update(&self.scene, &self.gfx, &screen.theme, &self.motion, &show, &screen.hide_corners, dt) {
+                let hide = if corner.at_top() { &screen.hide_corners_top } else { &screen.hide_corners_bottom };
+                match corner.update(&self.scene, &self.gfx, &screen.theme, &self.motion, &show, hide, dt) {
                     Ok(more) => moving |= more,
                     Err(e) => errors.push(e),
                 }
