@@ -394,6 +394,9 @@ pub struct Island {
     seeking: Option<f32>,
     volume: (f32, bool),
     hover_opens: bool,
+    /// Only the time is shown at rest, and how far the rest has gone (1 = the time alone).
+    mini: bool,
+    mini_at: Spring,
 
     scale: f32,
     /// Gap between the screen's top edge and the glass.
@@ -674,6 +677,8 @@ impl Island {
                 seeking: None,
                 volume: (0.0, false),
                 hover_opens: true,
+                mini: false,
+                mini_at: Spring::with(0.0, motion.fade()),
                 scale: 1.0,
                 top: 6.0,
                 win: (1.0, 1.0),
@@ -838,6 +843,22 @@ impl Island {
         self.pressed = None;
         self.typed.clear();
         self.focus(false);
+    }
+
+    /// Shrinks the resting island to the time alone (it is on its way out of view), or gives it
+    /// back the rest.
+    pub fn set_mini(&mut self, mini: bool) {
+        self.mini = mini;
+    }
+
+    pub fn is_mini(&self) -> bool {
+        self.mini
+    }
+
+    /// True while the island is in use: under the cursor, open, saying something, or with
+    /// something held on it.
+    pub fn engaged(&self) -> bool {
+        self.hovering || self.alerting || self.mode == Mode::Open || self.dragging || self.seeking.is_some() || self.focused
     }
 
     pub fn is_open(&self) -> bool {
@@ -1124,6 +1145,12 @@ impl Island {
                 self.c_batt_text.set(scene, gfx, &f.small, "", fg, None)?;
             }
         }
+        // On its way out of view only the time is left of it (see `set_mini`): the rest fades,
+        // and the glass closes on the time.
+        self.mini_at.tune(motion.fade());
+        self.mini_at.set(if self.mini { 1.0 } else { 0.0 });
+        self.mini_at.step(dt);
+        let rest = 1.0 - self.mini_at.pos.clamp(0.0, 1.0);
         let mut x = px(14.0);
         // Three bars that dance while something plays. The compositor moves them; the app sleeps.
         let (bar_w, bar_h, bar_gap) = (px(3.0), px(13.0), px(2.0));
@@ -1131,7 +1158,7 @@ impl Island {
         for (i, bar) in self.bars.iter_mut().enumerate() {
             bar.place(x + i as f32 * (bar_w + bar_gap), ((h0 - bar_h) * 0.5).round(), bar_w, bar_h, bar_w * 0.5)?;
             bar.set_color(theme.accent_color(1.0))?;
-            bar.set_opacity(if media.is_some() { 1.0 } else { 0.0 })?;
+            bar.set_opacity(if media.is_some() { rest } else { 0.0 })?;
             if playing && !motion.reduced() {
                 bar.pulse(0.3, 0.78 + 0.17 * i as f32, i as f32 * 0.31)?;
             } else {
@@ -1139,10 +1166,11 @@ impl Island {
             }
         }
         if media.is_some() {
-            x += 3.0 * bar_w + 2.0 * bar_gap + px(9.0);
+            x += ((3.0 * bar_w + 2.0 * bar_gap + px(9.0)) * rest).round();
         }
         let y = mid(&self.c_time, h0);
         self.c_time.place(x, y)?;
+        let time_end = x + self.c_time.w;
         x += self.c_time.w + px(8.0);
         let y = mid(&self.c_day, h0);
         self.c_day.place(x, y)?;
@@ -1165,7 +1193,10 @@ impl Island {
             self.c_batt_text.place(x, y)?;
             x += self.c_batt_text.w;
         }
-        let compact_size = (x + px(14.0), h0);
+        for line in [&mut self.c_day, &mut self.c_net, &mut self.c_mute, &mut self.c_batt, &mut self.c_batt_text] {
+            line.set_opacity(rest)?;
+        }
+        let compact_size = ((time_end + (x - time_end) * rest + px(14.0)).round(), h0);
 
         // -------------------------------------------------------------- alert
         let ah = h0 + px(6.0);
@@ -1739,6 +1770,7 @@ impl Island {
             || !self.h.settled(0.05)
             || !self.r.settled(0.05)
             || self.show.iter().any(|spring| !spring.settled(1e-3))
+            || !self.mini_at.settled(1e-3)
             || !self.hot_at.settled())
     }
 }

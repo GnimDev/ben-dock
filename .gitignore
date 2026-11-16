@@ -11,6 +11,8 @@
 ben.ini
 ben-*.ini
 pins.txt
+usage.txt
+icons.cache
 *.state
 
 # Nhật ký (của Bến, của build.bat) và file tạm.

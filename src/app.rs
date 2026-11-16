@@ -9,6 +9,7 @@
 use crate::audio;
 use crate::bluetooth;
 use crate::bubble::{self, Bubble, Entry};
+use crate::carry::Carry;
 use crate::config::{self, Config};
 use crate::corner::{self, Corner, Kind};
 use crate::desktop;
@@ -23,6 +24,7 @@ use crate::media::{self, Media, NowPlaying};
 use crate::motion::Motion;
 use crate::notices::{Notice, Notices};
 use crate::preview::{self, Preview};
+use crate::ranking;
 use crate::scene::Scene;
 use crate::settings;
 use crate::shell::{self, AppScan, WindowTracker};
@@ -36,11 +38,12 @@ use crate::wallpaper::{self, Wallpaper};
 use crate::weather::{self, Weather};
 use crate::widget::{self, Widget};
 use crate::wifi;
+use crate::winkey::{self, WinKey};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -61,6 +64,14 @@ const WM_PAGE_DATA: u32 = WM_APP + 6;
 const WM_NOTICES_CHANGED: u32 = WM_APP + 7;
 const WM_CLAUDE_READ: u32 = WM_APP + 8;
 const WM_WEATHER_READ: u32 = WM_APP + 9;
+const WM_FRONT_CHANGED: u32 = WM_APP + 10;
+const WM_WIN_KEY: u32 = WM_APP + 11;
+/// Rings when something that is tucked out of view is due to change (see `update`).
+const TIMER_TUCK: usize = 4;
+/// Tucked away and brought back by the cursor, the dock goes again this long after the cursor
+/// has left; the island then stays this long as the time alone before it goes too.
+const TUCK_DOCK: Duration = Duration::from_secs(2);
+const TUCK_ISLAND: Duration = Duration::from_secs(8);
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
@@ -71,7 +82,7 @@ const TIMER_WAKE: usize = 2;
 const TIMER_LOOK: usize = 3;
 /// A timer that runs while the live wallpaper is on show: time to look at where the cursor
 /// is and how loud the sound is (see `App::poll_desktop`). And how often, in milliseconds.
-const TIMER_POLL: usize = 4;
+const TIMER_POLL: usize = 5;
 const POLL_EVERY: u32 = 50;
 /// For how long after it opens a window is made to float if it turns out too large: some
 /// apps show their window first and maximise it a moment later. Seconds.
@@ -247,6 +258,8 @@ pub enum Event {
     Island(isize, island::Input),
     Bubble(bubble::Input),
     Launcher(launcher::Input),
+    /// The Windows key was tapped on its own (see `winkey.rs`).
+    WinKey,
     /// The settings window changed something. `true` once the change is final (control released).
     Config(bool),
     Quit,
@@ -353,6 +366,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 push(Event::WindowsChanged);
             } else if wparam.0 == TIMER_POLL {
                 push(Event::Poll);
+            } else if wparam.0 == TIMER_TUCK {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_TUCK);
+                }
+                push(Event::Wake);
             } else {
                 push(Event::Tick);
             }
@@ -377,6 +395,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             push(Event::Apps);
             return LRESULT(0);
         }
+        WM_WIN_KEY => {
+            push(Event::WinKey);
+            return LRESULT(0);
+        }
         WM_PAGE_DATA => {
             push(Event::PageData);
             return LRESULT(0);
@@ -391,6 +413,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_WEATHER_READ => {
             push(Event::Weather);
+            return LRESULT(0);
+        }
+        WM_FRONT_CHANGED => {
+            // The window in front was maximised or put back: the windows are read again.
+            push(Event::WindowsChanged);
             return LRESULT(0);
         }
         WM_POWERBROADCAST => push(Event::Power),
@@ -621,8 +648,19 @@ struct Screen {
     corners: Vec<Corner>,
     /// Bottom edge of the dock's strip on screen, as last granted by the shell.
     bottom_line: i32,
-    /// 0 = shown, 1 = out of the way of a full-screen app on this screen.
+    /// A full-screen app fills this screen; a maximised window is showing on it.
+    filled: bool,
+    covered: bool,
+    /// The dock and island are tucked out of view until the cursor comes for them (see `update`).
+    auto: bool,
+    /// When the cursor left the dock it had brought back (None: it is there), and when the
+    /// island stopped being shown whole (None: it is).
+    dock_left: Option<Instant>,
+    island_left: Option<Instant>,
+    /// 0 = shown, 1 = out of view: the dock, the island and the corners each.
     hide: Spring,
+    hide_island: Spring,
+    hide_corners: Spring,
 }
 
 pub struct App {
@@ -639,6 +677,8 @@ pub struct App {
     /// The screen each of the shared surfaces last opened on.
     bubble_screen: usize,
     launcher: Option<Launcher>,
+    /// The bubble that carries an app being dragged out of the tray (made at the first drag).
+    carry: Option<Carry>,
     /// The background reader of the app list, started when the tray is first opened.
     scan: Option<AppScan>,
     preview: Option<Preview>,
@@ -646,6 +686,11 @@ pub struct App {
     fx: Option<Fx>,
     /// After a restore effect ends, how long to keep its picture up while the real window appears.
     fx_release: Option<Release>,
+    /// Whether Windows' own minimise animation is on (true) or switched off (false) for each
+    /// open window, as the app last set it (see `keep_windows_still`), and the window the
+    /// effect was playing for then.
+    transitions: HashMap<isize, bool>,
+    fx_busy: Option<isize>,
 
     tracker: WindowTracker,
     taskbar: Taskbar,
@@ -735,11 +780,13 @@ pub struct App {
     /// The live wallpaper, when it is switched on; and when making it was last tried.
     wallpaper: Option<Wallpaper>,
     wallpaper_tried: Instant,
-    /// On some screen no window is spread over the whole desktop.
-    desktop_open: bool,
     /// The timer that looks at the cursor and the sound for the wallpaper is running.
     polling: bool,
+    /// When something tucked out of view is next due to change (a timer is set for it).
+    tuck_due: Option<Instant>,
     hooks: Vec<HWINEVENTHOOK>,
+    /// Watches the Windows key while the tray can be opened with it.
+    winkey: Option<WinKey>,
     /// Last error from updating the visuals, so a repeating error is logged once.
     shown_error: Option<windows::core::Error>,
 
@@ -785,11 +832,14 @@ impl App {
             bubble: None,
             bubble_screen: 0,
             launcher: None,
+            carry: None,
             scan: None,
             preview: None,
             preview_screen: 0,
             fx: None,
             fx_release: None,
+            transitions: HashMap::new(),
+            fx_busy: None,
             tracker: WindowTracker::default(),
             taskbar: Taskbar::new(),
             tracking_mouse: 0,
@@ -844,9 +894,10 @@ impl App {
             focus: tasks::Focus::new(25.0),
             wallpaper: None,
             wallpaper_tried: Instant::now(),
-            desktop_open: true,
             polling: false,
+            tuck_due: None,
             hooks: Vec::new(),
+            winkey: None,
             shown_error: None,
             bench: None,
             bench_last: None,
@@ -929,6 +980,7 @@ impl App {
         // Versions before this one switched Windows' own minimise animation off while they
         // ran. This one leaves it alone; if such a run never put it back, do so now.
         system::restore_window_animations();
+        shell::watch_front(app.hwnd, WM_FRONT_CHANGED);
         app.setup_surfaces();
         system::limit_memory(app.cfg.ram_limit.round().max(0.0) as u32);
         Ok(app)
@@ -949,7 +1001,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners: hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -1022,6 +1074,14 @@ impl App {
                 Err(e) => crate::log!("the app's own menus are unavailable ({e}); using Windows' menu"),
             }
         }
+        // The Start menu is only taken over while there is a tray to open instead.
+        if self.cfg.launcher && self.cfg.win_key {
+            if self.winkey.is_none() {
+                self.winkey = winkey::start(self.hwnd, WM_WIN_KEY);
+            }
+        } else {
+            self.winkey = None;
+        }
         if self.cfg.launcher && self.launcher.is_none() {
             match Launcher::new(&self.scene, first, &self.motion) {
                 Ok(l) => self.launcher = Some(l),
@@ -1031,8 +1091,20 @@ impl App {
             self.launcher = None;
             self.scan = None;
         }
+        self.start_scan();
         self.setup_wallpaper();
         self.setup_widgets();
+    }
+
+    /// Starts reading the list of installed apps, if the tray is there and it has not been
+    /// started: the names and popularity at once, and the icons of the most popular into a
+    /// file, so that the tray is full the first time it is opened.
+    fn start_scan(&mut self) {
+        if self.scan.is_some() || self.launcher.is_none() {
+            return;
+        }
+        let size = (self.cfg.launcher_icon * self.screens[0].monitor.scale()).round() as u32;
+        self.scan = Some(shell::scan_apps(self.hwnd, WM_APPS_FOUND, size));
     }
 
     /// The screen a point is on (the first, if it is on none).
@@ -1167,11 +1239,17 @@ impl App {
         self.poll_desktop();
     }
 
+    /// True while some of the desktop can be seen on some screen: no full-screen app fills
+    /// it, and no maximised window covers it (or one does, but strips along the edges are
+    /// kept free for the dock and the island, and the desktop shows there).
+    fn desktop_seen(&self) -> bool {
+        self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && (!screen.covered || self.cfg.reserve_space))
+    }
+
     /// Starts or stops the timer that looks at the cursor and the sound for the wallpaper.
     /// It runs while there is a wallpaper and a screen it can be seen on.
     fn poll_desktop(&mut self) {
-        let seen = self.demo.is_some() || self.screens.iter().any(|screen| screen.hide.target == 0.0);
-        let wanted = self.wallpaper.is_some() && seen;
+        let wanted = self.wallpaper.is_some() && self.desktop_seen();
         if wanted != self.polling {
             self.polling = wanted;
             unsafe {
@@ -1309,7 +1387,9 @@ impl App {
                 }
             }
             Event::LeftDown(window, x, y) => {
-                let Some(s) = self.screen_of_dock(window) else { return };
+                // (A click on the bar a tucked-away dock leaves only brings the dock back: its
+                // icons are not there to be clicked yet. The same for the other buttons.)
+                let Some(s) = self.screen_of_dock(window).filter(|&s| self.screens[s].hide.pos < 0.5) else { return };
                 self.close_bubble();
                 self.close_preview();
                 let pressed = self.screens[s].dock.press(x as f32, y as f32);
@@ -1326,18 +1406,25 @@ impl App {
                 match self.screens[s].dock.release(x as f32, y as f32) {
                     Released::Click(index) => self.click(s, index),
                     Released::Reordered => self.share_pins(s),
+                    // Pulled out of the dock and let go: it is off the dock, and the bubble bursts.
+                    Released::Removed => {
+                        self.share_pins(s);
+                        if let Some(carry) = self.carry.as_mut() {
+                            carry.vanish(false, &self.motion);
+                        }
+                    }
                     Released::Nothing => {}
                 }
             }
             Event::MiddleUp(window, x, y) => {
-                let Some(s) = self.screen_of_dock(window) else { return };
+                let Some(s) = self.screen_of_dock(window).filter(|&s| self.screens[s].hide.pos < 0.5) else { return };
                 self.close_bubble();
                 if let Some(index) = self.screens[s].dock.app_at(x as f32, y as f32) {
                     self.launch(s, index);
                 }
             }
             Event::RightUp(window, x, y) => {
-                let Some(s) = self.screen_of_dock(window) else { return };
+                let Some(s) = self.screen_of_dock(window).filter(|&s| self.screens[s].hide.pos < 0.5) else { return };
                 self.close_bubble();
                 self.close_preview();
                 let dock = &self.screens[s].dock;
@@ -1483,12 +1570,17 @@ impl App {
                 let window = HWND(id as *mut _);
                 // Unless the app started this minimise itself (then its own effect is playing).
                 if self.fx.as_ref().and_then(|f| f.window()) != Some(window) {
-                    if system::window_animations_on() {
+                    // Windows' animation is off for this window (see `keep_windows_still`) or
+                    // for all of them: the app's effect is all there is. (Another window's
+                    // effect is playing, as when many are minimised at once: this one just goes.)
+                    let still = self.transitions.get(&id) == Some(&false);
+                    if still || !system::window_animations_on() {
+                        if self.fx.as_ref().and_then(|f| f.window()).is_none() {
+                            self.play_effect(window, false);
+                        }
+                    } else {
                         // Windows is flying the window to its icon, which swallows it as it lands.
                         self.swallow(window, 0.11, 1.0);
-                    } else {
-                        // Windows' own animation is switched off: the app's effect is all there is.
-                        self.play_effect(window, false);
                     }
                 }
                 self.refresh_due = true;
@@ -1550,6 +1642,13 @@ impl App {
                     }
                 }
             }
+            Event::WinKey => {
+                // On the screen the cursor is on, where the person is looking.
+                let mut pt = POINT::default();
+                let have_cursor = unsafe { GetCursorPos(&mut pt) }.is_ok();
+                let s = self.screens.iter().position(|screen| have_cursor && pt.x >= screen.monitor.rect.left && pt.x < screen.monitor.rect.right && pt.y >= screen.monitor.rect.top && pt.y < screen.monitor.rect.bottom).unwrap_or(0);
+                self.toggle_launcher(s);
+            }
             Event::Launcher(input) => {
                 let chosen = self.launcher.as_mut().and_then(|l| l.handle(input));
                 if let Some(target) = chosen {
@@ -1602,6 +1701,39 @@ impl App {
     fn swallow(&mut self, window: HWND, delay: f32, strength: f32) {
         if let Some((s, index)) = self.owner_of(window) {
             self.screens[s].dock.items[index].gulp(delay, strength);
+        }
+    }
+
+    /// True when the app plays its own effect (shrink, genie, drop) as windows are minimised.
+    fn own_effect(&self) -> bool {
+        matches!(self.cfg.minimize_effect.round() as i32, 1..=3)
+    }
+
+    /// Windows animates a window as it is minimised with its own button, the keyboard or
+    /// Alt+Tab, and the app is only told once that has begun, too late to put its own effect
+    /// in place of it. So while the app plays its own effect, Windows' animation is switched
+    /// off for every open window that is not minimised (the minimise is then over at once, and
+    /// the app's effect plays over where the window was, see `Event::Minimized`). A minimised
+    /// window has Windows' animation back on, for the way out again by other means.
+    fn keep_windows_still(&mut self, open: &[HWND]) {
+        // The window the effect is playing for is the effect's (see `Fx::start`); when that
+        // changes, what was set may have been undone, so it is all set again.
+        let busy = self.fx.as_ref().and_then(|f| f.window()).map(|w| w.0 as isize);
+        if busy != self.fx_busy {
+            self.fx_busy = busy;
+            self.transitions.clear();
+        }
+        let own = self.own_effect();
+        for &w in open {
+            let id = w.0 as isize;
+            if busy == Some(id) {
+                continue;
+            }
+            let on = !(own && !shell::is_minimized(w));
+            if self.transitions.get(&id) != Some(&on) {
+                shell::set_transitions(w, on);
+                self.transitions.insert(id, on);
+            }
         }
     }
 
@@ -2242,6 +2374,21 @@ impl App {
         let Some(launcher) = self.launcher.as_mut() else { return };
         let let_go = matches!(input, launcher::Input::Click(..));
         let carried = if let_go { launcher.take_carried() } else { launcher.carried() };
+        // The app leaves the tray in a bubble that follows the cursor.
+        let lifting = if carried.is_some() && !let_go && !self.carry.as_ref().is_some_and(|c| c.is_held()) { launcher.carried_icon() } else { None };
+        if let Some((surface, icon)) = lifting {
+            if self.carry.is_none() {
+                match Carry::new(&self.scene, &self.screens[0].theme, &self.motion) {
+                    Ok(carry) => self.carry = Some(carry),
+                    Err(e) => crate::log!("no bubble for an app being dragged: {e}"),
+                }
+            }
+            if let Some(carry) = self.carry.as_mut() {
+                if let Err(e) = carry.lift(&surface, icon, self.screens[0].monitor.scale(), &self.screens[0].theme, &self.motion) {
+                    crate::log!("could not lift the bubble: {e}");
+                }
+            }
+        }
         let mut pt = POINT::default();
         let have_cursor = unsafe { GetCursorPos(&mut pt) }.is_ok();
         // Over a dock: on its glass, or a little above it, where the swollen icons reach.
@@ -2259,12 +2406,24 @@ impl App {
             self.tray_drag = None;
             self.refresh_due = true;
         }
+        // Over a dock the dock shows the icon, and the bubble steps aside.
+        if let Some(carry) = self.carry.as_mut() {
+            carry.over_dock(over.is_some());
+            if let_go && carried.is_some() && over.is_none() {
+                // Let go anywhere else: it bursts.
+                carry.vanish(false, &self.motion);
+            }
+        }
         let (Some(target), Some(s)) = (carried, over) else { return };
         let dock = &mut self.screens[s].dock;
         if let_go {
             self.tray_drag = None;
-            if dock.drop_in(&[target], &self.motion) {
+            let landed = dock.drop_in(&[target], &self.motion);
+            if landed {
                 self.share_pins(s);
+            }
+            if let Some(carry) = self.carry.as_mut() {
+                carry.vanish(landed, &self.motion);
             }
         } else {
             dock.drag_in(&[target], (pt.x - dock.win_x) as f32, &self.motion);
@@ -2473,6 +2632,7 @@ impl App {
         }
         // The shell can take a second to start an app; the icon starts hopping at once.
         let item = &mut self.screens[s].dock.items[index];
+        ranking::record_launch(&item.target);
         shell::launch_soon(&item.target);
         if self.cfg.bounce && item.windows.is_empty() {
             item.hop(None);
@@ -2645,11 +2805,8 @@ impl App {
     fn toggle_launcher(&mut self, s: usize) {
         self.close_preview();
         self.close_bubble();
-        if self.scan.is_none() && self.launcher.is_some() {
-            // First time: start reading the list of installed apps. Names arrive within a
-            // second; icons are read as their page is shown.
-            self.scan = Some(shell::scan_apps(self.hwnd, WM_APPS_FOUND));
-        }
+        // (Normally read since the start; names arrive within a second, icons as their page is shown.)
+        self.start_scan();
         self.take_found_apps();
         let screen = &self.screens[s];
         let rect = screen.monitor.rect;
@@ -2754,6 +2911,8 @@ impl App {
         let windows = self.tracker.scan(self.hwnd);
         self.settle_newcomers(&windows);
         let real_front = unsafe { GetForegroundWindow() };
+        // Which screens have a maximised window showing.
+        let covered: Vec<bool> = self.screens.iter().map(|screen| windows.iter().any(|w| shell::is_maximized(w.hwnd) && !shell::is_minimized(w.hwnd) && shell::monitor_of(w.hwnd) == screen.monitor.handle)).collect();
         // An open menu must not change which app counts as being in front; and if something
         // else came to the front without the menu being told, the menu goes.
         if let Some(open) = self.bubble.as_ref().filter(|b| b.is_open()).map(|b| b.hwnd()) {
@@ -2792,11 +2951,13 @@ impl App {
 
         // Remember where every open window is, for the minimise effect.
         let mut seen = Vec::new();
+        let mut open = Vec::new();
         for screen in &self.screens {
             for item in &screen.dock.items {
                 for &w in &item.windows {
                     let id = w.0 as isize;
                     seen.push(id);
+                    open.push(w);
                     if !shell::is_minimized(w) {
                         if let Some(whole) = shell::window_rect(w) {
                             self.rects.insert(id, (whole, shell::frame_rect(w).unwrap_or(whole)));
@@ -2807,6 +2968,8 @@ impl App {
         }
         self.rects.retain(|id, _| seen.contains(id));
         self.homes.retain(|id, _| seen.contains(id));
+        self.transitions.retain(|id, _| seen.contains(id));
+        self.keep_windows_still(&open);
         self.publish_min_rects();
 
         // If the previewed app's windows changed, rebuild the preview (or close it).
@@ -2824,13 +2987,14 @@ impl App {
             }
         }
 
-        // Step out of the way of games, videos and presentations, on the screen they fill.
+        // Games, videos and presentations fill a screen: everything steps out of their way. A
+        // maximised window covers one: what stays in view then is settled in `update`.
         let filled = (self.cfg.hide_on_fullscreen && shell::is_fullscreen(real_front)).then(|| shell::monitor_of(real_front));
         let mut changed = false;
-        for screen in &mut self.screens {
+        for (screen, covered) in self.screens.iter_mut().zip(covered) {
             let hidden = filled == Some(screen.monitor.handle);
-            changed |= (screen.hide.target == 1.0) != hidden;
-            screen.hide.set(if hidden { 1.0 } else { 0.0 });
+            changed |= screen.filled != hidden || screen.covered != covered;
+            (screen.filled, screen.covered) = (hidden, covered);
             if hidden {
                 if let Some(island) = screen.island.as_mut() {
                     island.collapse();
@@ -2863,10 +3027,7 @@ impl App {
             }
         }
 
-        // The wallpaper's water is only stirred by sound while there is desktop to see it
-        // on: while, on some screen, no window is spread over all of it.
-        let spread = |screen: &Screen| screen.dock.items.iter().flat_map(|item| item.windows.iter()).any(|&w| !shell::is_minimized(w) && (shell::is_maximized(w) || shell::is_fullscreen(w)));
-        self.desktop_open = self.screens.iter().any(|screen| !spread(screen));
+        // The wallpaper is only looked after while some of the desktop can be seen.
         self.poll_desktop();
     }
 
@@ -2937,6 +3098,10 @@ impl App {
     pub fn update(&mut self, dt: f32) -> bool {
         self.run_demo();
         self.passes += 1;
+        // An effect started or ended: Windows' animation is set up for the windows again.
+        if self.fx.as_ref().and_then(|f| f.window()).map(|w| w.0 as isize) != self.fx_busy {
+            self.refresh_due = true;
+        }
         // Windows often reports several changes at once (an app opening three windows): read
         // them together, a few times a second at most.
         if self.refresh_due && self.last_refresh.elapsed().as_secs_f32() >= REFRESH_EVERY {
@@ -2951,6 +3116,12 @@ impl App {
         let mut moving = false;
         let mut errors: Vec<windows::core::Error> = Vec::new();
         let previewing = self.preview.as_ref().map(|p| p.is_open()).unwrap_or(false);
+        // What keeps a tucked-away dock in view besides the cursor: something of its own that
+        // is open, or an app being carried to it.
+        let held = previewing || self.carry.as_ref().is_some_and(|c| c.is_held()) || self.launcher.as_ref().is_some_and(|l| l.is_open()) || self.bubble.as_ref().is_some_and(|b| b.is_open());
+        let scripted = self.scripted();
+        let now = Instant::now();
+        let mut due: Option<Instant> = None;
         let info = island::Info { time: &self.clock.time, day: &self.clock.day, date: &self.clock.date, today: self.today, status: self.last_status, media: self.playing.as_ref() };
         // What each corner says at rest. Claude's: the share of the week's limit used where
         // Claude Code has a current note of it, otherwise the tokens taken today.
@@ -2976,10 +3147,70 @@ impl App {
             if s == 0 && fake.is_some() {
                 cursor = fake;
             }
-            // Coming back into view it bounces a little; leaving, it just goes.
-            screen.hide.tune(if screen.hide.target == 0.0 { self.motion.medium() } else { self.motion.calm() });
-            screen.hide.step(dt);
-            moving |= !screen.hide.settled(1e-3);
+            // What stays in view on this screen. A full-screen app sends everything away. With
+            // a maximised window showing (or without one: both are settings) the dock and the
+            // island are tucked away: the cursor at the bar on the bottom edge brings them
+            // back, the dock goes again two seconds after the cursor has left, and the island
+            // stays eight seconds more as the time alone. The corners never show over a
+            // maximised window.
+            let auto = !scripted && !screen.filled && if screen.covered { !self.cfg.show_when_maximized } else { !self.cfg.show_on_desktop };
+            let was_mini = screen.island.as_ref().is_some_and(|island| island.is_mini());
+            let mut mini = false;
+            let (dock_away, island_away, corners_away) = if screen.filled {
+                // It leaves as it is.
+                mini = was_mini;
+                (true, true, true)
+            } else if !auto {
+                (false, false, screen.covered)
+            } else {
+                let (left, top, right, bottom) = screen.dock.bar_zone();
+                let at_bar = cursor.is_some_and(|(cx, cy)| cx >= left && cx < right && cy >= top && cy <= bottom);
+                let cornered = !screen.covered && screen.corners.iter().any(|corner| corner.engaged());
+                let near = held || at_bar || cornered || screen.dock.hovering || screen.dock.pressed.is_some();
+                if !screen.auto {
+                    // Just tucked away: out of view at once, unless the cursor is there.
+                    screen.dock_left = Some(now.checked_sub(TUCK_DOCK).unwrap_or(now));
+                    screen.island_left = Some(now.checked_sub(TUCK_ISLAND).unwrap_or(now));
+                }
+                if near {
+                    screen.dock_left = None;
+                } else if screen.dock_left.is_none() {
+                    screen.dock_left = Some(now);
+                }
+                let dock_shown = screen.dock_left.is_none_or(|at| now.duration_since(at) < TUCK_DOCK);
+                let full = dock_shown || screen.island.as_ref().is_some_and(|island| island.engaged());
+                if full {
+                    screen.island_left = None;
+                } else if screen.island_left.is_none() {
+                    screen.island_left = Some(now);
+                }
+                let lingering = !full && screen.island_left.is_some_and(|at| now.duration_since(at) < TUCK_ISLAND);
+                // Gone, it stays as it left: the time alone, if it was that.
+                mini = lingering || (!full && was_mini);
+                // Neither wait ends with an event: note when to look again.
+                let waits = [screen.dock_left.filter(|_| dock_shown).map(|at| at + TUCK_DOCK), screen.island_left.filter(|_| lingering).map(|at| at + TUCK_ISLAND)];
+                for at in waits.into_iter().flatten() {
+                    due = Some(due.map_or(at, |soonest| soonest.min(at)));
+                }
+                (!dock_shown, !full && !lingering, screen.covered || !dock_shown)
+            };
+            screen.auto = auto;
+            screen.dock.set_bar(auto);
+            if let Some(island) = screen.island.as_mut() {
+                island.set_mini(mini);
+            }
+            if corners_away {
+                for corner in &mut screen.corners {
+                    corner.collapse();
+                }
+            }
+            for (spring, away) in [(&mut screen.hide, dock_away), (&mut screen.hide_island, island_away), (&mut screen.hide_corners, corners_away)] {
+                spring.set(if away { 1.0 } else { 0.0 });
+                // Coming back into view it bounces a little; leaving, it just goes.
+                spring.tune(if away { self.motion.calm() } else { self.motion.medium() });
+                spring.step(dt);
+                moving |= !spring.settled(1e-3);
+            }
 
             let count = screen.dock.count();
             let quiet = previewing && self.preview_screen == s;
@@ -2991,8 +3222,31 @@ impl App {
                 // An app left the dock: read the windows again.
                 self.refresh_due = true;
             }
+            // A pinned app pulled up out of the dock is carried by a bubble; put back, the
+            // bubble shrinks into the dock again.
+            match screen.dock.pull() {
+                Some(true) => {
+                    if self.carry.is_none() {
+                        match Carry::new(&self.scene, &screen.theme, &self.motion) {
+                            Ok(carry) => self.carry = Some(carry),
+                            Err(e) => crate::log!("no bubble for an app pulled out of the dock: {e}"),
+                        }
+                    }
+                    if let (Some(carry), Some((surface, icon))) = (self.carry.as_mut(), screen.dock.pulled_icon()) {
+                        if let Err(e) = carry.lift(&surface, icon, screen.monitor.scale(), &screen.theme, &self.motion) {
+                            crate::log!("could not lift the bubble: {e}");
+                        }
+                    }
+                }
+                Some(false) => {
+                    if let Some(carry) = self.carry.as_mut().filter(|c| c.is_held()) {
+                        carry.vanish(true, &self.motion);
+                    }
+                }
+                None => {}
+            }
             if let Some(island) = screen.island.as_mut() {
-                match island.update(&self.scene, &self.gfx, &self.cfg, &screen.theme, &self.motion, &info, &screen.hide, dt) {
+                match island.update(&self.scene, &self.gfx, &self.cfg, &screen.theme, &self.motion, &info, &screen.hide_island, dt) {
                     Ok(more) => moving |= more,
                     Err(e) => errors.push(e),
                 }
@@ -3004,9 +3258,24 @@ impl App {
                     Kind::Weather => corner::Show { there: true, glyph: 0, text: &sky_text, sub: sky_words, busy: false },
                     Kind::System => corner::Show { there: true, glyph: PULSE, text: &vital_text, sub: &vital_sub, busy: false },
                 };
-                match corner.update(&self.scene, &self.gfx, &screen.theme, &self.motion, &show, &screen.hide, dt) {
+                match corner.update(&self.scene, &self.gfx, &screen.theme, &self.motion, &show, &screen.hide_corners, dt) {
                     Ok(more) => moving |= more,
                     Err(e) => errors.push(e),
+                }
+            }
+        }
+
+        // A timer rings when the soonest of the waits above is over.
+        if due != self.tuck_due {
+            self.tuck_due = due;
+            unsafe {
+                match due {
+                    Some(at) => {
+                        SetTimer(Some(self.hwnd), TIMER_TUCK, at.saturating_duration_since(now).as_millis() as u32 + 30, None);
+                    }
+                    None => {
+                        let _ = KillTimer(Some(self.hwnd), TIMER_TUCK);
+                    }
                 }
             }
         }
@@ -3038,13 +3307,14 @@ impl App {
             }
         }
 
-        // The wallpaper's water: the cursor stirs it wherever the desktop itself is under it.
+        // The wallpaper's water: the cursor stirs it wherever the desktop itself is under it,
+        // and sound does while, on some screen, no maximised window lies over it.
+        let showing = self.desktop_seen();
+        let open = self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && !screen.covered);
         if let Some(wallpaper) = self.wallpaper.as_mut() {
-            let touring = self.demo.is_some();
-            let showing = touring || self.screens.iter().any(|screen| screen.hide.target == 0.0);
             let feel = wallpaper::Feel {
                 showing,
-                open: touring || self.desktop_open,
+                open,
                 cursor: (showing && have_cursor && desktop::is_at(pt)).then_some((pt.x, pt.y)),
                 down: unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0,
             };
@@ -3103,6 +3373,18 @@ impl App {
         }
         if let Some(launcher) = self.launcher.as_mut() {
             match launcher.update(&self.scene, &self.gfx, &self.screens[0].theme, &self.motion, self.scan.as_ref(), dt) {
+                Ok(more) => moving |= more,
+                Err(e) => errors.push(e),
+            }
+            // Closed: what was started now counts, for the order the next time it opens.
+            if launcher.take_closed() {
+                if let Some(scan) = self.scan.as_ref() {
+                    scan.rescore();
+                }
+            }
+        }
+        if let Some(carry) = self.carry.as_mut() {
+            match carry.update(&self.scene, &self.motion, dt) {
                 Ok(more) => moving |= more,
                 Err(e) => errors.push(e),
             }
@@ -3377,8 +3659,13 @@ impl App {
 
     /// Undoes everything the app changed in Windows. Called once, on exit.
     pub fn shutdown(&mut self) {
-        // From here on Explorer's answer stands again.
+        // From here on Explorer's answer stands again, and so does Windows' own animation.
         MIN_RECTS.with(|table| table.borrow_mut().clear());
+        for (id, on) in std::mem::take(&mut self.transitions) {
+            if !on {
+                shell::set_transitions(HWND(id as *mut _), true);
+            }
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ID);
             let _ = DeregisterShellHookWindow(self.hwnd);
@@ -3391,6 +3678,8 @@ impl App {
         // The desktop gets its own picture back.
         self.wallpaper = None;
         self.poll_desktop();
+        // The Windows key is Windows' again.
+        self.winkey = None;
         self.preview = None;
         self.fx = None;
         self.launcher = None;
@@ -3400,6 +3689,7 @@ impl App {
         self.notices = None;
         self.claude = None;
         self.weather = None;
+        self.carry = None;
         system::restore_window_animations();
         // Each screen's dock and island give their strip of screen back as they go.
         self.screens.clear();

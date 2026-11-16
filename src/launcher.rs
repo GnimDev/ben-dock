@@ -1,16 +1,18 @@
 //! The app tray: a sheet of glass that grows up out of the dock's first
-//! button, holding every installed app in pages. Type to search, scroll or
-//! use the arrow keys to change page, click an app to open it, click outside
-//! or press Esc to leave.
+//! button, holding every installed app in pages, the most popular first (see
+//! `ranking.rs`). Type to search (by name, initials, short name...), scroll or
+//! use the arrow keys to change page, click an app to open it, drag it onto a
+//! dock to pin it, click outside or press Esc to leave.
 //!
-//! Nothing is read for it until it is first opened, and then only the icons
-//! of the page on show (see `shell::scan_apps`); a while after it is closed
-//! it lets them go again.
+//! The list of apps is read from the start; only the icons of the page on show
+//! are painted (they come from `shell::scan_apps`, mostly from the file kept by
+//! `icon_cache.rs`); a while after it is closed it lets them go again.
 
 use crate::app::{self, Event};
 use crate::gfx::Gfx;
 use crate::layout::Grid;
 use crate::motion::{Glide, Motion};
+use crate::ranking::{self, Hay, Query, Usage};
 use crate::scene::{Bead, Glass, Pill, Scene, Sprite, Stage};
 use crate::shell::{self, AppScan, Found, IconPixels};
 use crate::spring::Spring;
@@ -52,8 +54,12 @@ pub enum Input {
 
 struct Tile {
     name: String,
-    /// Lower-case name, for searching.
+    /// Lower-case name, for ordering.
     key: String,
+    /// What a search looks at.
+    hay: Hay,
+    /// How popular the app is (see `ranking.rs`); the most popular are on the first page.
+    score: f32,
     target: String,
     /// The icon, read but not painted yet.
     pixels: Option<IconPixels>,
@@ -65,6 +71,9 @@ struct Tile {
     shown: bool,
     /// 0 = a stand-in tile, 1 = the app's own icon, fully there. It swells in as it arrives.
     arrive: Spring,
+    /// 1 while the cursor is on the tile, falling off to 0 over the tiles around it: the
+    /// tile swells under the cursor, as an icon does in the dock.
+    swell: Spring,
 }
 
 pub struct Launcher {
@@ -77,11 +86,18 @@ pub struct Launcher {
     search_box: Pill,
     search_icon: Line,
     search_text: Line,
+    /// Said where the apps would be when there are none to show.
+    empty: Line,
     dots: Vec<Pill>,
+    /// Every app, the most popular first.
     tiles: Vec<Tile>,
     /// Indices into `tiles` that match the search, in display order.
     matches: Vec<usize>,
     query: String,
+    /// What was started and what was picked for which search.
+    usage: Usage,
+    /// The tray has been closed since this was last asked.
+    just_closed: bool,
     /// What a tile shows until its icon has been read.
     blank: Option<CompositionDrawingSurface>,
     open: bool,
@@ -213,6 +229,7 @@ impl Launcher {
             let search_box = scene.pill_in(&inside)?;
             let search_icon = Line::new_in(scene, &inside)?;
             let search_text = Line::new_in(scene, &inside)?;
+            let empty = Line::new_in(scene, &inside)?;
             Ok(Launcher {
                 hwnd,
                 _stage: stage,
@@ -222,10 +239,13 @@ impl Launcher {
                 search_box,
                 search_icon,
                 search_text,
+                empty,
                 dots: Vec::new(),
                 tiles: Vec::new(),
                 matches: Vec::new(),
                 query: String::new(),
+                usage: Usage::default(),
+                just_closed: false,
                 blank: None,
                 open: false,
                 visible: false,
@@ -268,6 +288,7 @@ impl Launcher {
         }
         self.search_text.forget();
         self.search_icon.forget();
+        self.empty.forget();
     }
 
     /// Lets go of every icon and name that was painted; they are read again when next shown.
@@ -295,20 +316,34 @@ impl Launcher {
         self.closed.map(|t| t.elapsed().as_secs_f32())
     }
 
-    /// Takes in what the background reader found: apps (kept in alphabetical order) and icons.
-    /// Returns true if anything arrived.
+    /// Takes in what the background reader found: apps (the most popular first, then in
+    /// alphabetical order), their scores when they change, and icons. Returns true if
+    /// anything arrived.
     pub fn absorb(&mut self, found: impl Iterator<Item = Found>, motion: &Motion) -> bool {
         let (mut added, mut any) = (false, false);
         for item in found {
             any = true;
             match item {
-                Found::App { name, target } => {
+                Found::App { name, target, score } => {
                     if self.tiles.iter().any(|t| t.target == target) {
                         continue;
                     }
                     let key = name.to_lowercase();
-                    let at = self.tiles.partition_point(|t| t.key <= key);
-                    self.tiles.insert(at, Tile { name, key, target, pixels: None, asked: false, icon: None, surface: None, label: None, shown: false, arrive: Spring::with(0.0, motion.small()) });
+                    let hay = ranking::hay(&name, &target);
+                    let at = self.tiles.partition_point(|t| t.score > score || (t.score == score && t.key <= key));
+                    self.tiles.insert(at, Tile { name, key, hay, score, target, pixels: None, asked: false, icon: None, surface: None, label: None, shown: false, arrive: Spring::with(0.0, motion.small()), swell: Spring::with(0.0, motion.small()) });
+                    added = true;
+                }
+                Found::Scores(scores) => {
+                    let scores: std::collections::HashMap<String, f32> = scores.into_iter().collect();
+                    for tile in &mut self.tiles {
+                        if let Some(&score) = scores.get(&tile.target) {
+                            tile.score = score;
+                        }
+                    }
+                    self.tiles.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.key.cmp(&b.key)));
+                    // The tiles have moved: what was held is another tile now.
+                    self.held = None;
                     added = true;
                 }
                 Found::Icon { target, pixels } => {
@@ -324,13 +359,44 @@ impl Launcher {
         any
     }
 
-    /// Recomputes which apps match the search text.
+    /// Recomputes which apps match the search text: all of them in order of popularity when
+    /// nothing is typed, otherwise the apps that answer it, the best answers first (and,
+    /// among equals, the most popular and those picked for this search before).
     fn search(&mut self) {
-        let query = self.query.trim().to_lowercase();
-        self.matches = (0..self.tiles.len()).filter(|&i| query.is_empty() || self.tiles[i].key.contains(&query)).collect();
+        let query = Query::new(&self.query);
+        if query.is_empty() {
+            self.matches = (0..self.tiles.len()).collect();
+        } else {
+            let key = query.key();
+            let mut found: Vec<(usize, f32)> = (0..self.tiles.len())
+                .filter_map(|i| {
+                    let tile = &self.tiles[i];
+                    query.score(&tile.hay).map(|score| (i, score + 0.6 * tile.score + 60.0 * self.usage.pick_count(&key, &tile.target).min(6) as f32))
+                })
+                .collect();
+            found.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| self.tiles[a.0].key.cmp(&self.tiles[b.0].key)));
+            self.matches = found.into_iter().map(|(i, _)| i).collect();
+        }
         let pages = self.grid.pages(self.matches.len());
         self.page = self.page.min(pages - 1);
         self.scroll.set(self.page as f32);
+    }
+
+    /// Notes that an app was chosen from the tray (for this search, if one was typed), and
+    /// hands its target back.
+    fn pick(&mut self, target: String) -> String {
+        let query = Query::new(&self.query);
+        if !query.is_empty() {
+            self.usage.picked(&query.key(), &target);
+        }
+        self.usage.launched(&target);
+        self.usage.save();
+        target
+    }
+
+    /// True once after the tray has been closed: the apps can be scored again.
+    pub fn take_closed(&mut self) -> bool {
+        std::mem::take(&mut self.just_closed)
     }
 
     /// Opens the tray on `monitor`, its bottom edge at screen row `bottom`, growing out of
@@ -359,11 +425,15 @@ impl Launcher {
         self.margin = margin;
         // Blur and shadow are sized for the screen it opens on.
         self.glass.set_material(&theme.sheet);
-        self.glass.set_rect(scene, margin, margin, w, h, px(26.0))?;
+        // As round as the dock: the corners follow the shorter side of the sheet.
+        self.glass.set_rect(scene, margin, margin, w, h, px(36.0))?;
 
         self.query.clear();
+        self.held = None;
+        self.carrying = None;
         self.page = 0;
         self.scroll = Spring::with(0.0, motion.medium());
+        self.usage = Usage::load();
         self.search();
         self.open = true;
         self.cursor = None;
@@ -384,6 +454,7 @@ impl Launcher {
     pub fn close(&mut self) {
         if self.open {
             self.open = false;
+            self.just_closed = true;
             self.show.set(0.0);
         }
         self.held = None;
@@ -400,6 +471,14 @@ impl Launcher {
         self.carrying.take()
     }
 
+    /// The picture of the app being dragged (its stand-in if its icon has not come yet) and
+    /// its size in pixels, for the bubble that carries it.
+    pub fn carried_icon(&self) -> Option<(CompositionDrawingSurface, f32)> {
+        let target = self.carrying.as_ref()?;
+        let tile = self.tiles.iter().find(|t| &t.target == target)?;
+        Some((tile.surface.clone().or_else(|| self.blank.clone())?, self.icon))
+    }
+
     fn turn_page(&mut self, by: i32) {
         let pages = self.grid.pages(self.matches.len()) as i32;
         self.page = (self.page as i32 + by).clamp(0, pages - 1) as usize;
@@ -408,17 +487,25 @@ impl Launcher {
 
     /// Reacts to mouse and keyboard. Returns the app to start, if one was chosen.
     pub fn handle(&mut self, input: Input) -> Option<String> {
-        if !self.open {
+        // Once an app is being dragged the tray has gone, but its window goes on hearing the
+        // mouse until the button comes up.
+        if !self.open && (self.carrying.is_none() || !matches!(input, Input::Move(..) | Input::Click(..) | Input::Leave)) {
             return None;
         }
         match input {
             Input::Move(x, y) => {
                 let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
                 self.cursor = Some((x, y));
-                // A press on a tile turns into a drag once the cursor has clearly moved.
+                // A press on a tile turns into a drag once the cursor has clearly moved: the
+                // tray fades away, and the app goes on under the cursor.
                 if let (Some((tile, px, py)), None) = (self.held, &self.carrying) {
                     if (x - px).abs().max((y - py).abs()) >= 6.0 * self.scale {
                         self.carrying = self.tiles.get(tile).map(|t| t.target.clone());
+                        if self.carrying.is_some() {
+                            self.open = false;
+                            self.just_closed = true;
+                            self.show.set(0.0);
+                        }
                     }
                 }
             }
@@ -436,6 +523,7 @@ impl Launcher {
                 }
                 let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
                 if let Some(target) = self.tile_at(x, y).map(|i| self.tiles[i].target.clone()) {
+                    let target = self.pick(target);
                     self.close();
                     return Some(target);
                 }
@@ -464,10 +552,13 @@ impl Launcher {
                     }
                 }
                 13 => {
-                    // Enter opens the first match.
-                    if let Some(target) = self.matches.first().map(|&i| self.tiles[i].target.clone()) {
-                        self.close();
-                        return Some(target);
+                    // Enter opens the first match (of a search: with nothing typed it opens nothing).
+                    if !self.query.trim().is_empty() {
+                        if let Some(target) = self.matches.first().map(|&i| self.tiles[i].target.clone()) {
+                            let target = self.pick(target);
+                            self.close();
+                            return Some(target);
+                        }
                     }
                 }
                 8 => {
@@ -536,8 +627,8 @@ impl Launcher {
         self.scroll.tune(motion.medium());
         self.show.step(dt);
         self.scroll.step(dt);
-        if !self.open && self.show.pos < 0.02 {
-            // Shrunk away: take the window off the screen.
+        if !self.open && self.show.pos < 0.02 && self.carrying.is_none() {
+            // Shrunk away (and nothing is being dragged out of it): take the window off the screen.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -569,6 +660,18 @@ impl Launcher {
         self.search_text.set(scene, gfx, self.search_font.as_ref().unwrap(), if placeholder { "Tìm ứng dụng" } else { &self.query }, if placeholder { dim } else { fg }, Some(bw - 60.0 * s))?;
         let ty = by + ((bh - self.search_text.h) * 0.5).round();
         self.search_text.place(bx + (36.0 * s).round(), ty)?;
+
+        // Where there are no apps to show, say why.
+        let words = if self.tiles.is_empty() {
+            "Đang đọc danh sách ứng dụng…".to_string()
+        } else if self.matches.is_empty() {
+            format!("Không tìm thấy “{}”", self.query.trim())
+        } else {
+            String::new()
+        };
+        self.empty.set(scene, gfx, self.search_font.as_ref().unwrap(), &words, dim, Some(w - 60.0 * s))?;
+        let ey = self.grid.y + (self.grid.height() * 0.35).round();
+        self.empty.place(((w - self.empty.w) * 0.5).round(), ey)?;
 
         // Tiles: the current page and, while a page turn is in motion, its neighbours.
         let per_page = self.grid.per_page();
@@ -627,13 +730,34 @@ impl Launcher {
             let (cx, cy) = self.grid.cell_center(position % per_page);
             let x = cx + away * w;
             let top = cy - (icon + 26.0 * s) * 0.5;
-            let size = if tile.surface.is_some() { icon * (0.7 + 0.3 * tile.arrive.pos.clamp(0.0, 1.15)) } else { icon };
+            // The icon under the cursor swells and rises a little, the ones next to it less,
+            // like the dock's. (Its picture is only made for its resting size, so it is kept
+            // from growing as much as the dock's icons do.)
+            let near = match self.cursor.filter(|_| self.open) {
+                Some((mx, my)) => {
+                    let d = ((mx - x).powi(2) + (my - cy).powi(2)).sqrt() / (cell_w * 1.3);
+                    if d < 1.0 {
+                        0.5 * (1.0 + (std::f32::consts::PI * d).cos())
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            };
+            tile.swell.tune(motion.small());
+            tile.swell.set(if motion.reduced() { 0.0 } else { near });
+            tile.swell.step(dt);
+            arriving |= !tile.swell.settled(1e-3);
+            let lift = tile.swell.pos.clamp(-0.2, 1.2);
+            let size = if tile.surface.is_some() { icon * (0.7 + 0.3 * tile.arrive.pos.clamp(0.0, 1.15)) } else { icon } * (1.0 + 0.2 * lift);
             let sprite = tile.icon.as_mut().unwrap();
-            sprite.place((x - size * 0.5).round(), (top + (icon - size) * 0.5).round(), size, size)?;
-            sprite.set_opacity(if tile.surface.is_some() { 1.0 } else { 0.55 })?;
+            sprite.place((x - size * 0.5).round(), (top + (icon - size) * 0.5 - icon * 0.07 * lift).round(), size, size)?;
+            // The app being dragged out of the tray is dimmed where it was taken from.
+            let lifted = self.carrying.as_deref() == Some(tile.target.as_str());
+            sprite.set_opacity(if lifted { 0.3 } else if tile.surface.is_some() { 1.0 } else { 0.55 })?;
             if let Some(label) = tile.label.as_mut() {
                 label.place(x - label.w * 0.5, top + icon + 8.0 * s)?;
-                label.set_opacity(1.0)?;
+                label.set_opacity(if lifted { 0.3 } else { 1.0 })?;
             }
             tile.shown = true;
         }
@@ -649,7 +773,13 @@ impl Launcher {
         }
 
         // The drop of light under the cursor.
-        let hot = self.cursor.filter(|_| self.open).and_then(|(mx, my)| self.grid.cell_at(mx, my)).filter(|&cell| self.matches.get(self.page * per_page + cell).is_some());
+        // Typing a search, the first answer is lit when the cursor is not on one: it is what Enter opens.
+        let hot = self
+            .cursor
+            .filter(|_| self.open)
+            .and_then(|(mx, my)| self.grid.cell_at(mx, my))
+            .filter(|&cell| self.matches.get(self.page * per_page + cell).is_some())
+            .or_else(|| (self.open && !self.query.trim().is_empty() && self.page == 0 && !self.matches.is_empty()).then_some(0));
         self.hot_at.tune(motion);
         self.hot_at.aim(hot.map(|cell| {
             let (cx, cy) = self.grid.cell_center(cell);
