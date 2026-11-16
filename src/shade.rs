@@ -81,6 +81,14 @@ impl Shade {
         }
     }
 
+    /// Puts the window right under `above` again, where it already is on screen: for when
+    /// `above` has changed its place among the other windows (the widgets on the desktop do).
+    pub fn tuck_under(&self, above: HWND) {
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(above), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
     /// Moves everything in the window (when the surface above slides out of view).
     pub fn set_offset(&mut self, x: f32, y: f32) -> Result<()> {
         self.stage.set_offset(x, y)

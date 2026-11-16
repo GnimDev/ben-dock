@@ -239,6 +239,34 @@ impl Scene {
         })
     }
 
+    /// Paints new pixels into a surface that is already on show: premultiplied BGRA, top row
+    /// first, of the size the surface was made with. For a picture that changes every frame
+    /// (the water of the wallpaper), which would otherwise need a new surface each time.
+    pub fn repaint(&self, surface: &CompositionDrawingSurface, width: u32, height: u32, bgra: &[u8]) -> Result<()> {
+        if width == 0 || height == 0 || bgra.len() < (width as usize) * (height as usize) * 4 {
+            return Err(E_INVALIDARG.into());
+        }
+        unsafe {
+            let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+            let mut offset = POINT::default();
+            let dc: ID2D1DeviceContext = interop.BeginDraw(None, &mut offset)?;
+            dc.SetDpi(96.0, 96.0);
+            dc.SetTransform(&Matrix3x2::translation(offset.x as f32, offset.y as f32));
+            dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            };
+            let drawn = dc.CreateBitmap(D2D_SIZE_U { width, height }, Some(bgra.as_ptr() as *const _), width * 4, &props).map(|bitmap| {
+                dc.DrawBitmap(&bitmap, Some(&rect(0.0, 0.0, width as f32, height as f32)), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
+            });
+            interop.EndDraw()?;
+            drawn
+        }
+    }
+
     /// A surface holding one line of text in the given colour.
     pub fn surface_from_text(&self, layout: &IDWriteTextLayout, width: f32, height: f32, text_color: D2D1_COLOR_F) -> Result<CompositionDrawingSurface> {
         self.paint(width.ceil() as u32, height.ceil() as u32, |dc| unsafe {
@@ -1068,6 +1096,93 @@ impl Slice {
 }
 
 impl Drop for Slice {
+    fn drop(&mut self) {
+        let _ = self.parent.Remove(&self.visual);
+    }
+}
+
+/// A picture laid side by side with itself to fill a rectangle, sliding slowly for ever: the
+/// light that plays on the wallpaper's water. The compositor moves it by itself, so it costs
+/// the app nothing while it slides. Removes itself from the tree when dropped.
+pub struct Drift {
+    visual: SpriteVisual,
+    picture: CompositionSurfaceBrush,
+    parent: VisualCollection,
+    last: Option<(f32, f32, f32, f32)>,
+    last_opacity: f32,
+    sliding: bool,
+}
+
+impl Scene {
+    /// `surface`: the picture, which must join up with itself at its edges. `scale`: how
+    /// many screen pixels one of its pixels covers.
+    pub fn drift_in(&self, parent: &VisualCollection, surface: &CompositionDrawingSurface, scale: f32) -> Result<Drift> {
+        let c = &self.compositor;
+        let picture = c.CreateSurfaceBrushWithSurface(surface)?;
+        picture.SetStretch(CompositionStretch::None)?;
+        picture.SetHorizontalAlignmentRatio(0.0)?;
+        picture.SetVerticalAlignmentRatio(0.0)?;
+        picture.SetScale(Vector2 { X: scale, Y: scale })?;
+        // Direct2D's border effect, set to wrap on both axes, is what repeats the picture.
+        let source: IGraphicsEffectSource = CompositionEffectSourceParameter::Create(&HSTRING::from("picture"))?.cast()?;
+        let tiled: IGraphicsEffect = D2DEffect { clsid: CLSID_D2D1Border, name: "Tile", props: vec![Prop::U32(1), Prop::U32(1)], sources: vec![source] }.into();
+        let brush = c.CreateEffectFactory(&tiled)?.CreateBrush()?;
+        brush.SetSourceParameter(&HSTRING::from("picture"), &picture)?;
+        let visual = c.CreateSpriteVisual()?;
+        visual.SetBrush(&brush)?;
+        parent.InsertAtTop(&visual)?;
+        Ok(Drift { visual, picture, parent: parent.clone(), last: None, last_opacity: f32::NAN, sliding: false })
+    }
+}
+
+impl Drift {
+    pub fn place(&mut self, x: f32, y: f32, w: f32, h: f32) -> Result<()> {
+        if self.last == Some((x, y, w, h)) {
+            return Ok(());
+        }
+        self.last = Some((x, y, w, h));
+        self.visual.SetOffset(Vector3 { X: x, Y: y, Z: 0.0 })?;
+        self.visual.SetSize(Vector2 { X: w, Y: h })
+    }
+
+    pub fn set_opacity(&mut self, opacity: f32) -> Result<()> {
+        if self.last_opacity == opacity {
+            return Ok(());
+        }
+        self.last_opacity = opacity;
+        self.visual.SetOpacity(opacity)
+    }
+
+    /// Starts it sliding: by (`dx`, `dy`) screen pixels every `seconds`, for ever. So that
+    /// starting over shows no jump, both are whole numbers of the picture's size on screen.
+    pub fn slide(&mut self, dx: f32, dy: f32, seconds: f32) -> Result<()> {
+        if self.sliding {
+            return Ok(());
+        }
+        let compositor = self.visual.Compositor()?;
+        let animation = compositor.CreateVector2KeyFrameAnimation()?;
+        let steady = compositor.CreateLinearEasingFunction()?;
+        animation.InsertKeyFrame(0.0, Vector2 { X: 0.0, Y: 0.0 })?;
+        animation.InsertKeyFrameWithEasingFunction(1.0, Vector2 { X: dx, Y: dy }, &steady)?;
+        animation.SetDuration(TimeSpan { Duration: (seconds.max(1.0) * 10_000_000.0) as i64 })?;
+        animation.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
+        self.picture.StartAnimation(&HSTRING::from("Offset"), &animation)?;
+        self.sliding = true;
+        Ok(())
+    }
+
+    /// Stops it where it started.
+    pub fn rest(&mut self) -> Result<()> {
+        if !self.sliding {
+            return Ok(());
+        }
+        self.sliding = false;
+        self.picture.StopAnimation(&HSTRING::from("Offset"))?;
+        self.picture.SetOffset(Vector2 { X: 0.0, Y: 0.0 })
+    }
+}
+
+impl Drop for Drift {
     fn drop(&mut self) {
         let _ = self.parent.Remove(&self.visual);
     }
