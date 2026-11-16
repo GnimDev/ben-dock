@@ -65,6 +65,9 @@ struct Tile {
     shown: bool,
     /// 0 = a stand-in tile, 1 = the app's own icon, fully there. It swells in as it arrives.
     arrive: Spring,
+    /// 1 while the cursor is on the tile, falling off to 0 over the tiles around it: the
+    /// tile swells under the cursor, as an icon does in the dock.
+    swell: Spring,
 }
 
 pub struct Launcher {
@@ -308,7 +311,7 @@ impl Launcher {
                     }
                     let key = name.to_lowercase();
                     let at = self.tiles.partition_point(|t| t.key <= key);
-                    self.tiles.insert(at, Tile { name, key, target, pixels: None, asked: false, icon: None, surface: None, label: None, shown: false, arrive: Spring::with(0.0, motion.small()) });
+                    self.tiles.insert(at, Tile { name, key, target, pixels: None, asked: false, icon: None, surface: None, label: None, shown: false, arrive: Spring::with(0.0, motion.small()), swell: Spring::with(0.0, motion.small()) });
                     added = true;
                 }
                 Found::Icon { target, pixels } => {
@@ -359,7 +362,8 @@ impl Launcher {
         self.margin = margin;
         // Blur and shadow are sized for the screen it opens on.
         self.glass.set_material(&theme.sheet);
-        self.glass.set_rect(scene, margin, margin, w, h, px(26.0))?;
+        // As round as the dock: the corners follow the shorter side of the sheet.
+        self.glass.set_rect(scene, margin, margin, w, h, px(36.0))?;
 
         self.query.clear();
         self.page = 0;
@@ -627,9 +631,28 @@ impl Launcher {
             let (cx, cy) = self.grid.cell_center(position % per_page);
             let x = cx + away * w;
             let top = cy - (icon + 26.0 * s) * 0.5;
-            let size = if tile.surface.is_some() { icon * (0.7 + 0.3 * tile.arrive.pos.clamp(0.0, 1.15)) } else { icon };
+            // The icon under the cursor swells and rises a little, the ones next to it less,
+            // like the dock's. (Its picture is only made for its resting size, so it is kept
+            // from growing as much as the dock's icons do.)
+            let near = match self.cursor.filter(|_| self.open) {
+                Some((mx, my)) => {
+                    let d = ((mx - x).powi(2) + (my - cy).powi(2)).sqrt() / (cell_w * 1.3);
+                    if d < 1.0 {
+                        0.5 * (1.0 + (std::f32::consts::PI * d).cos())
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            };
+            tile.swell.tune(motion.small());
+            tile.swell.set(if motion.reduced() { 0.0 } else { near });
+            tile.swell.step(dt);
+            arriving |= !tile.swell.settled(1e-3);
+            let lift = tile.swell.pos.clamp(-0.2, 1.2);
+            let size = if tile.surface.is_some() { icon * (0.7 + 0.3 * tile.arrive.pos.clamp(0.0, 1.15)) } else { icon } * (1.0 + 0.2 * lift);
             let sprite = tile.icon.as_mut().unwrap();
-            sprite.place((x - size * 0.5).round(), (top + (icon - size) * 0.5).round(), size, size)?;
+            sprite.place((x - size * 0.5).round(), (top + (icon - size) * 0.5 - icon * 0.07 * lift).round(), size, size)?;
             sprite.set_opacity(if tile.surface.is_some() { 1.0 } else { 0.55 })?;
             if let Some(label) = tile.label.as_mut() {
                 label.place(x - label.w * 0.5, top + icon + 8.0 * s)?;

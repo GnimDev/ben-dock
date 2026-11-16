@@ -27,6 +27,7 @@ use crate::system::{self, AppBar, Clock, Monitor, Taskbar};
 use crate::theme::{self, Theme};
 use crate::util::wide;
 use crate::wifi;
+use crate::winkey::{self, WinKey};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
@@ -48,6 +49,7 @@ const WM_VOLUME_CHANGED: u32 = WM_APP + 3;
 const WM_MEDIA_CHANGED: u32 = WM_APP + 4;
 const WM_APPS_FOUND: u32 = WM_APP + 5;
 const WM_PAGE_DATA: u32 = WM_APP + 6;
+const WM_WIN_KEY: u32 = WM_APP + 7;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
@@ -171,6 +173,8 @@ pub enum Event {
     Island(isize, island::Input),
     Bubble(bubble::Input),
     Launcher(launcher::Input),
+    /// The Windows key was tapped on its own (see `winkey.rs`).
+    WinKey,
     /// The settings window changed something. `true` once the change is final (control released).
     Config(bool),
     Quit,
@@ -297,6 +301,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_APPS_FOUND => {
             push(Event::Apps);
+            return LRESULT(0);
+        }
+        WM_WIN_KEY => {
+            push(Event::WinKey);
             return LRESULT(0);
         }
         WM_PAGE_DATA => {
@@ -605,6 +613,8 @@ pub struct App {
     /// The screen whose dock an app's tile, dragged out of the tray, is over.
     tray_drag: Option<usize>,
     hooks: Vec<HWINEVENTHOOK>,
+    /// Watches the Windows key while the tray can be opened with it.
+    winkey: Option<WinKey>,
     /// Last error from updating the visuals, so a repeating error is logged once.
     shown_error: Option<windows::core::Error>,
 
@@ -686,6 +696,7 @@ impl App {
             preview_block: None,
             tray_drag: None,
             hooks: Vec::new(),
+            winkey: None,
             shown_error: None,
             bench: None,
             bench_last: None,
@@ -824,6 +835,14 @@ impl App {
                 Ok(bubble) => self.bubble = Some(bubble),
                 Err(e) => crate::log!("the app's own menus are unavailable ({e}); using Windows' menu"),
             }
+        }
+        // The Start menu is only taken over while there is a tray to open instead.
+        if self.cfg.launcher && self.cfg.win_key {
+            if self.winkey.is_none() {
+                self.winkey = winkey::start(self.hwnd, WM_WIN_KEY);
+            }
+        } else {
+            self.winkey = None;
         }
         if self.cfg.launcher && self.launcher.is_none() {
             match Launcher::new(&self.scene, first, &self.motion) {
@@ -1144,6 +1163,13 @@ impl App {
                         self.run_command(id, item);
                     }
                 }
+            }
+            Event::WinKey => {
+                // On the screen the cursor is on, where the person is looking.
+                let mut pt = POINT::default();
+                let have_cursor = unsafe { GetCursorPos(&mut pt) }.is_ok();
+                let s = self.screens.iter().position(|screen| have_cursor && pt.x >= screen.monitor.rect.left && pt.x < screen.monitor.rect.right && pt.y >= screen.monitor.rect.top && pt.y < screen.monitor.rect.bottom).unwrap_or(0);
+                self.toggle_launcher(s);
             }
             Event::Launcher(input) => {
                 let chosen = self.launcher.as_mut().and_then(|l| l.handle(input));
@@ -2665,6 +2691,8 @@ impl App {
                 let _ = UnhookWinEvent(hook);
             }
         }
+        // The Windows key is Windows' again.
+        self.winkey = None;
         self.preview = None;
         self.fx = None;
         self.launcher = None;

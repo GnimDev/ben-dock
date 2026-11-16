@@ -44,6 +44,7 @@ mod theme;
 mod util;
 mod warp;
 mod wifi;
+mod winkey;
 
 use std::time::Instant;
 use util::wide;
