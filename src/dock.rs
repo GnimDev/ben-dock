@@ -381,11 +381,22 @@ struct Tag {
     shown: Option<String>,
 }
 
+/// The bubble beside the dock that sends every window out of the way: a round piece of the
+/// dock's glass, the drop of light the cursor gets on it, and the screen painted on it.
+struct Desk {
+    glass: Glass,
+    lens: Bead,
+    sign: Sprite,
+    label: Option<Label>,
+}
+
 /// What letting go of the mouse button over the dock meant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Released {
     /// A click on this icon.
     Click(usize),
+    /// A click on the bubble beside the dock: every window out of the way.
+    Desktop,
     /// The end of a drag that changed the order of the pinned apps (now saved).
     Reordered,
     /// A pinned app was dragged out of the dock and let go there: it is off the dock (now saved).
@@ -454,6 +465,16 @@ pub struct Dock {
     bar: bool,
     bar_rim: Pill,
     bar_pill: Pill,
+    /// The bubble beside the dock that shows the desktop (see `show_desk`). It stands there
+    /// while a window is showing (`set_desk`), and waits below the screen's edge otherwise:
+    /// 0 = in its place, 1 = out of view.
+    desk: Desk,
+    desk_wanted: bool,
+    desk_away: Spring,
+    /// The cursor is on it; the mouse button went down on it.
+    pub desk_hot: bool,
+    desk_down: bool,
+    desk_glow: Spring,
     pub win_x: i32,
     pub win_y: i32,
     region: Option<(i32, i32, i32, i32)>,
@@ -475,6 +496,14 @@ impl Dock {
             }
         };
         let lens = scene.bead_in(&glass.inner()?)?;
+        // The bubble that shows the desktop is of the same glass, and its shadow lies where the
+        // dock's does.
+        let mut desk_glass = scene.glass_in(&stage.content()?, &theme.dock)?;
+        match shade.as_ref() {
+            Some(shade) => desk_glass.cast_shadow_on(&shade.content()?)?,
+            None => desk_glass.without_shadow(),
+        }
+        let desk = Desk { lens: scene.bead_in(&desk_glass.inner()?)?, sign: scene.sprite_in(&desk_glass.outer()?)?, glass: desk_glass, label: None };
         let layer = scene.layer_in(&stage.content()?)?;
         let bar_rim = scene.pill_in(&stage.content()?)?;
         let bar_pill = scene.pill_in(&stage.content()?)?;
@@ -519,6 +548,12 @@ impl Dock {
             bar: false,
             bar_rim,
             bar_pill,
+            desk,
+            desk_wanted: false,
+            desk_away: Spring::with(1.0, motion.medium()),
+            desk_hot: false,
+            desk_down: false,
+            desk_glow: Spring::with(0.0, motion.fade()),
             win_x: 0,
             win_y: 0,
             region: None,
@@ -659,6 +694,7 @@ impl Dock {
 
     pub fn set_theme(&mut self, theme: &Theme) {
         self.glass.set_material(&theme.dock);
+        self.desk.glass.set_material(&theme.dock);
         if let Some(tag) = self.tag.as_mut() {
             tag.glass.set_material(&theme.bubble);
         }
@@ -676,6 +712,7 @@ impl Dock {
     /// Throws away painted app names (they are painted for one font size and one theme).
     pub fn forget_labels(&mut self) {
         self.text_format = None;
+        self.desk.label = None;
         if let Some(tag) = self.tag.as_mut() {
             tag.shown = None;
         }
@@ -686,6 +723,7 @@ impl Dock {
 
     /// Throws away painted icons (after a size change or a GPU reset); they are painted again when shown.
     pub fn forget_icons(&mut self) {
+        self.desk.label = None;
         for item in &mut self.items {
             item.surfaces.clear();
             item.level = None;
@@ -996,6 +1034,7 @@ impl Dock {
         self.press_x = x;
         self.drag = None;
         self.pulled = false;
+        self.desk_down = self.desk_at(x, y);
         self.pressed
     }
 
@@ -1018,6 +1057,10 @@ impl Dock {
 
     /// The mouse button came up: a click, the end of a drag, or a release somewhere else.
     pub fn release(&mut self, x: f32, y: f32) -> Released {
+        if std::mem::take(&mut self.desk_down) {
+            // Pressed on the bubble beside the dock: a click if it is let go there too.
+            return if self.desk_at(x, y) { Released::Desktop } else { Released::Nothing };
+        }
         let Some(index) = self.pressed.take() else { return Released::Nothing };
         if self.drag.take().is_some() {
             if std::mem::take(&mut self.pulled) {
@@ -1074,6 +1117,7 @@ impl Dock {
         if self.hovering {
             self.cursor_x = cx;
         }
+        self.desk_hot = cursor.is_some() && shown && self.desk_at(cx, cy);
         self.mag.tune(motion.small());
         self.swell.tune(motion.small());
         self.edge_left.tune(motion.medium());
@@ -1254,6 +1298,7 @@ impl Dock {
         self.show_lens(theme, squash, radius, raise)?;
         self.show_items(scene, cfg, theme)?;
         self.show_label(scene, gfx, theme, motion)?;
+        self.show_desk(scene, gfx, theme, motion, dt)?;
         self.update_region(hide);
 
         // The cursor resting on the dock is no reason for another frame: when it moves, the
@@ -1271,6 +1316,8 @@ impl Dock {
             || !self.edge_right.settled(0.05)
             || !self.label_alpha.settled(1e-3)
             || !self.lens_at.settled()
+            || !self.desk_away.settled(1e-3)
+            || !self.desk_glow.settled(1e-3)
             || self.items.iter().any(|i| !i.settled()))
     }
 
@@ -1537,6 +1584,9 @@ impl Dock {
         let watery = self.intake.is_some() || !self.spray.is_empty() || !self.surface.calm();
         let lively = watery || self.mag.pos > 0.001 || self.label_alpha.pos > 0.001 || self.items.iter().any(|i| i.bounce.is_some());
         let (px, _, pw, _) = self.panel;
+        // The bubble beside the dock is part of it while it is in view.
+        let (desk_left, _, desk_size) = self.desk_rect();
+        let desk_right = if self.desk_away.pos < 0.97 { (desk_left + desk_size + 2.0).ceil() as i32 } else { 0 };
         let wanted = if hidden && self.bar {
             // Out of view, but for the strip at the bottom edge that brings it back.
             let (l, t, r, b) = self.bar_zone();
@@ -1547,9 +1597,9 @@ impl Dock {
             let grow = m.amp * m.mag_radius * 0.5 + 24.0 * m.scale;
             let rest_left = m.win_w as f32 * 0.5 - self.widths.iter().sum::<f32>() * 0.5 - m.pad_x;
             let rest_right = m.win_w as f32 - rest_left;
-            ((rest_left - grow).floor() as i32, 0, (rest_right + grow).ceil() as i32, m.win_h)
+            ((rest_left - grow).floor() as i32, 0, ((rest_right + grow).ceil() as i32).max(desk_right), m.win_h)
         } else {
-            ((px - 2.0).floor() as i32, (m.panel_top - 2.0).floor() as i32, (px + pw + 2.0).ceil() as i32, m.win_h)
+            ((px - 2.0).floor() as i32, (m.panel_top - 2.0).floor() as i32, ((px + pw + 2.0).ceil() as i32).max(desk_right), m.win_h)
         };
         if self.region == Some(wanted) {
             return;
@@ -1566,6 +1616,60 @@ impl Dock {
     /// come back by (it does when it is only tucked away, not for a full-screen app).
     pub fn set_bar(&mut self, on: bool) {
         self.bar = on;
+    }
+
+    /// Whether the bubble that shows the desktop stands beside the dock: it does while a
+    /// window is showing, when there is something to send out of the way.
+    pub fn set_desk(&mut self, wanted: bool) {
+        self.desk_wanted = wanted;
+    }
+
+    /// That bubble's place beside the dock: left, top and size (it is round), in window
+    /// coordinates.
+    fn desk_rect(&self) -> (f32, f32, f32) {
+        let m = self.m;
+        let (px, _, pw, _) = self.panel;
+        ((px + pw + 10.0 * m.scale).round(), m.panel_top, m.panel_h)
+    }
+
+    /// Whether a point in window coordinates is on that bubble, or on the strip below it.
+    fn desk_at(&self, x: f32, y: f32) -> bool {
+        let (left, top, size) = self.desk_rect();
+        self.desk_wanted && self.desk_away.pos < 0.5 && x >= left - 2.0 && x <= left + size + 2.0 && y >= top - 2.0 && y < self.m.win_h as f32
+    }
+
+    /// The bubble beside the dock that shows the desktop. It comes up from below the screen's
+    /// edge when a window is showing and goes back down when none is, as the dock does.
+    fn show_desk(&mut self, scene: &Scene, gfx: &Gfx, theme: &Theme, motion: &Motion, dt: f32) -> Result<()> {
+        let m = self.m;
+        // Coming into view it bounces a little; leaving, it just goes.
+        self.desk_away.tune(if self.desk_wanted { motion.medium() } else { motion.calm() });
+        self.desk_away.set(if self.desk_wanted { 0.0 } else { 1.0 });
+        self.desk_away.step(dt);
+        self.desk_glow.tune(motion.fade());
+        self.desk_glow.set(if self.desk_hot { 1.0 } else { 0.0 });
+        self.desk_glow.step(dt);
+
+        let (x, y, size) = self.desk_rect();
+        let down = (self.desk_away.pos.max(0.0) * (m.panel_h + m.margin + theme.dock.shadow_reach + 6.0 * m.scale)).round();
+        let desk = &mut self.desk;
+        desk.glass.set_rect(scene, x, y + down, size, size, size * 0.5)?;
+        if desk.label.is_none() {
+            // A screen, from the symbol font.
+            let format = text::format(gfx, text::ICON_FONT, (m.icon * 0.72).round(), DWRITE_FONT_WEIGHT_NORMAL)?;
+            let (layout, width, height) = text::fit(gfx, &format, &text::glyph(0xE7F4), None)?;
+            let surface = scene.surface_from_text(&layout, width, height, theme.text)?;
+            desk.sign.set_surface(&surface)?;
+            desk.label = Some(Label { surface, width, height });
+        }
+        let label = desk.label.as_ref().unwrap();
+        desk.sign.place(((size - label.width) * 0.5).round(), ((size - label.height) * 0.5).round(), label.width, label.height)?;
+        // The drop of light under the cursor; pressing squeezes it (as in `show_lens`).
+        let inset = m.lens_inset + if self.desk_down { size * 0.035 } else { 0.0 };
+        desk.lens.place(inset, inset, size - 2.0 * inset, size - 2.0 * inset, size * 0.5 - inset)?;
+        let (top, bottom, edge) = theme.bead;
+        desk.lens.set_colors(top, bottom, edge)?;
+        desk.lens.set_opacity(self.desk_glow.pos.clamp(0.0, 1.0))
     }
 
     /// The strip at the screen's bottom edge that brings the tucked-away dock back: as wide

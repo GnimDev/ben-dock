@@ -1026,6 +1026,22 @@ pub fn is_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd).as_bool() }
 }
 
+/// True when a maximised window on the same screen stands in front of `hwnd`: nothing of
+/// `hwnd` shows.
+pub fn behind_maximized(hwnd: HWND) -> bool {
+    unsafe {
+        let screen = monitor_of(hwnd);
+        let mut above = GetWindow(hwnd, GW_HWNDPREV);
+        while let Ok(w) = above {
+            if IsZoomed(w).as_bool() && !IsIconic(w).as_bool() && app_window(w) == Some(true) && monitor_of(w) == screen {
+                return true;
+            }
+            above = GetWindow(w, GW_HWNDPREV);
+        }
+        false
+    }
+}
+
 /// Tells `window` (with `message`) whenever the window in front is maximised, put back, or
 /// moved to another screen. Windows sends no word of that by itself, so a small thread of
 /// its own looks five times a second; it ends when `window` is gone.

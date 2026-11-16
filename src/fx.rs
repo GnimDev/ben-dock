@@ -443,7 +443,9 @@ impl Fx {
             }
             for (index, slice) in playing.slices.iter_mut().enumerate() {
                 let shown = match playing.strips.get(index) {
-                    Some(strip) if strip.dst.w() > 0.01 && strip.dst.h() > 0.01 => slice.show(&playing.levels, strip.dst.l - ox, strip.dst.t - oy, strip.dst.w(), strip.dst.h(), strip.src_top, strip.src_bottom),
+                    Some(strip) if strip.dst.w() > 0.01 && strip.dst.h() > 0.01 && strip.foot.1 - strip.foot.0 > 0.01 => {
+                        slice.show(&playing.levels, strip.dst.l - ox, strip.dst.t - oy, strip.dst.w(), strip.dst.h(), strip.foot.0 - ox, strip.foot.1 - strip.foot.0, strip.src_top, strip.src_bottom)
+                    }
                     _ => slice.hide(),
                 };
                 if let Err(e) = shown {

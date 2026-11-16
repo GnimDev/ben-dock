@@ -36,11 +36,14 @@ impl R {
 }
 
 /// One horizontal slice: which part of the window (0 = top, 1 = bottom) goes where on screen.
+/// Its sides lean the way the funnel's do: `dst` is its rows, with its left and right edge
+/// at the top row; `foot` is its left and right edge at the bottom row.
 #[derive(Clone, Copy, Debug)]
 pub struct Strip {
     pub src_top: f32,
     pub src_bottom: f32,
     pub dst: R,
+    pub foot: (f32, f32),
 }
 
 fn clamp01(v: f32) -> f32 {
@@ -99,26 +102,28 @@ impl Funnel {
 
 /// Genie effect. `p` runs from 0 (the window where it is) to 1 (inside the icon).
 ///
-/// The picture is cut into horizontal slices on whole screen rows. Slices are tall where the
-/// funnel's sides are nearly vertical and only a row or two high where the sides sweep
-/// inwards, so the edge never steps sideways by more than a couple of pixels from one slice
-/// to the next. At most `max_slices` are produced.
+/// The picture is cut into horizontal slices on whole screen rows. A slice's sides are
+/// straight and lean from the funnel's edge at its top row to the funnel's edge at its
+/// bottom row, so the edge of the picture is one unbroken line with no steps in it. Slices
+/// are short where the funnel's sides curve, so that the line never strays from the curve by
+/// more than a fraction of a pixel. At most `max_slices` are produced.
 pub fn funnel(win: R, icon: R, p: f32, max_slices: usize, out: &mut Vec<Strip>) {
     let f = Funnel::at(win, icon, p);
     let max_slices = max_slices.max(1);
-    // Sideways step allowed between neighbouring slices; relaxed until the slices fit the budget.
-    let mut step = 1.5;
+    // How far a slice's straight side may stray from the curve; relaxed until the slices fit
+    // the budget. (Slices twice as tall stray four times as far.)
+    let mut slack = 0.2;
     for _ in 0..6 {
-        cut(&f, step, out);
+        cut(&f, slack, out);
         if out.len() <= max_slices {
             return;
         }
-        step *= (out.len() as f32 / max_slices as f32).max(1.15);
+        slack *= (out.len() as f32 / max_slices as f32).max(1.15).powi(2);
     }
     out.truncate(max_slices);
 }
 
-fn cut(f: &Funnel, step: f32, out: &mut Vec<Strip>) {
+fn cut(f: &Funnel, slack: f32, out: &mut Vec<Strip>) {
     out.clear();
     let (top, bottom) = (f.top.round(), f.bottom.round());
     let height = f.bottom - f.top;
@@ -127,12 +132,13 @@ fn cut(f: &Funnel, step: f32, out: &mut Vec<Strip>) {
     }
     const TALLEST: f32 = 24.0;
     let mut y = top;
+    let (mut l0, mut r0) = f.edges(y);
     while y < bottom {
-        // The tallest slice (in whole rows) whose ends differ sideways by no more than `step`.
-        let (l0, r0) = f.edges(y);
+        // The tallest slice (in whole rows) whose straight sides stay within `slack` of the
+        // funnel's, which are furthest from them half-way down.
         let fits = |h: f32| {
-            let (l1, r1) = f.edges(y + h);
-            (l1 - l0).abs() <= step && (r1 - r0).abs() <= step
+            let ((l1, r1), (lm, rm)) = (f.edges(y + h), f.edges(y + h * 0.5));
+            ((l0 + l1) * 0.5 - lm).abs() <= slack && ((r0 + r1) * 0.5 - rm).abs() <= slack
         };
         let limit = TALLEST.min(bottom - y);
         let mut h = limit;
@@ -149,8 +155,9 @@ fn cut(f: &Funnel, step: f32, out: &mut Vec<Strip>) {
             h = lo;
         }
         let h = h.max(1.0);
-        let (l, r) = f.edges(y + h * 0.5);
-        out.push(Strip { src_top: clamp01((y - f.top) / height), src_bottom: clamp01((y + h - f.top) / height), dst: R { l, t: y, r, b: y + h } });
+        let (l1, r1) = f.edges(y + h);
+        out.push(Strip { src_top: clamp01((y - f.top) / height), src_bottom: clamp01((y + h - f.top) / height), dst: R { l: l0, t: y, r: r0, b: y + h }, foot: (l1, r1) });
+        (l0, r0) = (l1, r1);
         y += h;
     }
 }
@@ -224,6 +231,7 @@ mod tests {
         for x in &s {
             assert!(x.dst.t >= ICON.t - 1.0 && x.dst.b <= ICON.b + 1.0);
             assert!(x.dst.l >= ICON.l - 1.0 && x.dst.r <= ICON.r + 1.0);
+            assert!(x.foot.0 >= ICON.l - 1.0 && x.foot.1 <= ICON.r + 1.0);
         }
         assert!(opacity(1.0) < 1e-3);
     }
@@ -238,12 +246,12 @@ mod tests {
             for pair in s.windows(2) {
                 assert!((pair[0].dst.b - pair[1].dst.t).abs() < 1e-3, "gap between slices at p={p}");
                 assert!((pair[0].src_bottom - pair[1].src_top).abs() < 1e-5, "picture rows skipped at p={p}");
-                // The edge steps sideways by a few pixels at most from one slice to the next.
-                assert!((pair[0].dst.l - pair[1].dst.l).abs() <= 6.0, "edge jumps {} px at p={p}", (pair[0].dst.l - pair[1].dst.l).abs());
+                // The edge is unbroken: where one slice's sides end, the next one's begin.
+                assert!((pair[0].foot.0 - pair[1].dst.l).abs() < 1e-3 && (pair[0].foot.1 - pair[1].dst.r).abs() < 1e-3, "edge broken at p={p}");
             }
             for x in &s {
-                assert!(x.dst.b >= x.dst.t - 1e-3 && x.dst.r >= x.dst.l);
-                assert!(x.dst.l >= WIN.l - 1e-3 && x.dst.r <= WIN.r + 1e-3, "slice left the funnel at p={p}");
+                assert!(x.dst.b >= x.dst.t - 1e-3 && x.dst.r >= x.dst.l && x.foot.1 >= x.foot.0);
+                assert!(x.dst.l >= WIN.l - 1e-3 && x.dst.r <= WIN.r + 1e-3 && x.foot.0 >= WIN.l - 1e-3 && x.foot.1 <= WIN.r + 1e-3, "slice left the funnel at p={p}");
                 assert!(x.dst.t >= WIN.t - 0.51 && x.dst.b <= ICON.b + 1e-3);
                 assert!(x.dst.t.fract() == 0.0 && x.dst.b.fract() == 0.0, "slices sit on whole rows");
             }
@@ -263,7 +271,8 @@ mod tests {
             }
             assert!(s[0].dst.t >= last_top - 1e-3);
             last_top = s[0].dst.t;
-            let w = s.last().unwrap().dst.w();
+            let foot = s.last().unwrap().foot;
+            let w = foot.1 - foot.0;
             assert!(w <= last_width + 1.0, "bottom got wider at step {step}");
             last_width = w;
         }

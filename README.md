@@ -7,6 +7,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 ## Features
 
 - **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. Drag an app, shortcut or file onto the dock to pin it: the glass strains like the skin of a water drop, then lets the icon slip in. Dividers group the pinned apps. The first icon opens an app launcher with search, made of the same glass as the dock; tapping the Windows key opens it too, in place of the Start menu.
+- **Desktop bubble:** a round bubble of its own beside the dock. Click it and every window goes out of the way, back to the desktop. It is only there while a window is showing. Turn it off with **Nút về màn hình chính cạnh dock** in the settings, or `desktop_button = false` in `ben.ini`.
 - **App tray:** every installed app, the ones you use most on the first page and installers and admin tools on the last. Icons are kept in a file (`icons.cache`), so the tray opens full. Search ignores case and accents and finds apps by initials (`vsc`), short names (`cmd`, `calc`), program names (`winword`), several words (`ms word`) and small typos (`notepda`); what you picked before comes first. Drag a tile onto the dock to pin it.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
 - **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
@@ -17,7 +18,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
   - Bottom-right, **system:** CPU and memory in use. Click the very corner of the screen to show the desktop.
 - **Out of the way of maximized windows:** no screen space is reserved. While a maximized window is showing, the dock, the island and the corners leave, and a small white bar stays at the bottom edge. Put the cursor on the bar and the dock and island come back; 2 seconds after the cursor leaves, the dock goes again and the island shrinks to the time alone for 8 more seconds (hover it to get the whole island back). Volume, charging and now-playing changes still bring the island in for a moment.
 - **Floating windows:** new windows open centered at up to 70% of the screen instead of maximized.
-- **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon, and when you minimize a window with its own button or the keyboard.
+- **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon, and when you minimize a window with its own button or the keyboard. A window that is out of sight behind a maximized one flies out of its icon in the same way when you click it.
 - **Themes:** four glass materials, light/dark mode, accent tint.
 - **Multiple monitors:** each monitor gets its own dock and island.
 

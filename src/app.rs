@@ -630,9 +630,11 @@ struct Screen {
     corners: Vec<Corner>,
     /// Bottom edge of the dock's strip on screen, as last granted by the shell.
     bottom_line: i32,
-    /// A full-screen app fills this screen; a maximised window is showing on it.
+    /// A full-screen app fills this screen; a maximised window is showing on it; a window of
+    /// any size is.
     filled: bool,
     covered: bool,
+    showing: bool,
     /// The dock and island are tucked out of view until the cursor comes for them (see `update`).
     auto: bool,
     /// When the cursor left the dock it had brought back (None: it is there), and when the
@@ -946,7 +948,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners: hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners: hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -1186,6 +1188,8 @@ impl App {
                 let Some(s) = self.screen_of_dock(window) else { return };
                 match self.screens[s].dock.release(x as f32, y as f32) {
                     Released::Click(index) => self.click(s, index),
+                    // The bubble beside the dock does what the very corner of the screen does.
+                    Released::Desktop => self.act(s, Action::Desktop),
                     Released::Reordered => self.share_pins(s),
                     // Pulled out of the dock and let go: it is off the dock, and the bubble bursts.
                     Released::Removed => {
@@ -2217,14 +2221,15 @@ impl App {
         self.refresh_due = true;
     }
 
-    /// Brings a window to the front. A minimised one flies out of its icon first.
+    /// Brings a window to the front. A minimised one flies out of its icon first, and so does
+    /// one that is out of sight behind a maximised window.
     fn bring(&mut self, window: HWND) {
         if self.fx.as_ref().and_then(|f| f.window()) == Some(window) {
             // Already on its way.
             return;
         }
-        if shell::is_minimized(window) && self.play_effect(window, true) {
-            // The window itself is restored when the effect ends (see `update`).
+        if (shell::is_minimized(window) || shell::behind_maximized(window)) && self.play_effect(window, true) {
+            // The window itself is brought back when the effect ends (see `update`).
             return;
         }
         shell::activate(window);
@@ -2666,8 +2671,9 @@ impl App {
         let windows = self.tracker.scan(self.hwnd);
         self.settle_newcomers(&windows);
         let real_front = unsafe { GetForegroundWindow() };
-        // Which screens have a maximised window showing.
+        // Which screens have a maximised window showing, and which a window of any size.
         let covered: Vec<bool> = self.screens.iter().map(|screen| windows.iter().any(|w| shell::is_maximized(w.hwnd) && !shell::is_minimized(w.hwnd) && shell::monitor_of(w.hwnd) == screen.monitor.handle)).collect();
+        let showing: Vec<bool> = self.screens.iter().map(|screen| windows.iter().any(|w| !shell::is_minimized(w.hwnd) && shell::monitor_of(w.hwnd) == screen.monitor.handle)).collect();
         // An open menu must not change which app counts as being in front; and if something
         // else came to the front without the menu being told, the menu goes.
         if let Some(open) = self.bubble.as_ref().filter(|b| b.is_open()).map(|b| b.hwnd()) {
@@ -2746,10 +2752,10 @@ impl App {
         // maximised window covers one: what stays in view then is settled in `update`.
         let filled = (self.cfg.hide_on_fullscreen && shell::is_fullscreen(real_front)).then(|| shell::monitor_of(real_front));
         let mut changed = false;
-        for (screen, covered) in self.screens.iter_mut().zip(covered) {
+        for ((screen, covered), showing) in self.screens.iter_mut().zip(covered).zip(showing) {
             let hidden = filled == Some(screen.monitor.handle);
-            changed |= screen.filled != hidden || screen.covered != covered;
-            (screen.filled, screen.covered) = (hidden, covered);
+            changed |= screen.filled != hidden || screen.covered != covered || screen.showing != showing;
+            (screen.filled, screen.covered, screen.showing) = (hidden, covered, showing);
             if hidden {
                 if let Some(island) = screen.island.as_mut() {
                     island.collapse();
@@ -2902,7 +2908,7 @@ impl App {
                 let (left, top, right, bottom) = screen.dock.bar_zone();
                 let at_bar = cursor.is_some_and(|(cx, cy)| cx >= left && cx < right && cy >= top && cy <= bottom);
                 let cornered = !screen.covered && screen.corners.iter().any(|corner| corner.engaged());
-                let near = held || at_bar || cornered || screen.dock.hovering || screen.dock.pressed.is_some();
+                let near = held || at_bar || cornered || screen.dock.hovering || screen.dock.desk_hot || screen.dock.pressed.is_some();
                 if !screen.auto {
                     // Just tucked away: out of view at once, unless the cursor is there.
                     screen.dock_left = Some(now.checked_sub(TUCK_DOCK).unwrap_or(now));
@@ -2932,6 +2938,8 @@ impl App {
             };
             screen.auto = auto;
             screen.dock.set_bar(auto);
+            // The bubble that shows the desktop has nothing to do when the desktop is showing.
+            screen.dock.set_desk(self.cfg.desktop_button && screen.showing);
             if let Some(island) = screen.island.as_mut() {
                 island.set_mini(mini);
             }

@@ -44,7 +44,7 @@ use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DispatcherQ
 use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::*;
-use windows_numerics::{Matrix3x2, Vector2, Vector3};
+use windows_numerics::{Matrix3x2, Matrix4x4, Vector2, Vector3};
 
 const FULL: Vector2 = Vector2 { X: 1.0, Y: 1.0 };
 
@@ -1017,21 +1017,23 @@ pub fn level_for(scale: f32, count: usize) -> usize {
     }
 }
 
-/// A band of rows from a picture, shown stretched into a rectangle. Removes itself when dropped.
+/// A band of rows from a picture, shown stretched into a shape with a level top and bottom
+/// and leaning sides. Removes itself when dropped.
 pub struct Slice {
     visual: SpriteVisual,
     brush: CompositionSurfaceBrush,
     parent: VisualCollection,
-    last: Option<[f32; 6]>,
+    last: Option<[f32; 8]>,
     hidden: bool,
     level: usize,
 }
 
 impl Slice {
     /// Shows the band of the picture from `src_top` to `src_bottom` (fractions of its height,
-    /// 0 = top row) stretched into the rectangle `(x, y, w, h)`.
-    pub fn show(&mut self, levels: &[Level], x: f32, y: f32, w: f32, h: f32, src_top: f32, src_bottom: f32) -> Result<()> {
-        let now = [x, y, w, h, src_top, src_bottom];
+    /// 0 = top row) stretched into the `h` rows from `y` down: `w` wide from `x` at the top
+    /// row, `foot_w` wide from `foot_x` at the bottom row, with straight sides between.
+    pub fn show(&mut self, levels: &[Level], x: f32, y: f32, w: f32, h: f32, foot_x: f32, foot_w: f32, src_top: f32, src_bottom: f32) -> Result<()> {
+        let now = [x, y, w, h, foot_x, foot_w, src_top, src_bottom];
         if self.last == Some(now) && !self.hidden {
             return Ok(());
         }
@@ -1047,8 +1049,19 @@ impl Slice {
             self.level = pick;
         }
         let (sx, sy) = (w / level.width.max(1.0), h / (band * level.height).max(1e-3));
+        // The visual is the rectangle `w` by `h`; the shape it is shown as has sides that
+        // lean, and no stretching or shearing turns a rectangle into that: it takes the
+        // kind of transform a picture seen at an angle gets. A point (u, v) of the rectangle
+        // goes to ((u + lean v) / (1 + k v), ratio v / (1 + k v)): the top row stays where it
+        // is, and the bottom row (v = h) ends up `foot_w` wide, starting at `foot_x`.
+        let ratio = w / foot_w.max(1e-3);
+        let (lean, k) = ((foot_x - x) * ratio / h, (ratio - 1.0) / h);
         self.visual.SetOffset(Vector3 { X: x, Y: y, Z: 0.0 })?;
-        self.visual.SetSize(Vector2 { X: w, Y: h })?;
+        // (Two screen rows more than its own, of the picture's next rows: the edges of a
+        // leaning shape are smoothed, the level ones too, and where two slices meet what
+        // lies behind would show through as a hairline. The slice below lies over these.)
+        self.visual.SetSize(Vector2 { X: w, Y: h + 2.0 * ratio })?;
+        self.visual.SetTransformMatrix(Matrix4x4 { M11: 1.0, M12: 0.0, M13: 0.0, M14: 0.0, M21: lean, M22: ratio, M23: 0.0, M24: k, M31: 0.0, M32: 0.0, M33: 1.0, M34: 0.0, M41: 0.0, M42: 0.0, M43: 0.0, M44: 1.0 })?;
         self.brush.SetScale(Vector2 { X: sx, Y: sy })?;
         self.brush.SetOffset(Vector2 { X: 0.0, Y: -src_top * level.height * sy })?;
         if self.hidden {
