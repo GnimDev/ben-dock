@@ -1,13 +1,16 @@
 //! The settings window: one row per entry of `config::PARAMS`, with a slider,
 //! a switch or a set of choices. Every change is applied to the dock while
 //! the control is being moved and written to ben.ini when it is released.
+//!
+//! The rows are sorted into tabs, listed down the left side (see `TABS`): a
+//! tab shows the groups of settings that belong to one part of the app.
 
 use crate::config::{self, Config, Kind, PARAMS};
 use crate::app::{self, Event};
 use crate::gfx::{color, rect};
 use crate::system;
 use crate::util::wide;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -26,13 +29,41 @@ const CLASS_NAME: &str = "BenSettingsWindow";
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 
 // Layout, in logical pixels.
-const COLUMN_W: f32 = 430.0;
+const COLUMN_W: f32 = 470.0;
 const MARGIN: f32 = 22.0;
 const ROW_H: f32 = 34.0;
 const HEADER_H: f32 = 38.0;
 const CONTROL_W: f32 = 150.0;
 const VALUE_W: f32 = 46.0;
 const BUTTON_H: f32 = 30.0;
+/// The list of tabs down the left side: its width, the height of one tab, and the room
+/// between its edge and what is in it.
+const SIDE_W: f32 = 196.0;
+const TAB_H: f32 = 38.0;
+const SIDE_PAD: f32 = 10.0;
+
+/// One tab: its name, its symbol in Windows' icon font, and the groups of settings
+/// (`Param::section`) it shows, in this order.
+struct Tab {
+    name: &'static str,
+    glyph: u32,
+    sections: &'static [&'static str],
+}
+
+const TABS: [Tab; 6] = [
+    Tab { name: "Giao diện", glyph: 0xE771, sections: &["Giao diện", "Chuyển động"] },
+    Tab { name: "Dock", glyph: 0xE90E, sections: &["Dock"] },
+    Tab { name: "Đảo và bốn góc", glyph: 0xECA5, sections: &["Đảo động", "Bốn góc"] },
+    Tab { name: "Màn hình nền", glyph: 0xE91B, sections: &["Widget", "Hình nền"] },
+    Tab { name: "Cửa sổ", glyph: 0xE7C4, sections: &["Cửa sổ"] },
+    Tab { name: "Hành vi", glyph: 0xE713, sections: &["Hành vi"] },
+];
+
+/// The tab a group of settings is shown on. A group no tab names goes on the last one, so
+/// that a new setting can never be left out of the window.
+fn tab_of(section: &str) -> usize {
+    TABS.iter().position(|tab| tab.sections.contains(&section)).unwrap_or(TABS.len() - 1)
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Control {
@@ -60,7 +91,10 @@ struct State {
     text_right: IDWriteTextFormat,
     text_center: IDWriteTextFormat,
     header: IDWriteTextFormat,
+    icons: IDWriteTextFormat,
     cfg: Config,
+    /// The tab on show, and its rows.
+    tab: usize,
     rows: Vec<Row>,
     scale: f32,
     dark: bool,
@@ -72,40 +106,70 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// The tab that was on show when the window was last closed: it opens there again.
+    static LAST_TAB: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Rows in three columns, and the size of the content they need.
-fn build_rows() -> (Vec<Row>, f32, f32) {
-    // The groups that start a new column: how it looks and moves | the dock | how it behaves.
-    const NEW_COLUMN: [&str; 2] = ["Dock", "Hành vi"];
+#[cfg(test)]
+thread_local! {
+    /// For looking at the window in a test: it opens behind every other window and does
+    /// not take the keyboard.
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The rows of one tab, in one column to the right of the list of tabs, and how tall
+/// they are together.
+fn tab_rows(tab: usize) -> (Vec<Row>, f32) {
     let mut rows = Vec::new();
-    let mut section = "";
-    let (mut x, mut y) = (0.0, MARGIN - 8.0);
-    let mut tallest: f32 = 0.0;
-    for (index, p) in PARAMS.iter().enumerate() {
-        if !p.in_window {
-            continue;
+    let (x, mut y) = (SIDE_W, MARGIN - 8.0);
+    // The tab's groups in the tab's own order, each under its heading.
+    let mut sections: Vec<&str> = TABS[tab].sections.to_vec();
+    for p in PARAMS.iter().filter(|p| p.in_window && tab_of(p.section) == tab) {
+        if !sections.contains(&p.section) {
+            sections.push(p.section);
         }
-        if p.section != section {
-            section = p.section;
-            if NEW_COLUMN.contains(&section) {
-                tallest = tallest.max(y);
-                x += COLUMN_W;
-                y = MARGIN - 8.0;
+    }
+    for section in sections {
+        let mut headed = false;
+        for (index, p) in PARAMS.iter().enumerate().filter(|(_, p)| p.in_window && p.section == section) {
+            if !std::mem::replace(&mut headed, true) {
+                rows.push(Row { control: Control::Header(p.section), x, y });
+                y += HEADER_H;
             }
-            rows.push(Row { control: Control::Header(section), x, y });
-            y += HEADER_H;
+            rows.push(Row { control: Control::Param(index), x, y });
+            y += ROW_H;
         }
-        rows.push(Row { control: Control::Param(index), x, y });
+    }
+    // Starting with Windows is not a line of ben.ini, but it is how the app behaves.
+    if tab == TABS.len() - 1 {
+        rows.push(Row { control: Control::Autostart, x, y });
         y += ROW_H;
     }
-    rows.push(Row { control: Control::Autostart, x, y });
-    y += ROW_H + 14.0;
-    rows.push(Row { control: Control::Reset, x, y });
-    rows.push(Row { control: Control::OpenFile, x, y });
-    y += BUTTON_H;
-    tallest = tallest.max(y);
-    (rows, x + COLUMN_W, tallest + MARGIN)
+    (rows, y + MARGIN)
+}
+
+/// The size of the window's content: as tall as the tallest tab.
+fn content_size() -> (f32, f32) {
+    let tallest = (0..TABS.len()).map(|tab| tab_rows(tab).1).fold(0.0, f32::max);
+    // The list of tabs needs its own height too: the tabs, and the two buttons under them.
+    let side = SIDE_PAD + TABS.len() as f32 * TAB_H + 2.0 * (BUTTON_H + 8.0) + MARGIN + SIDE_PAD;
+    (SIDE_W + COLUMN_W, tallest.max(side))
+}
+
+/// The rows on show with tab `tab`: its own, and the two buttons at the foot of the list of
+/// tabs, which are there on every tab.
+fn build_rows(tab: usize, height: f32) -> Vec<Row> {
+    let (mut rows, _) = tab_rows(tab);
+    let foot = height - MARGIN + 4.0;
+    rows.push(Row { control: Control::Reset, x: 0.0, y: foot - 2.0 * BUTTON_H - 8.0 });
+    rows.push(Row { control: Control::OpenFile, x: 0.0, y: foot - BUTTON_H });
+    rows
+}
+
+/// Where a tab is in the list down the left side (logical pixels).
+fn tab_rect(tab: usize) -> (f32, f32, f32, f32) {
+    let top = SIDE_PAD + tab as f32 * TAB_H;
+    (SIDE_PAD, top, SIDE_W - SIDE_PAD, top + TAB_H - 4.0)
 }
 
 /// Opens the settings window, or brings it forward if it is already open.
@@ -178,7 +242,9 @@ fn create(cfg: &Config) -> Result<()> {
 
         // Size the window so the content fits, then centre it on the screen.
         let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-        let (rows, content_w, content_h) = build_rows();
+        let (content_w, content_h) = content_size();
+        let tab = LAST_TAB.get().min(TABS.len() - 1);
+        let rows = build_rows(tab, content_h);
         let mut frame = RECT { left: 0, top: 0, right: (content_w * scale).round() as i32, bottom: (content_h * scale).round() as i32 };
         let _ = AdjustWindowRectEx(&mut frame, STYLE, false, WINDOW_EX_STYLE(0));
         let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
@@ -233,7 +299,14 @@ fn create(cfg: &Config) -> Result<()> {
             text_right: make(13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             text_center: make(13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             header: make(12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+            icons: {
+                let format = dwrite.CreateTextFormat(PCWSTR(wide("Segoe Fluent Icons").as_ptr()), None, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 15.0 * scale, PCWSTR(wide("").as_ptr()))?;
+                format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                format
+            },
             cfg: cfg.clone(),
+            tab,
             rows,
             scale,
             dark,
@@ -242,6 +315,11 @@ fn create(cfg: &Config) -> Result<()> {
             autostart: system::autostart_enabled(),
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
+        #[cfg(test)]
+        if QUIET.get() {
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            return Ok(());
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(hwnd);
         Ok(())
@@ -260,13 +338,13 @@ fn control_rect(row: &Row, control: Control) -> (f32, f32, f32, f32) {
             Kind::Toggle => (right - 40.0, cy - 11.0, right, cy + 11.0),
             Kind::Choice(names) => {
                 // Narrower cells when there are many choices, so the label still fits beside them.
-                let w = if names.len() > 3 { 64.0 } else { 72.0 } * names.len() as f32;
+                let w = if names.len() > 3 { 70.0 } else { 92.0 } * names.len() as f32;
                 (right - w, cy - 13.0, right, cy + 13.0)
             }
         },
         Control::Autostart => (right - 40.0, cy - 11.0, right, cy + 11.0),
-        Control::Reset => (row.x + MARGIN, row.y, row.x + MARGIN + 150.0, row.y + BUTTON_H),
-        Control::OpenFile => (row.x + MARGIN + 162.0, row.y, row.x + MARGIN + 312.0, row.y + BUTTON_H),
+        // The two buttons are as wide as the list of tabs they stand under.
+        Control::Reset | Control::OpenFile => (row.x + SIDE_PAD, row.y, row.x + SIDE_W - SIDE_PAD, row.y + BUTTON_H),
         Control::Header(_) => (0.0, 0.0, 0.0, 0.0),
     }
 }
@@ -298,7 +376,24 @@ impl State {
         }
     }
 
+    /// Shows another tab.
+    fn show_tab(&mut self, tab: usize) {
+        if tab == self.tab || tab >= TABS.len() {
+            return;
+        }
+        self.tab = tab;
+        LAST_TAB.set(tab);
+        self.rows = build_rows(tab, content_size().1);
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
     fn mouse_down(&mut self, x: f32, y: f32) {
+        if let Some(tab) = (0..TABS.len()).find(|&tab| inside(tab_rect(tab), x, y)) {
+            self.show_tab(tab);
+            return;
+        }
         for row in self.rows.clone() {
             let area = control_rect(&row, row.control);
             match row.control {
@@ -394,6 +489,7 @@ impl State {
         let dim = if dark { color(1.0, 1.0, 1.0, 0.56) } else { color(0.0, 0.0, 0.0, 0.56) };
         let track = if dark { color(1.0, 1.0, 1.0, 0.16) } else { color(0.0, 0.0, 0.0, 0.14) };
         let line = if dark { color(1.0, 1.0, 1.0, 0.08) } else { color(0.0, 0.0, 0.0, 0.08) };
+        let side = if dark { color(0.0, 0.0, 0.0, 0.16) } else { color(0.0, 0.0, 0.0, 0.035) };
         let accent = color(ar, ag, ab, 1.0);
         let knob = color(1.0, 1.0, 1.0, 1.0);
 
@@ -419,14 +515,28 @@ impl State {
             t.BeginDraw();
             t.Clear(Some(&bg));
 
-            // Dividers between the columns.
-            brush.SetColor(&line);
+            // The list of tabs down the left side, a shade apart from the rest, and a line
+            // between the two.
             let mut client = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut client);
-            let columns = self.rows.iter().map(|r| (r.x / COLUMN_W).round() as usize).max().unwrap_or(0) + 1;
-            for column in 1..columns {
-                let x = (COLUMN_W * column as f32 * s).round();
-                t.FillRectangle(&rect(x, MARGIN * s, x + 1.0, client.bottom as f32 - MARGIN * s), brush);
+            brush.SetColor(&side);
+            t.FillRectangle(&rect(0.0, 0.0, SIDE_W * s, client.bottom as f32), brush);
+            brush.SetColor(&line);
+            t.FillRectangle(&rect((SIDE_W * s).round(), 0.0, (SIDE_W * s).round() + 1.0, client.bottom as f32), brush);
+            for (index, tab) in TABS.iter().enumerate() {
+                let area = tab_rect(index);
+                let picked = index == self.tab;
+                if picked {
+                    // The tab on show: a plate under it and a short bar of the accent colour.
+                    brush.SetColor(&track);
+                    t.FillRoundedRectangle(&round(area, 7.0), brush);
+                    brush.SetColor(&accent);
+                    let middle = (area.1 + area.3) * 0.5;
+                    t.FillRoundedRectangle(&round((area.0, middle - 8.0, area.0 + 3.0, middle + 8.0), 1.5), brush);
+                }
+                let symbol = char::from_u32(tab.glyph).map(String::from).unwrap_or_default();
+                write(&symbol, &self.icons, (area.0 + 8.0, area.1, area.0 + 40.0, area.3), if picked { &fg } else { &dim });
+                write(tab.name, if picked { &self.header } else { &self.text }, (area.0 + 44.0, area.1, area.2 - 4.0, area.3), &fg);
             }
 
             for row in &self.rows {
@@ -543,4 +653,82 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Not a check of anything: opens the window behind every other one and goes through
+    /// its tabs, a second and a half each, so that they can be looked at.
+    /// Run by hand: cargo test --release settings_tab_by_tab -- --ignored
+    #[test]
+    #[ignore]
+    fn settings_tab_by_tab() {
+        QUIET.set(true);
+        open(&Config::default());
+        let started = std::time::Instant::now();
+        let mut msg = MSG::default();
+        loop {
+            let tab = (started.elapsed().as_secs_f32() / 1.5) as usize;
+            if tab >= TABS.len() {
+                break;
+            }
+            with_state(|state| state.show_tab(tab));
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn every_setting_of_the_window_is_on_exactly_one_tab() {
+        let mut shown = vec![0; PARAMS.len()];
+        let mut autostart = 0;
+        for tab in 0..TABS.len() {
+            let (rows, height) = tab_rows(tab);
+            assert!(height > 0.0 && height <= content_size().1);
+            for row in rows {
+                match row.control {
+                    Control::Param(index) => shown[index] += 1,
+                    Control::Autostart => autostart += 1,
+                    _ => {}
+                }
+                assert_eq!(row.x, SIDE_W);
+            }
+        }
+        for (index, p) in PARAMS.iter().enumerate() {
+            assert_eq!(shown[index], p.in_window as usize, "{}", p.key);
+        }
+        assert_eq!(autostart, 1);
+    }
+
+    #[test]
+    fn every_group_has_a_tab_and_every_tab_has_rows() {
+        for p in PARAMS.iter().filter(|p| p.in_window) {
+            assert!(TABS.iter().any(|tab| tab.sections.contains(&p.section)), "no tab names the group '{}'", p.section);
+        }
+        for tab in 0..TABS.len() {
+            assert!(tab_rows(tab).0.iter().any(|row| matches!(row.control, Control::Param(_))), "tab '{}' is empty", TABS[tab].name);
+            // A tab starts with the heading of its first group.
+            assert!(matches!(tab_rows(tab).0[0].control, Control::Header(_)));
+        }
+        assert_eq!(tab_of("a group that is new"), TABS.len() - 1);
+    }
+
+    #[test]
+    fn the_tabs_and_the_buttons_do_not_overlap() {
+        let (_, height) = content_size();
+        let rows = build_rows(0, height);
+        let reset = rows.iter().find(|row| row.control == Control::Reset).unwrap();
+        let open = rows.iter().find(|row| row.control == Control::OpenFile).unwrap();
+        let last_tab = tab_rect(TABS.len() - 1);
+        assert!(control_rect(reset, reset.control).1 >= last_tab.3, "the buttons start under the last tab");
+        assert!(control_rect(open, open.control).1 >= control_rect(reset, reset.control).3);
+        assert!(control_rect(open, open.control).3 <= height);
+        assert!(control_rect(open, open.control).2 <= SIDE_W);
+    }
 }

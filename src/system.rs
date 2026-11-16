@@ -616,6 +616,12 @@ pub fn today() -> (i32, u32, u32) {
     (now.wYear as i32, now.wMonth as u32, now.wDay as u32)
 }
 
+/// Seconds since midnight, and the day of the week (0 = Monday).
+pub fn time_of_day() -> (u32, u32) {
+    let now = unsafe { GetLocalTime() };
+    (now.wHour as u32 * 3600 + now.wMinute as u32 * 60 + now.wSecond as u32, (now.wDayOfWeek as u32 + 6) % 7)
+}
+
 /// The time and date as the island writes them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Clock {

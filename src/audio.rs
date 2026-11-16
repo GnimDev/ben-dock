@@ -7,6 +7,7 @@ use std::ffi::c_void;
 
 use windows::core::{IUnknown, Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, ERole, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -65,6 +66,34 @@ pub fn set_default_output(id: &str) -> bool {
             all_set &= set_default_endpoint(this, PCWSTR(wide.as_ptr()), role).is_ok();
         }
         all_set
+    }
+}
+
+/// How loud what Windows is playing is, right now: the needle of the default playback
+/// device's own level meter. Nothing is recorded or listened to; Windows keeps this number
+/// for every device and hands it over when asked.
+pub struct Meter {
+    meter: IAudioMeterInformation,
+}
+
+impl Meter {
+    /// The meter of the device Windows plays through at the moment. `None` if there is no
+    /// such device, or Windows cannot be asked.
+    pub fn new() -> Option<Self> {
+        // SAFETY: ordinary COM calls on interfaces this function owns.
+        unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
+            let meter = device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None).ok()?;
+            Some(Meter { meter })
+        }
+    }
+
+    /// The loudest the sound has been in the last few hundredths of a second, from 0
+    /// (silence) to 1. `None` if the device is gone (unplugged, or no longer the default).
+    pub fn peak(&self) -> Option<f32> {
+        // SAFETY: an ordinary COM call on an interface this struct owns.
+        unsafe { self.meter.GetPeakValue().ok() }
     }
 }
 
