@@ -200,7 +200,8 @@ fn state_file() -> std::path::PathBuf {
 fn taskbar_windows() -> Vec<HWND> {
     let mut out = Vec::new();
     unsafe {
-        if let Ok(h) = FindWindowW(PCWSTR(wide("Shell_TrayWnd").as_ptr()), PCWSTR::null()) {
+        // (Not the window that stands in for it while Bến runs, see `background.rs`.)
+        if let Some(h) = crate::background::taskbar() {
             out.push(h);
         }
         // One extra taskbar per additional monitor.

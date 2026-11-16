@@ -214,6 +214,9 @@ fn create(cfg: &Config) -> Result<()> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
+            // The program's own icon (the first one in its file, see `build.rs`); none if
+            // the program was built without it.
+            hIcon: LoadIconW(Some(instance), PCWSTR(1 as *const u16)).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()

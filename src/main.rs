@@ -17,6 +17,7 @@
 
 mod app;
 mod audio;
+mod background;
 mod bluetooth;
 mod bubble;
 mod camera;

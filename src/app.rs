@@ -11,6 +11,7 @@ use crate::bluetooth;
 use crate::bubble::{self, Bubble, Entry};
 use crate::carry::Carry;
 use crate::config::{self, Config};
+use crate::background::{self, Background, Button, Resident};
 use crate::corner::{self, Corner, Kind};
 use crate::desktop;
 use crate::dock::{self, Dock, Released, LAUNCHER_KEY};
@@ -50,7 +51,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetDoubleClickTime, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_LBUTTON};
 use windows::Win32::UI::Shell::ABN_POSCHANGED;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -66,6 +67,7 @@ const WM_CLAUDE_READ: u32 = WM_APP + 8;
 const WM_WEATHER_READ: u32 = WM_APP + 9;
 const WM_FRONT_CHANGED: u32 = WM_APP + 10;
 const WM_WIN_KEY: u32 = WM_APP + 11;
+const WM_BACKGROUND_CHANGED: u32 = WM_APP + 12;
 /// Rings when something that is tucked out of view is due to change (see `update`).
 const TIMER_TUCK: usize = 4;
 /// Tucked away and brought back by the cursor, the dock goes again this long after the cursor
@@ -84,6 +86,13 @@ const TIMER_LOOK: usize = 3;
 /// is and how loud the sound is (see `App::poll_desktop`). And how often, in milliseconds.
 const TIMER_POLL: usize = 5;
 const POLL_EVERY: u32 = 50;
+/// A timer that runs while an island is kept open for an app in the background (see
+/// `App::watch_held`), and how often it rings, in milliseconds. The island is kept at least
+/// `HELD_AT_LEAST` (the app takes a moment to put its menu up) and at most `HELD_AT_MOST`.
+const TIMER_HELD: usize = 6;
+const HELD_EVERY: u32 = 120;
+const HELD_AT_LEAST: Duration = Duration::from_millis(600);
+const HELD_AT_MOST: Duration = Duration::from_secs(120);
 /// For how long after it opens a window is made to float if it turns out too large: some
 /// apps show their window first and maximise it a moment later. Seconds.
 const NEWCOMER_FOR: f32 = 1.5;
@@ -260,6 +269,8 @@ pub enum Event {
     Launcher(launcher::Input),
     /// The Windows key was tapped on its own (see `winkey.rs`).
     WinKey,
+    /// An app in the background came, went or changed its icon (see `background.rs`).
+    Background,
     /// The settings window changed something. `true` once the change is final (control released).
     Config(bool),
     Quit,
@@ -371,6 +382,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let _ = KillTimer(Some(hwnd), TIMER_TUCK);
                 }
                 push(Event::Wake);
+            } else if wparam.0 == TIMER_HELD {
+                push(Event::Wake);
             } else {
                 push(Event::Tick);
             }
@@ -397,6 +410,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_WIN_KEY => {
             push(Event::WinKey);
+            return LRESULT(0);
+        }
+        WM_BACKGROUND_CHANGED => {
+            push(Event::Background);
             return LRESULT(0);
         }
         WM_PAGE_DATA => {
@@ -448,7 +465,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 let answered = wparam.0 == HSHELL_GETMINRECT && unsafe { answer_min_rect(lparam) };
                 return LRESULT(answered as isize);
             }
-            if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) {
+            // (Not when it is this program asking the others for their icons, see `background.rs`.)
+            if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) && wparam.0 != background::OWN {
                 push(Event::TaskbarCreated);
             }
         }
@@ -789,6 +807,15 @@ pub struct App {
     hooks: Vec<HWINEVENTHOOK>,
     /// Watches the Windows key while the tray can be opened with it.
     winkey: Option<WinKey>,
+    /// The watch on the apps running in the background, what it last said, and which of
+    /// them was last clicked and when (the next click may be the second of a double click).
+    background: Option<Background>,
+    residents: Vec<Resident>,
+    resident_clicked: Option<(u64, Instant)>,
+    /// The island that is kept open for an app in the background which is showing what a
+    /// click on its icon asked for (its menu): the island's screen, the app, what the app
+    /// had up before the click, and when the click was.
+    island_held: Option<(usize, Resident, Vec<isize>, Instant)>,
     /// Last error from updating the visuals, so a repeating error is logged once.
     shown_error: Option<windows::core::Error>,
 
@@ -900,6 +927,10 @@ impl App {
             tuck_due: None,
             hooks: Vec::new(),
             winkey: None,
+            background: None,
+            residents: Vec::new(),
+            resident_clicked: None,
+            island_held: None,
             shown_error: None,
             bench: None,
             bench_last: None,
@@ -1067,6 +1098,16 @@ impl App {
         } else if !self.cfg.corner_weather {
             self.weather = None;
             self.sky = None;
+        }
+
+        // The apps running in the background have a card on the island's first page.
+        if self.cfg.island && self.cfg.background_apps {
+            if self.background.is_none() {
+                self.background = background::start(self.hwnd, WM_BACKGROUND_CHANGED);
+            }
+        } else {
+            self.background = None;
+            self.residents.clear();
         }
 
         let first = &self.screens[0].theme;
@@ -1368,7 +1409,7 @@ impl App {
     pub fn handle(&mut self, ev: Event) {
         // (Looking at the cursor for the wallpaper changes nothing by itself.)
         self.touched |= !matches!(ev, Event::Poll);
-        if !matches!(ev, Event::Poll | Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude | Event::Weather) {
+        if !matches!(ev, Event::Poll | Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude | Event::Weather | Event::Background) {
             self.busy();
         }
         if matches!(ev, Event::DragIn(..) | Event::DragOut(_) | Event::Dropped(_) | Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Corner(..) | Event::Widget(..) | Event::Bubble(_) | Event::Launcher(_)) {
@@ -1568,6 +1609,10 @@ impl App {
                 unsafe {
                     let _ = RegisterShellHookWindow(self.hwnd);
                 }
+                // (If there was no taskbar to stand in for when Bến started, there is now.)
+                if self.cfg.island && self.cfg.background_apps && self.background.is_none() {
+                    self.background = background::start(self.hwnd, WM_BACKGROUND_CHANGED);
+                }
                 self.place(true);
             }
             Event::Minimized(id) => {
@@ -1604,7 +1649,8 @@ impl App {
                 self.refresh_due = true;
             }
             // Nothing to do but look again, which every event leads to.
-            Event::PreviewHover | Event::Wake | Event::Poll => {}
+            Event::Wake => self.watch_held(),
+            Event::PreviewHover | Event::Poll => {}
             Event::PreviewClick(middle) => {
                 let mut pt = POINT::default();
                 let target = unsafe { GetCursorPos(&mut pt) }.ok().and_then(|_| self.preview.as_ref().and_then(|p| p.window_at(pt)));
@@ -1621,6 +1667,7 @@ impl App {
             Event::Volume | Event::Power => self.read_status(),
             Event::Media => self.take_media(),
             Event::Notices => self.take_notices(),
+            Event::Background => self.take_residents(),
             Event::Claude => self.take_usage(),
             Event::Weather => self.take_weather(),
             Event::Corner(window, input) => self.corner_input(window, input),
@@ -1796,6 +1843,63 @@ impl App {
         self.refresh_pages(Page::Notices);
     }
 
+    /// Takes what the watch on the apps in the background has sent: the islands show them
+    /// on their first page.
+    fn take_residents(&mut self) {
+        if let Some(residents) = self.background.as_ref().and_then(|b| b.take()) {
+            self.residents = residents;
+        }
+    }
+
+    /// A click on an app in the background, on the island of screen `s`: its icon is
+    /// clicked the way the taskbar would, where the cursor is. A second click soon after
+    /// the first is a double click, as Windows counts it.
+    ///
+    /// The island then stays as it is while the app shows what the click asked for (its
+    /// menu, which takes the cursor off the island at once), see `watch_held`.
+    fn click_resident(&mut self, s: usize, id: u64, button: Button) {
+        let Some(resident) = self.residents.iter().find(|resident| resident.id == id).cloned() else { return };
+        let mut pt = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut pt) };
+        let now = Instant::now();
+        let twice = button == Button::Left && self.resident_clicked.is_some_and(|(last, at)| last == id && now.duration_since(at).as_millis() <= unsafe { GetDoubleClickTime() } as u128);
+        self.resident_clicked = (button == Button::Left && !twice).then_some((id, now));
+        // (Clicked again while its menu is up: what it had before the first click still counts.)
+        let before = match self.island_held.take() {
+            Some((_, held, before, _)) if held.id == id => before,
+            _ => resident.popups(),
+        };
+        resident.click(button, twice, (pt.x, pt.y));
+        for (index, screen) in self.screens.iter_mut().enumerate() {
+            if let Some(island) = screen.island.as_mut() {
+                island.hold(index == s);
+            }
+        }
+        self.island_held = Some((s, resident, before, now));
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_HELD, HELD_EVERY, None);
+        }
+    }
+
+    /// Looks whether the app an island is kept open for is still showing its menu, and
+    /// lets the island go once it is not: the panel then closes as it always does, when
+    /// the cursor is off it.
+    fn watch_held(&mut self) {
+        let Some((s, resident, before, since)) = self.island_held.as_ref() else { return };
+        let waited = since.elapsed();
+        if waited < HELD_AT_LEAST || (waited < HELD_AT_MOST && resident.showing(before)) {
+            return;
+        }
+        let s = *s;
+        self.island_held = None;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_HELD);
+        }
+        if let Some(island) = self.screens.get_mut(s).and_then(|screen| screen.island.as_mut()) {
+            island.hold(false);
+        }
+    }
+
     /// Takes what the asker for the weather has heard.
     fn take_weather(&mut self) {
         let Some(report) = self.weather.as_ref().and_then(|w| w.take()) else { return };
@@ -1904,6 +2008,9 @@ impl App {
             }
             Action::Open(page) => self.open_page(s, page),
             Action::Row(page, id) => self.page_row(s, page, id),
+            // An app in the background, on the island's first page: a click on its icon, as
+            // in the taskbar.
+            Action::Resident(id, button) => self.click_resident(s, id, button),
             // The cross at the end of a notification takes it off the list, and out of Windows' own.
             Action::Close(Page::Notices, id) if id >= row::LISTED => {
                 if let (Some(notices), Some(notice)) = (self.notices.as_ref(), self.noticed.get(id - row::LISTED)) {
@@ -1914,7 +2021,7 @@ impl App {
             // What a click on the far end of the taskbar does. The taskbar is hidden, not
             // gone, and still takes the order.
             Action::Desktop => unsafe {
-                if let Ok(tray) = FindWindowW(PCWSTR(wide("Shell_TrayWnd").as_ptr()), PCWSTR::null()) {
+                if let Some(tray) = background::taskbar() {
                     let _ = PostMessageW(Some(tray), WM_COMMAND, WPARAM(407), LPARAM(0));
                 }
             },
@@ -3128,7 +3235,7 @@ impl App {
         let scripted = self.scripted();
         let now = Instant::now();
         let mut due: Option<Instant> = None;
-        let info = island::Info { time: &self.clock.time, day: &self.clock.day, date: &self.clock.date, today: self.today, status: self.last_status, media: self.playing.as_ref() };
+        let info = island::Info { time: &self.clock.time, day: &self.clock.day, date: &self.clock.date, today: self.today, status: self.last_status, media: self.playing.as_ref(), residents: &self.residents };
         // What each corner says at rest. Claude's: the share of the week's limit used where
         // Claude Code has a current note of it, otherwise the tokens taken today.
         let (claude_text, claude_sub) = match self.usage.as_ref() {
@@ -3688,6 +3795,8 @@ impl App {
         self.poll_desktop();
         // The Windows key is Windows' again.
         self.winkey = None;
+        // And the programs in the background talk to the taskbar itself again.
+        self.background = None;
         self.preview = None;
         self.fx = None;
         self.launcher = None;

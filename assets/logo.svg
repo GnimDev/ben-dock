@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Bến">
+  <title>Bến</title>
+  <defs>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#43B4FF"/>
+      <stop offset="1" stop-color="#0B4FCF"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.26"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <!-- The screen: water. -->
+  <rect width="256" height="256" rx="58" fill="url(#water)"/>
+  <rect width="256" height="256" rx="58" fill="url(#sheen)"/>
+  <!-- The island, at the top. -->
+  <rect x="86" y="44" width="84" height="30" rx="15" fill="#FFFFFF" fill-opacity="0.96"/>
+  <!-- The dock, at the bottom, with three apps on it: the one in the middle swells, as the
+       one under the cursor does. -->
+  <rect x="38" y="156" width="180" height="58" rx="29" fill="#FFFFFF" fill-opacity="0.96"/>
+  <rect x="74" y="176" width="21" height="21" rx="6.5" fill="#0B63DB"/>
+  <rect x="113" y="167" width="30" height="30" rx="9" fill="#0B63DB"/>
+  <rect x="161" y="176" width="21" height="21" rx="6.5" fill="#0B63DB"/>
+</svg>

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="112" alt="Bến's logo: the island above, the dock below"></p>
+
 # Bến
 
 A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock along the bottom edge and a dynamic island along the top edge of every monitor. Written in Rust, drawn with Windows Composition.
@@ -11,6 +13,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 - **App tray:** every installed app, the ones you use most on the first page and installers and admin tools on the last. Icons are kept in a file (`icons.cache`), so the tray opens full. Search ignores case and accents and finds apps by initials (`vsc`), short names (`cmd`, `calc`), program names (`winword`), several words (`ms word`) and small typos (`notepda`); what you picked before comes first. Drag a tile onto the dock to pin it.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
 - **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
+- **Background apps:** the apps that run in the background, whose icons the Windows taskbar keeps in its corner, have a card of their own on the island's first page, under the Wi-Fi, Bluetooth, sound and battery cards. Click, double-click or right-click an icon there and its program gets the click as it would from the taskbar: its window opens, or its own menu shows. The name of the app under the cursor is written beside the card's title.
 - **Four corners:** a small glass pill in each corner of the screen. Hover one to open its list.
   - Top-left, **Claude:** the share of the weekly limit used when Claude Code has a current figure, otherwise today's tokens. Read from the files Claude Code keeps on this computer; it never reads Claude's sign-in.
   - Top-right, **notifications:** a bell with a count. Each new app notification swells out as a card. In the list, click one to open its app or the ✕ to dismiss it.
@@ -48,6 +51,7 @@ Both Rust toolchains work: MSVC (needs the C++ Build Tools) or GNU (needs MinGW'
 - **Settings:** open them from the dock menu, or edit `ben.ini` next to `ben.exe`. Changes apply immediately. The window is sorted into tabs: look, dock, island and corners, desktop, windows, behaviour.
 - **Widgets:** switch them on under **Màn hình nền** in the settings. Drag a card to move it; its place is kept in `widgets.txt`. The to-do list and the note are plain text files next to `ben.exe` (`todo.txt`, one task per line, a line starting with `x ` is done; `note.txt`): click the pencil on the card to open the file. Widgets stay visible when you show the desktop (Win+D).
 - **Live wallpaper:** choose **Nước tối** or **Nước xanh** under **Màn hình nền**. Your Windows wallpaper is not changed: switch the water off and it is back.
+- **Background apps:** hover the island and look under the cards. To read those icons Bến keeps a hidden window in front of the hidden taskbar's; it passes every message on to the taskbar unchanged, so Windows' own list stays as it is, and what an icon's tip or balloon says is never written to the log. Turn it off with **Ứng dụng chạy ngầm** in the settings (under the island's), or `background_apps = false` in `ben.ini`.
 - **Always shown or tucked away:** `show_on_desktop` (on by default) keeps the dock, island and corners in view while no window is maximized; `show_when_maximized` (off by default) keeps the dock and island in view over a maximized window. Turned off, each tucks them away behind the white bar. With `show_when_maximized` on, `reserve_space` stops maximized windows from covering them.
 - **Taskbar:** the Windows taskbar is hidden while Bến runs and comes back when it quits. If Bến crashes and the taskbar stays hidden, run `restore-taskbar.bat`.
 

@@ -12,7 +12,9 @@
 //!   open      under the cursor it opens into a panel. Its first page has what
 //!             is playing, the volume, and a row of cards; a card turns the
 //!             panel into that card's own page (Wi-Fi, sound, Bluetooth,
-//!             battery, the month) without leaving the island
+//!             battery, the month) without leaving the island. Under the
+//!             cards are the apps running in the background, as their icons
+//!             in the taskbar's corner were (see `background.rs`)
 //!
 //! What a page *says* is decided by the app (`app.rs`), which hands the island
 //! a list of rows; the island only lays them out and reports what was clicked.
@@ -20,6 +22,7 @@
 //! inside it changes size, and only the glass takes the mouse.
 
 use crate::app::{self, Event};
+use crate::background::{Button as Mouse, Resident};
 use crate::config::Config;
 use crate::dates;
 use crate::gfx::Gfx;
@@ -27,6 +30,7 @@ use crate::media::{Art, NowPlaying};
 use crate::motion::{Glide, Motion};
 use crate::scene::{rgba, Bead, Glass, Layer, Pill, Scene, Sprite, Stage};
 use crate::shade::Shade;
+use crate::shell;
 use crate::spring::Spring;
 use crate::system::{AppBar, Monitor, Status};
 use crate::text::{self, glyph, Line, DISPLAY_FONT, ICON_FONT, UI_FONT};
@@ -58,7 +62,7 @@ const LEAVE_MS: u32 = 320;
 // The open panel, in logical pixels.
 const OPEN_W: f32 = 372.0;
 /// The tallest a page gets (the window is made this tall).
-const OPEN_H_MOST: f32 = 430.0;
+const OPEN_H_MOST: f32 = 520.0;
 const OPEN_RADIUS: f32 = 24.0;
 /// Most rows a list page shows.
 pub const MOST_ROWS: usize = 11;
@@ -70,6 +74,8 @@ pub enum Input {
     Leave,
     Down(i32, i32),
     Up(i32, i32),
+    /// Another mouse button came up: the right one or the middle one.
+    OtherUp(Mouse, i32, i32),
     /// Mouse wheel; positive = away from the user.
     Wheel(i32),
     /// One of the island's own timers ran out.
@@ -195,6 +201,9 @@ pub enum Action {
     Close(Page, usize),
     /// The very corner of the screen was clicked: every window out of the way, or back.
     Desktop,
+    /// An app running in the background was clicked (its number, see `Resident`), with
+    /// this mouse button.
+    Resident(u64, Mouse),
     /// Enter was pressed in a page's text field (what was typed is in `Island::typed`).
     Enter(Page),
 }
@@ -208,6 +217,8 @@ pub struct Info<'a> {
     pub today: (i32, u32, u32),
     pub status: Status,
     pub media: Option<&'a NowPlaying>,
+    /// The apps running in the background (see `background.rs`).
+    pub residents: &'a [Resident],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +246,8 @@ enum Zone {
     Date,
     Status,
     Card(Page),
+    /// An app running in the background (its place among them).
+    App(usize),
     /// Back to the first page.
     Back,
     /// A row of a list page (its index).
@@ -267,6 +280,13 @@ struct Button {
     back: Pill,
     icon: Line,
     label: Line,
+}
+
+/// The icon of an app running in the background, and which of the app's pictures it
+/// shows (the app's number and the count of its pictures).
+struct AppLook {
+    sprite: Sprite,
+    shown: Option<(u64, u32)>,
 }
 
 /// The visuals of one row of a list page.
@@ -324,6 +344,15 @@ pub struct Island {
     p_repeat: Line,
     cards: Vec<Button>,
     buttons: Vec<Button>,
+    /// The card of apps running in the background, between those two: its back, its title,
+    /// the name of the app under the cursor, the apps' icons, and their numbers in the
+    /// order they are laid out in.
+    p_apps_back: Pill,
+    p_apps_title: Line,
+    p_apps_name: Line,
+    apps: Vec<AppLook>,
+    app_ids: Vec<u64>,
+    home_content: VisualCollection,
     /// The drop of light under the cursor, one for each kind of page.
     hot: [Bead; 3],
     hot_at: Glide,
@@ -371,6 +400,8 @@ pub struct Island {
     reveal: bool,
     /// The island has taken the keyboard (a page with a text field is open).
     focused: bool,
+    /// The open panel is kept as it is, wherever the cursor goes (see `hold`).
+    held: bool,
     w: Spring,
     h: Spring,
     r: Spring,
@@ -442,6 +473,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             send(Input::Up(x, y));
+            return LRESULT(0);
+        }
+        WM_RBUTTONUP => {
+            send(Input::OtherUp(Mouse::Right, x, y));
+            return LRESULT(0);
+        }
+        WM_MBUTTONUP => {
+            send(Input::OtherUp(Mouse::Middle, x, y));
             return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
@@ -556,6 +595,7 @@ impl Island {
             let p_art = scene.sprite_in(&p)?;
             let (p_seek_track, p_seek_fill) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
             let backs = (0..8).map(|_| scene.pill_in(&p)).collect::<Result<Vec<_>>>()?;
+            let p_apps_back = scene.pill_in(&p)?;
             let hot_home = scene.bead_in(&p)?;
             let (p_knob, p_seek_knob) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
             let specs = [
@@ -618,6 +658,12 @@ impl Island {
                 p_repeat: line(&p)?,
                 cards,
                 buttons,
+                p_apps_back,
+                p_apps_title: line(&p)?,
+                p_apps_name: line(&p)?,
+                apps: Vec::new(),
+                app_ids: Vec::new(),
+                home_content: p.clone(),
                 hot: [hot_home, hot_list, hot_month],
                 hot_at: Glide::new(motion),
                 p_knob,
@@ -660,6 +706,7 @@ impl Island {
                 typed: String::new(),
                 reveal: false,
                 focused: false,
+                held: false,
                 w: Spring::with(40.0, motion.medium()),
                 h: Spring::with(8.0, motion.medium()),
                 r: Spring::with(4.0, motion.medium()),
@@ -768,6 +815,8 @@ impl Island {
             &mut self.p_next,
             &mut self.p_vol,
             &mut self.p_vol_text,
+            &mut self.p_apps_title,
+            &mut self.p_apps_name,
             &mut self.l_back,
             &mut self.l_title,
             &mut self.m_back,
@@ -786,6 +835,9 @@ impl Island {
         self.looks.clear();
         self.p_art_of = None;
         self.a_art_of = None;
+        for look in &mut self.apps {
+            look.shown = None;
+        }
     }
 
     fn timer(&self, id: usize, ms: u32) {
@@ -834,11 +886,28 @@ impl Island {
         self.timer(TIMER_ALERT, ALERT_MS);
     }
 
+    /// Keeps the open panel as it is, wherever the cursor goes, while something that was
+    /// started from it is still going on elsewhere: an app running in the background is
+    /// showing the menu its icon was clicked for. Let go, the panel closes as it always
+    /// does, once the cursor is off it.
+    pub fn hold(&mut self, on: bool) {
+        if self.held == on {
+            return;
+        }
+        self.held = on;
+        if on {
+            self.cancel(TIMER_LEAVE);
+        } else if !self.hovering && self.mode == Mode::Open && !self.dragging && self.seeking.is_none() && !self.focused {
+            self.timer(TIMER_LEAVE, LEAVE_MS);
+        }
+    }
+
     /// Closes the open panel (something else took the stage).
     pub fn collapse(&mut self) {
         if self.mode == Mode::Open {
             self.mode = if self.alerting { Mode::Alert } else { Mode::Compact };
         }
+        self.held = false;
         self.page = Page::Home;
         self.pressed = None;
         self.typed.clear();
@@ -944,8 +1013,9 @@ impl Island {
                 self.hovering = false;
                 self.cursor = None;
                 self.cancel(TIMER_DWELL);
-                // While something is being typed the panel stays, wherever the cursor goes.
-                if self.mode == Mode::Open && !self.dragging && self.seeking.is_none() && !self.focused {
+                // While something is being typed the panel stays, wherever the cursor goes. So
+                // it does while it is held (see `hold`).
+                if self.mode == Mode::Open && !self.dragging && self.seeking.is_none() && !self.focused && !self.held {
                     self.timer(TIMER_LEAVE, LEAVE_MS);
                 }
             }
@@ -1012,6 +1082,7 @@ impl Island {
                     }
                     Some(Zone::Status) => Action::Open(Page::Wifi),
                     Some(Zone::Card(card)) => Action::Open(card),
+                    Some(Zone::App(index)) => self.app_ids.get(index).map(|&id| Action::Resident(id, Mouse::Left)).unwrap_or(Action::None),
                     Some(Zone::Back) => {
                         self.go_home();
                         Action::None
@@ -1038,6 +1109,17 @@ impl Island {
                     }
                     Some(Zone::Slider) | Some(Zone::Seek) | None => Action::None,
                 };
+            }
+            Input::OtherUp(button, x, y) => {
+                // The other buttons mean something on an app running in the background only:
+                // the right one asks for the menu its icon had in the taskbar.
+                if self.mode == Mode::Open {
+                    if let Some(Zone::App(index)) = self.zone_at(x as f32, y as f32) {
+                        if let Some(&id) = self.app_ids.get(index) {
+                            return Action::Resident(id, button);
+                        }
+                    }
+                }
             }
             Input::Wheel(delta) => {
                 // Rolling the wheel over the island turns the volume.
@@ -1085,7 +1167,7 @@ impl Island {
                 }
             }
             Input::Timer(TIMER_LEAVE) => {
-                if !self.hovering && !self.dragging && self.seeking.is_none() && !self.focused && self.mode == Mode::Open {
+                if !self.hovering && !self.dragging && self.seeking.is_none() && !self.focused && !self.held && self.mode == Mode::Open {
                     self.collapse();
                 }
             }
@@ -1458,7 +1540,62 @@ impl Island {
         let gap = px(8.0);
         let pressed = self.pressed;
         let online = info.status.online;
+        // Between the two: the apps running in the background (see `background.rs`), on a
+        // card of their own. Their icons stand in rows, at the size programs make them for
+        // the taskbar, so that they stay sharp; the name of the one under the cursor is
+        // written beside the card's title.
+        let apps = info.residents;
+        let apps_top = row_y + self.cards.len().div_ceil(2) as f32 * (px(40.0) + gap);
+        let mut apps_h = 0.0;
+        self.app_ids.clear();
+        if !apps.is_empty() {
+            let (icon, cell_w, cell_h, inset, title_h) = (px(16.0), px(30.0), px(28.0), px(5.0), px(26.0));
+            let across = (((ow - 2.0 * pad - 2.0 * inset) / cell_w).floor() as usize).max(1);
+            let h = title_h + apps.len().div_ceil(across) as f32 * cell_h + px(6.0);
+            self.p_apps_back.place(pad, apps_top, ow - 2.0 * pad, h, px(11.0))?;
+            self.p_apps_back.set_color(theme.track)?;
+            while self.apps.len() < apps.len() {
+                self.apps.push(AppLook { sprite: scene.sprite_in(&self.home_content)?, shown: None });
+            }
+            let cursor = self.cursor.filter(|_| open && self.page == Page::Home).map(|(cx, cy)| (cx - x0, cy - y0));
+            let mut named = "";
+            for (index, (app, look)) in apps.iter().zip(self.apps.iter_mut()).enumerate() {
+                if look.shown != Some((app.id, app.drawn)) {
+                    look.sprite.set_surface(&scene.surface_from_pixels(&shell::resample(&app.picture, icon as u32))?)?;
+                    look.shown = Some((app.id, app.drawn));
+                }
+                let left = pad + inset + (index % across) as f32 * cell_w;
+                let top = apps_top + title_h + (index / across) as f32 * cell_h;
+                look.sprite.place(left + ((cell_w - icon) * 0.5).round(), top + ((cell_h - icon) * 0.5).round(), icon, icon)?;
+                look.sprite.set_opacity(if pressed == Some(Zone::App(index)) { 0.7 } else { 1.0 })?;
+                home_zones.push((Zone::App(index), left, top, left + cell_w, top + cell_h));
+                if cursor.is_some_and(|(cx, cy)| cx >= left && cx < left + cell_w && cy >= top && cy < top + cell_h) {
+                    named = &app.name;
+                }
+                self.app_ids.push(app.id);
+            }
+            self.p_apps_title.set(scene, gfx, &f.small, "Đang chạy ngầm", dim, None)?;
+            let title_x = pad + px(12.0);
+            let y = apps_top + px(3.0) + mid(&self.p_apps_title, title_h);
+            self.p_apps_title.place(title_x, y)?;
+            let room = ow - pad - px(12.0) - (title_x + self.p_apps_title.w + px(14.0));
+            self.p_apps_name.set(scene, gfx, &f.small, named, fg, Some(room.max(px(40.0))))?;
+            let y = apps_top + px(3.0) + mid(&self.p_apps_name, title_h);
+            self.p_apps_name.place(ow - pad - px(12.0) - self.p_apps_name.w, y)?;
+            apps_h = h + gap;
+        }
+        self.p_apps_back.set_opacity(if apps.is_empty() { 0.0 } else { 1.0 })?;
+        for line in [&mut self.p_apps_title, &mut self.p_apps_name] {
+            line.set_opacity(if apps.is_empty() { 0.0 } else { 1.0 })?;
+        }
+        for look in self.apps.iter_mut().skip(apps.len()) {
+            look.sprite.set_opacity(0.0)?;
+        }
         for (group, across, row_h) in [(&mut self.cards, 2usize, px(40.0)), (&mut self.buttons, 4usize, px(36.0))] {
+            // (The card of apps in the background lies between the two.)
+            if across == 4 {
+                row_y += apps_h;
+            }
             let each = ((ow - 2.0 * pad - (across as f32 - 1.0) * gap) / across as f32).floor();
             let rows = group.len().div_ceil(across);
             for (i, button) in group.iter_mut().enumerate() {
@@ -1781,5 +1918,103 @@ impl Drop for Island {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+    use std::time::Duration;
+
+    /// Not a check of anything: opens an island on a screen that is not there, with apps
+    /// running in the background on its first page, and saves pictures of its window to
+    /// look at. Nothing shows on the real screens and nothing takes the focus.
+    /// Run by hand: cargo test --profile quick the_island_for_looking_at -- --ignored
+    /// (BEN_OUT: the folder for the pictures. BEN_APPS: a file naming a program on each
+    /// line, whose icons are shown. BEN_LIGHT=1 for the light look.)
+    #[test]
+    #[ignore]
+    fn the_island_for_looking_at() {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+        /// A picture file anything can open: BGRA rows, the top one first.
+        fn save(path: &std::path::Path, w: i32, h: i32, bgra: &[u8]) {
+            let mut file = Vec::with_capacity(54 + bgra.len());
+            file.extend_from_slice(b"BM");
+            file.extend_from_slice(&(54 + bgra.len() as u32).to_le_bytes());
+            file.extend_from_slice(&[0; 4]);
+            file.extend_from_slice(&54u32.to_le_bytes());
+            file.extend_from_slice(&40u32.to_le_bytes());
+            file.extend_from_slice(&w.to_le_bytes());
+            file.extend_from_slice(&(-h).to_le_bytes());
+            file.extend_from_slice(&1u16.to_le_bytes());
+            file.extend_from_slice(&32u16.to_le_bytes());
+            file.extend_from_slice(&[0; 24]);
+            file.extend_from_slice(bgra);
+            std::fs::write(path, file).expect("the picture saved");
+        }
+
+        let out = std::path::PathBuf::from(std::env::var("BEN_OUT").expect("BEN_OUT: the folder for the pictures"));
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let gfx = Gfx::new(false).expect("a graphics device");
+        let scene = Scene::new(&gfx).expect("a compositor");
+        let mut cfg = Config::default();
+        cfg.theme = if std::env::var("BEN_LIGHT").is_ok() { 2.0 } else { 1.0 };
+        let theme = theme::build(&cfg, true, (0.0, 0.47, 0.84), 1.0);
+        let motion = Motion::new(1.0, 0.5, false);
+        let rect = RECT { left: -8000, top: 0, right: -8000 + 1920, bottom: 1080 };
+        let monitor = Monitor { handle: 0, rect, work: rect, dpi: 96, primary: false };
+        let mut island = Island::new(&scene, &theme, &motion).expect("an island");
+        island.place(&monitor, &cfg, &theme);
+
+        let programs: Vec<String> = match std::env::var("BEN_APPS") {
+            Ok(file) => std::fs::read_to_string(file).expect("the list of programs").lines().map(|line| line.trim().trim_start_matches('\u{feff}').to_string()).filter(|line| !line.is_empty()).collect(),
+            Err(_) => ["taskmgr", "cmd", "notepad", "mspaint", "SnippingTool", "control", "mmc", "perfmon", "charmap", "osk", "magnify"].iter().map(|name| format!("C:\\Windows\\System32\\{name}.exe")).collect(),
+        };
+        let residents: Vec<Resident> = programs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, program)| shell::load_icon(program, 16).map(|picture| Resident::made_up(index as u64 + 1, &shell::display_name(program), picture)))
+            .collect();
+        println!("{} apps in the background", residents.len());
+
+        let hide = Spring::with(0.0, motion.medium());
+        let track = NowPlaying { title: "Một bài hát để thử".into(), artist: "Ban nhạc nào đó".into(), playing: true, position: 62.0, length: 215.0, seekable: true, shuffle: Some(false), repeat: Some(0), ..Default::default() };
+        let shoot = |island: &mut Island, media: Option<&NowPlaying>, count: usize, frames: usize, name: &str| {
+            let mut msg = MSG::default();
+            for _ in 0..frames {
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&msg);
+                    }
+                }
+                let status = Status { battery: Some((85, false)), volume: Some((0.62, false)), online: true };
+                let info = Info { time: "14:05", day: "Th 2", date: "Thứ hai, 16 tháng 11", today: (2026, 11, 16), status, media, residents: &residents[..count.min(residents.len())] };
+                island.update(&scene, &gfx, &cfg, &theme, &motion, &info, &hide, 1.0 / 60.0).expect("an update");
+                scene.commit();
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            let (w, h) = (island.win.0 as i32, island.win.1 as i32);
+            let pixels = unsafe { crate::camera::print(island.hwnd, w, h) }.expect("a picture of the window");
+            save(&out.join(format!("{name}.bmp")), w, h, &pixels);
+            println!("{name}: window {w}x{h}, glass {}x{}", island.w.pos.round(), island.h.pos.round());
+        };
+        island.open();
+        shoot(&mut island, None, usize::MAX, 90, "home");
+        // The cursor on the third app.
+        let spot = island.zones.iter().find(|(zone, ..)| *zone == Zone::App(2)).map(|(_, l, t, r, b)| ((l + r) * 0.5, (t + b) * 0.5));
+        if let Some((x, y)) = spot {
+            island.handle(Input::Move(x as i32, y as i32));
+        }
+        shoot(&mut island, None, usize::MAX, 60, "hover");
+        island.handle(Input::Leave);
+        island.open();
+        shoot(&mut island, Some(&track), usize::MAX, 90, "playing");
+        shoot(&mut island, None, 5, 90, "few");
+        shoot(&mut island, None, 0, 90, "none");
     }
 }

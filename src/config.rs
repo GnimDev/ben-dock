@@ -46,6 +46,8 @@ pub struct Config {
     pub island_hover: bool,
     pub island_alerts: bool,
     pub island_media: bool,
+    /// The island's first page shows the apps running in the background.
+    pub background_apps: bool,
 
     // Corners
     pub corner_claude: bool,
@@ -137,6 +139,7 @@ impl Default for Config {
             island_hover: true,
             island_alerts: true,
             island_media: true,
+            background_apps: true,
             corner_claude: true,
             corner_notices: true,
             corner_weather: true,
@@ -246,6 +249,7 @@ pub const PARAMS: &[Param] = &[
     param!("island_hover", "Đảo động", "Rê chuột để mở rộng", "Rê chuột lên đảo thì nó mở rộng thành bảng điều khiển (tắt: phải bấm)", Kind::Toggle, true, flag!(island_hover)),
     param!("island_alerts", "Đảo động", "Thông báo nhanh", "Đảo nở ra báo khi đổi âm lượng, cắm / rút sạc, pin yếu, có / mất mạng", Kind::Toggle, true, flag!(island_alerts)),
     param!("island_media", "Đảo động", "Nhạc đang phát", "Hiện bài đang phát, ảnh bìa, thanh tua và nút điều khiển trên đảo", Kind::Toggle, true, flag!(island_media)),
+    param!("background_apps", "Đảo động", "Ứng dụng chạy ngầm", "Khi đảo mở ra, trang đầu có thêm thẻ \"Đang chạy ngầm\" với icon của các ứng dụng đang chạy ngầm (những icon vốn nằm ở góc taskbar của Windows). Bấm chuột trái, chuột phải hay bấm đúp vào icon thì ứng dụng nhận được y như khi bấm ở taskbar", Kind::Toggle, true, flag!(background_apps)),
     param!("corner_claude", "Bốn góc", "Claude (trên trái)", "Viên kính ở góc trên bên trái: phần trăm giới hạn tuần của Claude đã dùng khi Claude Code có ghi lại, nếu không thì số token hôm nay. Đọc từ những gì Claude Code lưu trên máy này", Kind::Toggle, true, flag!(corner_claude)),
     param!("corner_notices", "Bốn góc", "Thông báo (trên phải)", "Viên kính ở góc trên bên phải: chuông và số thông báo; mỗi thông báo mới của ứng dụng nở ra từ đây", Kind::Toggle, true, flag!(corner_notices)),
     param!("corner_weather", "Bốn góc", "Thời tiết (dưới trái)", "Viên kính ở góc dưới bên trái: thời tiết nơi máy đang ở. Vị trí (làm tròn khoảng 10 km) được gửi tới Open-Meteo để hỏi thời tiết", Kind::Toggle, true, flag!(corner_weather)),

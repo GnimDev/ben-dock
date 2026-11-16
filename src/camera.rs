@@ -267,7 +267,7 @@ unsafe fn place(thumb: isize, source: Option<RECT>, dest: RECT) {
 }
 
 /// Has the compositor draw a window of ours into a bitmap. BGRA, top row first.
-unsafe fn print(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
+pub(crate) unsafe fn print(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
     unsafe {
         let screen = GetDC(None);
         let memory = CreateCompatibleDC(Some(screen));

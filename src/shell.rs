@@ -310,6 +310,82 @@ unsafe fn bitmap_pixels(hbm: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     }
 }
 
+/// The picture of an icon a program holds (the one it keeps in the taskbar's notification
+/// area, for one), at the size it was made. Drawn the way Windows draws it, twice: an icon
+/// of the old kind says which of its pixels are there with a mask, not with each pixel's
+/// own alpha, and the mask is drawn first to read that.
+pub fn icon_pixels(icon: HICON) -> Option<IconPixels> {
+    unsafe {
+        // How large it is: its bitmaps say. (One without colours keeps both halves of its
+        // mask in one bitmap, twice as high.)
+        let mut parts = ICONINFO::default();
+        GetIconInfo(icon, &mut parts).ok()?;
+        let plain = parts.hbmColor.is_invalid();
+        let mut bm = BITMAP::default();
+        let measured = GetObjectW(if plain { parts.hbmMask } else { parts.hbmColor }.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _));
+        if !parts.hbmColor.is_invalid() {
+            let _ = DeleteObject(parts.hbmColor.into());
+        }
+        if !parts.hbmMask.is_invalid() {
+            let _ = DeleteObject(parts.hbmMask.into());
+        }
+        let side = bm.bmWidth.min(if plain { bm.bmHeight / 2 } else { bm.bmHeight });
+        if measured == 0 || !(1..=256).contains(&side) {
+            return None;
+        }
+
+        let screen = GetDC(None);
+        let memory = CreateCompatibleDC(Some(screen));
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: side,
+                biHeight: -side, // negative = top row first
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut pixels = None;
+        if let Ok(bitmap) = CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let previous = SelectObject(memory, bitmap.into());
+            if !bits.is_null() {
+                let drawn = std::slice::from_raw_parts_mut(bits as *mut u8, (side * side * 4) as usize);
+                // The mask: black where the icon is.
+                drawn.fill(0xFF);
+                let masked = DrawIconEx(memory, 0, 0, icon, side, side, 0, None, DI_MASK).is_ok();
+                let _ = GdiFlush();
+                let there: Vec<bool> = drawn.chunks_exact(4).map(|p| !masked || (p[0] == 0 && p[1] == 0 && p[2] == 0)).collect();
+                drawn.fill(0);
+                if DrawIconEx(memory, 0, 0, icon, side, side, 0, None, DI_NORMAL).is_ok() {
+                    let _ = GdiFlush();
+                    let mut bgra = drawn.to_vec();
+                    if bgra.chunks_exact(4).any(|p| p[3] != 0) {
+                        fix_alpha(&mut bgra);
+                    } else {
+                        for (p, there) in bgra.chunks_exact_mut(4).zip(&there) {
+                            if *there {
+                                p[3] = 255;
+                            } else {
+                                p.fill(0);
+                            }
+                        }
+                    }
+                    pixels = Some(IconPixels { size: side as u32, bgra });
+                }
+            }
+            SelectObject(memory, previous);
+            let _ = DeleteObject(bitmap.into());
+        }
+        let _ = DeleteDC(memory);
+        ReleaseDC(None, screen);
+        pixels
+    }
+}
+
 /// Shell bitmaps are normally premultiplied, but some icons come back with no
 /// alpha at all or with straight alpha. Normalise to premultiplied.
 fn fix_alpha(bgra: &mut [u8]) {
