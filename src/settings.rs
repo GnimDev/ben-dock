@@ -3,7 +3,7 @@
 //! the control is being moved and written to ben.ini when it is released.
 
 use crate::config::{self, Config, Kind, PARAMS};
-use crate::dock::{self, Event};
+use crate::app::{self, Event};
 use crate::gfx::{color, rect};
 use crate::system;
 use crate::util::wide;
@@ -74,10 +74,10 @@ thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
-/// Rows in two columns, and the size of the content they need.
+/// Rows in three columns, and the size of the content they need.
 fn build_rows() -> (Vec<Row>, f32, f32) {
-    // First column: how things look. Second column: how they move and behave.
-    let second_column_from = "Chuyển động";
+    // The groups that start a new column: how it looks and moves | the dock | how it behaves.
+    const NEW_COLUMN: [&str; 2] = ["Dock", "Hành vi"];
     let mut rows = Vec::new();
     let mut section = "";
     let (mut x, mut y) = (0.0, MARGIN - 8.0);
@@ -88,9 +88,9 @@ fn build_rows() -> (Vec<Row>, f32, f32) {
         }
         if p.section != section {
             section = p.section;
-            if section == second_column_from {
+            if NEW_COLUMN.contains(&section) {
                 tallest = tallest.max(y);
-                x = COLUMN_W;
+                x += COLUMN_W;
                 y = MARGIN - 8.0;
             }
             rows.push(Row { control: Control::Header(section), x, y });
@@ -105,7 +105,7 @@ fn build_rows() -> (Vec<Row>, f32, f32) {
     rows.push(Row { control: Control::OpenFile, x, y });
     y += BUTTON_H;
     tallest = tallest.max(y);
-    (rows, COLUMN_W * 2.0, tallest + MARGIN)
+    (rows, x + COLUMN_W, tallest + MARGIN)
 }
 
 /// Opens the settings window, or brings it forward if it is already open.
@@ -260,7 +260,7 @@ fn control_rect(row: &Row, control: Control) -> (f32, f32, f32, f32) {
             Kind::Toggle => (right - 40.0, cy - 11.0, right, cy + 11.0),
             Kind::Choice(names) => {
                 // Narrower cells when there are many choices, so the label still fits beside them.
-                let w = if names.len() > 3 { 58.0 } else { 72.0 } * names.len() as f32;
+                let w = if names.len() > 3 { 64.0 } else { 72.0 } * names.len() as f32;
                 (right - w, cy - 13.0, right, cy + 13.0)
             }
         },
@@ -292,7 +292,7 @@ impl State {
         if done {
             self.cfg.save();
         }
-        dock::post(Event::Config(done));
+        app::post(Event::Config(done));
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
@@ -354,7 +354,7 @@ impl State {
                 }
                 Control::OpenFile => {
                     if inside(area, x, y) {
-                        crate::shell::launch(&config::config_file().to_string_lossy());
+                        crate::shell::launch_soon(&config::config_file().to_string_lossy());
                         return;
                     }
                 }
@@ -419,11 +419,15 @@ impl State {
             t.BeginDraw();
             t.Clear(Some(&bg));
 
-            // Divider between the two columns.
+            // Dividers between the columns.
             brush.SetColor(&line);
             let mut client = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut client);
-            t.FillRectangle(&rect((COLUMN_W * s).round(), MARGIN * s, (COLUMN_W * s).round() + 1.0, client.bottom as f32 - MARGIN * s), brush);
+            let columns = self.rows.iter().map(|r| (r.x / COLUMN_W).round() as usize).max().unwrap_or(0) + 1;
+            for column in 1..columns {
+                let x = (COLUMN_W * column as f32 * s).round();
+                t.FillRectangle(&rect(x, MARGIN * s, x + 1.0, client.bottom as f32 - MARGIN * s), brush);
+            }
 
             for row in &self.rows {
                 let label_area = (row.x + MARGIN, row.y, row.x + COLUMN_W - MARGIN, row.y + ROW_H);

@@ -5,15 +5,16 @@ use crate::util::{from_wide, wide};
 use std::collections::HashMap;
 use windows::core::{BOOL, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToString};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -42,6 +43,8 @@ pub fn key_for_target(target: &str) -> String {
 #[derive(Default)]
 pub struct WindowTracker {
     cache: HashMap<isize, (String, String)>,
+    /// App windows the shell is keeping out of sight: those on other virtual desktops.
+    elsewhere: Vec<isize>,
 }
 
 impl WindowTracker {
@@ -53,9 +56,18 @@ impl WindowTracker {
         }
         let mut out = Vec::new();
         let mut seen = Vec::with_capacity(handles.len());
+        self.elsewhere.clear();
         for hwnd in handles {
-            if hwnd == own || !is_app_window(hwnd) {
+            if hwnd == own {
                 continue;
+            }
+            match app_window(hwnd) {
+                Some(true) => {}
+                Some(false) => {
+                    self.elsewhere.push(hwnd.0 as isize);
+                    continue;
+                }
+                None => continue,
             }
             let id = hwnd.0 as isize;
             seen.push(id);
@@ -76,6 +88,12 @@ impl WindowTracker {
         self.cache.retain(|id, _| seen.contains(id));
         out
     }
+
+    /// App windows on other virtual desktops, as of the last scan. They are not in the scan's
+    /// result, and they are not new when their desktop comes up.
+    pub fn elsewhere(&self) -> &[isize] {
+        &self.elsewhere
+    }
 }
 
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -90,34 +108,43 @@ pub fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-/// The same test the taskbar uses, roughly: visible, top-level, not a tool
-/// window, not hidden by the system ("cloaked"), and it has a title.
-fn is_app_window(hwnd: HWND) -> bool {
+/// A window hidden by the shell itself ("cloaked" with DWM_CLOAKED_SHELL): what a window on
+/// another virtual desktop is.
+const CLOAKED_BY_SHELL: u32 = 2;
+
+/// The same test the taskbar uses, roughly: visible, top-level, not a tool window, it has a
+/// title, and it is not hidden by the system ("cloaked"). `Some(true)` for an app's window
+/// on this desktop, `Some(false)` for one on another virtual desktop, `None` for the rest.
+fn app_window(hwnd: HWND) -> Option<bool> {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
-            return false;
+            return None;
         }
         let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
         let app_window = ex.contains(WS_EX_APPWINDOW);
         if ex.contains(WS_EX_TOOLWINDOW) && !app_window {
-            return false;
+            return None;
         }
         if ex.contains(WS_EX_NOACTIVATE) && !app_window {
-            return false;
+            return None;
         }
         let owned = GetWindow(hwnd, GW_OWNER).map(|o| !o.is_invalid()).unwrap_or(false);
         if owned && !app_window {
-            return false;
+            return None;
         }
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
-        if cloaked != 0 {
-            return false;
+        if cloaked != 0 && cloaked & CLOAKED_BY_SHELL == 0 {
+            // Hidden by its own app: the left-over frame of a closed Store app, for one.
+            return None;
         }
         if GetWindowTextLengthW(hwnd) == 0 {
-            return false;
+            return None;
         }
-        !matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow")
+        if matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow") {
+            return None;
+        }
+        Some(cloaked == 0)
     }
 }
 
@@ -400,23 +427,45 @@ pub fn launcher_icon(size: u32, accent: (f32, f32, f32)) -> IconPixels {
     IconPixels { size, bgra }
 }
 
-/// One entry of the app launcher.
-pub struct AppEntry {
-    pub name: String,
-    pub target: String,
-    pub icon: IconPixels,
+/// What the background reader of the app list has found.
+pub enum Found {
+    /// An app in the Start menu's "all apps" list.
+    App { name: String, target: String },
+    /// The icon that was asked for with `AppScan::want_icon`.
+    Icon { target: String, pixels: IconPixels },
 }
 
-/// Lists every app in the Start menu's "all apps" list, with icons at `icon_px` pixels, on a
-/// background thread. Entries arrive on the returned channel as they are read, so the dock
-/// never waits for the few seconds this takes.
-pub fn scan_apps(icon_px: u32) -> std::sync::mpsc::Receiver<AppEntry> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || unsafe {
+/// The app list, read on a background thread: first every app's name, then icons, but only
+/// the ones that are asked for. Reading an icon is slow (the shell takes around 40 ms for
+/// each) and most are never looked at, so none is read until the tray shows it.
+pub struct AppScan {
+    wanted: std::sync::mpsc::Sender<(String, u32)>,
+    pub found: std::sync::mpsc::Receiver<Found>,
+}
+
+impl AppScan {
+    /// Asks for an app's icon at `size` pixels. It arrives on `found` when it has been read.
+    pub fn want_icon(&self, target: &str, size: u32) {
+        let _ = self.wanted.send((target.to_string(), size));
+    }
+}
+
+/// Starts reading the app list. `window` gets `message` whenever something new is on `found`.
+/// The thread sleeps between requests and ends when the `AppScan` is dropped.
+pub fn scan_apps(window: HWND, message: u32) -> AppScan {
+    let (tx, found) = std::sync::mpsc::channel();
+    let (wanted, requests) = std::sync::mpsc::channel::<(String, u32)>();
+    let window = window.0 as isize;
+    let spawned = std::thread::Builder::new().name("apps".into()).spawn(move || unsafe {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
         if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
             return;
         }
+        // Never in the way of the thread that animates.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        let nudge = || {
+            let _ = PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0));
+        };
         let started = std::time::Instant::now();
         let mut count = 0;
         let listed = (|| -> windows::core::Result<()> {
@@ -440,11 +489,8 @@ pub fn scan_apps(icon_px: u32) -> std::sync::mpsc::Receiver<AppEntry> {
                 if name.is_empty() || id.is_empty() || !is_launchable_name(&name) {
                     continue;
                 }
-                let target = format!("{APPS_FOLDER}{id}");
-                let Some(icon) = load_icon(&target, 256) else { continue };
-                let icon = resample(&icon, icon_px);
                 count += 1;
-                if tx.send(AppEntry { name, target, icon }).is_err() {
+                if tx.send(Found::App { name, target: format!("{APPS_FOLDER}{id}") }).is_err() {
                     break;
                 }
             }
@@ -454,9 +500,20 @@ pub fn scan_apps(icon_px: u32) -> std::sync::mpsc::Receiver<AppEntry> {
             Ok(()) => crate::log!("app list read: {count} apps in {:.1} s", started.elapsed().as_secs_f32()),
             Err(e) => crate::log!("could not read the app list: {e}"),
         }
+        nudge();
+        while let Ok((target, size)) = requests.recv() {
+            let pixels = load_icon(&target, 256).map(|icon| resample(&icon, size)).unwrap_or_else(|| placeholder_icon(size));
+            if tx.send(Found::Icon { target, pixels }).is_err() {
+                break;
+            }
+            nudge();
+        }
         CoUninitialize();
     });
-    rx
+    if let Err(e) = spawned {
+        crate::log!("could not start reading the app list: {e}");
+    }
+    AppScan { wanted, found }
 }
 
 /// The "all apps" list also holds uninstallers, read-me files and links to websites. Leave
@@ -528,16 +585,46 @@ pub fn resample(src: &IconPixels, size: u32) -> IconPixels {
 }
 
 /// Starts an app (or opens another window of it).
+/// Starts an app, or opens a file, a link or a page of Windows' settings. This waits for
+/// the shell, which can take a second: from the main thread use `launch_soon`.
 pub fn launch(target: &str) -> bool {
     let wtarget = wide(target);
     let verb = wide("open");
-    let result = unsafe { ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(wtarget.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
-    // ShellExecute reports success as a value above 32.
-    let ok = result.0 as isize > 32;
-    if !ok {
-        crate::log!("could not launch '{target}' (ShellExecute returned {})", result.0 as isize);
+    // SEE_MASK_NOASYNC: do everything before returning. The thread that asks may have no
+    // message loop and may end right after.
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(wtarget.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    match unsafe { ShellExecuteExW(&mut info) } {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log!("could not launch '{target}': {e}");
+            false
+        }
     }
-    ok
+}
+
+/// Starts an app (see `launch`) on a thread of its own, so that whoever asked does not
+/// stand still while the shell finds and starts it.
+pub fn launch_soon(target: &str) {
+    let target = target.to_string();
+    let run = move || {
+        unsafe {
+            // The shell wants a single-threaded apartment, and no old-style DDE talk that
+            // would need a message loop here.
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        }
+        launch(&target);
+        unsafe { CoUninitialize() };
+    };
+    if let Err(e) = std::thread::Builder::new().name("launch".into()).spawn(run) {
+        crate::log!("could not start a thread to launch an app: {e}");
+    }
 }
 
 /// Brings a window to the front, restoring it first if it is minimised.
@@ -562,14 +649,6 @@ pub fn minimize(hwnd: HWND) {
     }
 }
 
-/// Maximises a window, or puts a maximised one back to its normal size.
-pub fn toggle_maximize(hwnd: HWND) {
-    unsafe {
-        let command = if IsZoomed(hwnd).as_bool() { SC_RESTORE } else { SC_MAXIMIZE };
-        let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0));
-    }
-}
-
 /// True for a window of this program (the dock, the bar, a menu...).
 pub fn is_own_window(hwnd: HWND) -> bool {
     let mut pid = 0u32;
@@ -585,46 +664,101 @@ pub fn close(hwnd: HWND) {
     }
 }
 
-/// Copies a rectangle of the screen. Returns (width, height, opaque BGRA pixels, top row first).
-pub fn capture_screen(area: RECT) -> Option<(u32, u32, Vec<u8>)> {
-    let (w, h) = (area.right - area.left, area.bottom - area.top);
-    if w < 1 || h < 1 {
-        return None;
-    }
+/// True while the window exists.
+pub fn exists(hwnd: HWND) -> bool {
+    unsafe { IsWindow(Some(hwnd)).as_bool() }
+}
+
+/// Makes a window that has just opened a floating one: not maximised, at most `share` of its
+/// screen's work area wide and high, in the middle of it. A maximised window gets exactly
+/// that size; a large one is cut down only where it is too large. Left alone: windows that
+/// are small enough already, cannot be resized, are minimised, or fill the screen on purpose
+/// (games, videos). `taken`: where other windows' top-left corners are, so that several
+/// opening at once step aside instead of landing exactly on each other.
+///
+/// Returns the top-left corner the window is sent to, or `None` if it is left alone. The
+/// move itself is made from a thread of its own: the window's app has to answer it, and an
+/// app that is still starting up may take its time.
+pub fn float_window(hwnd: HWND, share: f32, taken: &[(i32, i32)]) -> Option<(i32, i32)> {
     unsafe {
-        let screen = GetDC(None);
-        let memory = CreateCompatibleDC(Some(screen));
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h, // negative = top row first
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let mut pixels = None;
-        if let Ok(bitmap) = CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
-            let previous = SelectObject(memory, bitmap.into());
-            let copied = BitBlt(memory, 0, 0, w, h, Some(screen), area.left, area.top, SRCCOPY).is_ok();
-            if copied && !bits.is_null() {
-                let mut data = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
-                // The screen has no transparency; the alpha bytes come back undefined.
-                for px in data.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-                pixels = Some(data);
-            }
-            SelectObject(memory, previous);
-            let _ = DeleteObject(bitmap.into());
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_fullscreen(hwnd) || is_own_window(hwnd) {
+            return None;
         }
-        let _ = DeleteDC(memory);
-        ReleaseDC(None, screen);
-        pixels.map(|p| (w as u32, h as u32, p))
+        let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
+        if !style.contains(WS_THICKFRAME) {
+            return None;
+        }
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return None;
+        }
+        let work = info.rcWork;
+        let (room_w, room_h) = (work.right - work.left, work.bottom - work.top);
+        let share = share.clamp(0.2, 1.0);
+        let (most_w, most_h) = ((room_w as f32 * share).round() as i32, (room_h as f32 * share).round() as i32);
+        let whole = window_rect(hwnd)?;
+        let frame = frame_rect(hwnd).unwrap_or(whole);
+        let (now_w, now_h) = (frame.right - frame.left, frame.bottom - frame.top);
+        let zoomed = IsZoomed(hwnd).as_bool();
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        // A few pixels over is not worth moving a window for.
+        let slack = 12 * dpi / 96;
+        if !zoomed && now_w <= most_w + slack && now_h <= most_h + slack {
+            return None;
+        }
+        let (w, h) = if zoomed { (most_w, most_h) } else { (now_w.min(most_w), now_h.min(most_h)) };
+        let (mut x, mut y) = (work.left + (room_w - w) / 2, work.top + (room_h - h) / 2);
+        // Step down and to the right past windows that already stand exactly there.
+        let step = 30 * dpi / 96;
+        for _ in 0..6 {
+            if !taken.iter().any(|&(tx, ty)| (tx - x).abs() < 8 && (ty - y).abs() < 8) {
+                break;
+            }
+            x += step;
+            y += step;
+        }
+        // A window's own rectangle is wider than what is drawn of it by its invisible edges
+        // (where the resize cursor appears). A maximised window has none to measure, so
+        // they are worked out from the system's sizes.
+        let edges = if zoomed {
+            let e = (GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi as u32) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi as u32) - 1).max(0);
+            (e, 0, e, e)
+        } else {
+            (frame.left - whole.left, frame.top - whole.top, whole.right - frame.right, whole.bottom - frame.bottom)
+        };
+        // The place a window keeps for its normal state is not in screen coordinates: it is
+        // measured from where its screen's work area starts.
+        let (dx, dy) = (work.left - info.rcMonitor.left, work.top - info.rcMonitor.top);
+        let normal = RECT { left: x - edges.0 - dx, top: y - edges.1 - dy, right: x + w + edges.2 - dx, bottom: y + h + edges.3 - dy };
+        let id = hwnd.0 as isize;
+        let run = move || {
+            let hwnd = HWND(id as *mut _);
+            let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            if GetWindowPlacement(hwnd, &mut placement).is_err() {
+                return;
+            }
+            // Its normal place becomes the floating one, and it is shown in its normal
+            // state without being made the active window. For a maximised window Windows
+            // animates the change.
+            placement.rcNormalPosition = normal;
+            placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+            placement.flags = WINDOWPLACEMENT_FLAGS(0);
+            if let Err(e) = SetWindowPlacement(hwnd, &placement) {
+                crate::log!("could not make a new window float: {e}");
+            }
+        };
+        std::thread::Builder::new().name("float".into()).stack_size(128 * 1024).spawn(run).ok()?;
+        crate::log!("a new window floats: {w}x{h} at ({x},{y}); it opened {}", if zoomed { "maximised".to_string() } else { format!("{now_w}x{now_h}") });
+        Some((x, y))
+    }
+}
+
+/// Switches Windows' own minimise / restore animation off for one window (any app's), or back
+/// on. Used while the app plays its own effect for that window, so the two never overlap.
+pub fn set_transitions(hwnd: HWND, enabled: bool) {
+    let off = BOOL((!enabled) as i32);
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const BOOL as *const _, std::mem::size_of::<BOOL>() as u32);
     }
 }
 
@@ -633,23 +767,48 @@ pub fn restored_rect(hwnd: HWND) -> Option<RECT> {
     unsafe {
         let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         GetWindowPlacement(hwnd, &mut placement).ok()?;
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        // The stored rectangle is measured from where the work area of its screen starts, not
+        // from the screen's own corner. The window itself is parked far off screen while it is
+        // minimised, so that rectangle is also what says which screen it belongs to.
+        let r = placement.rcNormalPosition;
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        if !GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
             return None;
         }
         if placement.flags.contains(WPF_RESTORETOMAXIMIZED) {
+            // It comes back maximised, on that screen.
             return Some(info.rcWork);
         }
-        // The stored rectangle is relative to the work area's corner.
         let (dx, dy) = (info.rcWork.left - info.rcMonitor.left, info.rcWork.top - info.rcMonitor.top);
-        let r = placement.rcNormalPosition;
         Some(RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy })
+    }
+}
+
+/// True for a window that is minimised, or on its way there: Windows parks a window far off
+/// screen a moment before it counts as minimised.
+pub fn is_parked(hwnd: HWND) -> bool {
+    unsafe { IsIconic(hwnd).as_bool() || window_rect(hwnd).map(|r| r.left <= -30000).unwrap_or(false) }
+}
+
+/// The screen a window is on (Windows' handle for it, as a number). A minimised window
+/// counts as being on the screen it will come back to.
+pub fn monitor_of(hwnd: HWND) -> isize {
+    unsafe {
+        if is_parked(hwnd) {
+            if let Some(rect) = restored_rect(hwnd) {
+                return MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST).0 as isize;
+            }
+        }
+        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize
     }
 }
 
 pub fn is_minimized(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd).as_bool() }
+}
+
+pub fn is_maximized(hwnd: HWND) -> bool {
+    unsafe { IsZoomed(hwnd).as_bool() }
 }
 
 pub fn window_rect(hwnd: HWND) -> Option<RECT> {

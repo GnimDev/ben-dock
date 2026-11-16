@@ -1,7 +1,6 @@
 //! Calendar arithmetic for the date panel. Months are 1..=12; weekdays are
 //! 0 = Monday .. 6 = Sunday (the week starts on Monday).
 
-pub const WEEKDAYS: [&str; 7] = ["Thứ hai", "Thứ ba", "Thứ tư", "Thứ năm", "Thứ sáu", "Thứ bảy", "Chủ nhật"];
 pub const WEEKDAYS_SHORT: [&str; 7] = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
 
 pub fn is_leap(year: i32) -> bool {

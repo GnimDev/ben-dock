@@ -10,51 +10,61 @@ use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    // Size and spacing (logical pixels, multiplied by the display scale)
-    pub icon_size: f32,
-    pub gap: f32,
-    pub margin_bottom: f32,
-    pub padding: f32,
-    /// Corner radius as a percentage of the panel height (50 = fully round ends).
-    pub corner_radius: f32,
-
-    // Magnification
-    pub magnification: f32,
-    pub spread: f32,
-    pub mag_speed: f32,
-    /// How much the panel rises with the magnified icons: 0 = stays flat, 1 = rises as much as the icons grow.
-    pub panel_grow: f32,
-
     // Look
+    /// What the glass is made of: 0 = liquid, 1 = frosted, 2 = ink, 3 = solid.
+    pub style: f32,
     /// 0 = follow Windows, 1 = dark, 2 = light.
     pub theme: f32,
-    pub blur: bool,
-    pub blur_radius: f32,
     pub tint_opacity: f32,
+    /// Blur of what is behind the glass. 0 = no blur.
+    pub blur_radius: f32,
+    /// How much of the Windows accent colour the glass takes on.
+    pub accent_tint: f32,
+    pub shadow: bool,
+
+    // Dock (logical pixels, multiplied by the display scale)
+    pub icon_size: f32,
+    pub gap: f32,
+    pub padding: f32,
+    /// Corner radius as a percentage of the panel height (50 = a capsule).
+    pub corner_radius: f32,
+    pub margin_bottom: f32,
+    pub magnification: f32,
+    pub spread: f32,
+    /// The drop of light that follows the cursor.
+    pub lens: bool,
     pub indicator: bool,
-
-    // Top bar and launcher
-    pub top_bar: bool,
-    pub bar_height: f32,
-    pub launcher: bool,
-    pub launcher_icon: f32,
-
-    // Motion
-    pub anim_speed: f32,
     pub labels: bool,
     pub label_size: f32,
     pub bounce: bool,
     pub bounce_height: f32,
     pub bounce_time: f32,
 
+    // Island
+    pub island: bool,
+    pub island_height: f32,
+    pub island_hover: bool,
+    pub island_alerts: bool,
+    pub island_media: bool,
+
+    // Motion
+    pub anim_speed: f32,
+    pub elastic: f32,
+
     // Behaviour
     pub click_minimize: bool,
     pub hide_on_fullscreen: bool,
     pub hide_taskbar: bool,
     pub reserve_space: bool,
+    pub launcher: bool,
+    pub launcher_icon: f32,
 
-    // Window effects
-    /// 0 = off, 1 = shrink, 2 = funnel, 3 = drop.
+    // Windows
+    /// A window that has just opened floats in the middle of its screen instead of filling it.
+    pub float_windows: bool,
+    /// How much of the screen's width and height a floating window takes at most.
+    pub float_size: f32,
+    /// 0 = Windows' own, 1 = shrink, 2 = genie, 3 = drop.
     pub minimize_effect: f32,
     pub minimize_time: f32,
     pub preview: bool,
@@ -63,45 +73,57 @@ pub struct Config {
 
     // Diagnostics (ini only)
     pub stats: bool,
+    pub hardware_gpu: bool,
+    /// Most memory (MB) Windows lets the app keep in RAM. 0 = no limit.
+    pub ram_limit: f32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            icon_size: 52.0,
-            gap: 8.0,
-            margin_bottom: 8.0,
-            padding: 8.0,
-            corner_radius: 30.0,
-            magnification: 1.9,
-            spread: 2.6,
-            mag_speed: 26.0,
-            panel_grow: 0.0,
+            style: 0.0,
             theme: 0.0,
-            blur: true,
-            blur_radius: 30.0,
-            tint_opacity: 0.55,
+            tint_opacity: 0.5,
+            blur_radius: 26.0,
+            accent_tint: 0.10,
+            shadow: true,
+            icon_size: 46.0,
+            gap: 8.0,
+            padding: 9.0,
+            corner_radius: 50.0,
+            margin_bottom: 10.0,
+            magnification: 1.6,
+            spread: 2.4,
+            lens: true,
             indicator: true,
-            top_bar: true,
-            bar_height: 30.0,
-            launcher: true,
-            launcher_icon: 72.0,
-            anim_speed: 1.0,
             labels: true,
             label_size: 13.0,
             bounce: true,
-            bounce_height: 0.55,
-            bounce_time: 0.62,
+            bounce_height: 0.5,
+            bounce_time: 0.56,
+            island: true,
+            island_height: 30.0,
+            island_hover: true,
+            island_alerts: true,
+            island_media: true,
+            anim_speed: 1.0,
+            elastic: 0.5,
             click_minimize: true,
             hide_on_fullscreen: true,
             hide_taskbar: true,
             reserve_space: true,
+            launcher: true,
+            launcher_icon: 56.0,
+            float_windows: true,
+            float_size: 0.7,
             minimize_effect: 2.0,
-            minimize_time: 0.42,
+            minimize_time: 0.36,
             preview: true,
-            preview_delay: 0.45,
+            preview_delay: 0.4,
             preview_size: 220.0,
             stats: false,
+            hardware_gpu: false,
+            ram_limit: 256.0,
         }
     }
 }
@@ -159,40 +181,49 @@ const fn n(min: f32, max: f32, step: f32) -> Kind {
 }
 
 pub const PARAMS: &[Param] = &[
-    param!("icon_size", "Kích thước", "Cỡ icon", "Cỡ icon khi đứng yên (điểm ảnh, trước khi nhân tỉ lệ màn hình)", n(24.0, 128.0, 1.0), true, num!(icon_size)),
-    param!("gap", "Kích thước", "Khoảng cách giữa icon", "Khoảng cách giữa các icon", n(0.0, 40.0, 1.0), true, num!(gap)),
-    param!("padding", "Kích thước", "Lề trong của nền", "Khoảng cách từ icon tới mép nền dock", n(2.0, 30.0, 1.0), true, num!(padding)),
-    param!("corner_radius", "Kích thước", "Độ bo góc", "Độ bo góc của nền, tính theo % chiều cao nền (50 = bo tròn hết cỡ)", n(0.0, 50.0, 1.0), true, num!(corner_radius)),
-    param!("margin_bottom", "Kích thước", "Cách mép dưới màn hình", "Khoảng cách từ dock tới mép dưới màn hình", n(0.0, 60.0, 1.0), true, num!(margin_bottom)),
-    param!("magnification", "Phóng to", "Độ phóng to", "Icon dưới con trỏ to gấp mấy lần. 1.0 = tắt phóng to", n(1.0, 3.0, 0.05), true, num!(magnification)),
-    param!("spread", "Phóng to", "Độ lan", "Hiệu ứng phóng to lan ra mấy icon ở mỗi bên con trỏ", n(1.0, 6.0, 0.1), true, num!(spread)),
-    param!("mag_speed", "Phóng to", "Tốc độ phóng to", "Icon phồng lên / xẹp xuống nhanh cỡ nào khi chuột vào / ra dock (số lớn = nhanh)", n(6.0, 60.0, 1.0), true, num!(mag_speed)),
-    param!("panel_grow", "Phóng to", "Nền cao lên theo icon", "Khi icon phóng to, nền dock cao lên theo bao nhiêu: 0 = nền giữ nguyên chiều cao (icon nhô lên trên), 1 = nền cao lên bằng đúng phần icon to ra", n(0.0, 1.0, 0.05), true, num!(panel_grow)),
-    param!("theme", "Giao diện", "Màu nền", "Màu nền: 0 = theo Windows, 1 = tối, 2 = sáng", Kind::Choice(&["Theo Windows", "Tối", "Sáng"]), true, num!(theme)),
-    param!("tint_opacity", "Giao diện", "Độ đục của nền", "Độ đục của nền: 0 = trong suốt, 1 = đặc", n(0.0, 1.0, 0.01), true, num!(tint_opacity)),
-    param!("blur", "Giao diện", "Nền mờ kính", "Nền mờ kính (làm nhòe những gì nằm sau dock)", Kind::Toggle, true, flag!(blur)),
-    param!("blur_radius", "Giao diện", "Độ mờ", "Độ mờ của nền kính", n(0.0, 100.0, 1.0), true, num!(blur_radius)),
-    param!("indicator", "Giao diện", "Vạch báo app đang mở", "Vạch nhỏ dưới icon của ứng dụng đang mở", Kind::Toggle, true, flag!(indicator)),
-    param!("top_bar", "Thanh trên và lưới ứng dụng", "Thanh trên cùng", "Thanh trên cùng màn hình: tên ứng dụng đang dùng, tìm kiếm, mạng, âm lượng, pin, đồng hồ", Kind::Toggle, true, flag!(top_bar)),
-    param!("bar_height", "Thanh trên và lưới ứng dụng", "Chiều cao thanh trên", "Chiều cao thanh trên cùng (điểm ảnh)", n(22.0, 44.0, 1.0), true, num!(bar_height)),
-    param!("launcher", "Thanh trên và lưới ứng dụng", "Nút lưới ứng dụng trong dock", "Icon đầu tiên của dock mở lưới tất cả ứng dụng toàn màn hình", Kind::Toggle, true, flag!(launcher)),
-    param!("launcher_icon", "Thanh trên và lưới ứng dụng", "Cỡ icon trong lưới", "Cỡ icon trong lưới ứng dụng (điểm ảnh). Đổi xong cần mở lại Bến", n(48.0, 128.0, 4.0), true, num!(launcher_icon)),
-    param!("anim_speed", "Chuyển động", "Tốc độ chuyển động chung", "Tốc độ các chuyển động khác (icon trượt vào / ra, dock trượt lên / xuống). 1.0 = mặc định", n(0.3, 3.0, 0.05), true, num!(anim_speed)),
-    param!("labels", "Chuyển động", "Hiện tên khi rê chuột", "Hiện tên ứng dụng khi rê chuột", Kind::Toggle, true, flag!(labels)),
-    param!("label_size", "Chuyển động", "Cỡ chữ tên", "Cỡ chữ của tên ứng dụng", n(9.0, 24.0, 1.0), true, num!(label_size)),
-    param!("bounce", "Chuyển động", "Icon nảy khi mở app", "Icon nảy lên khi mở ứng dụng", Kind::Toggle, true, flag!(bounce)),
-    param!("bounce_height", "Chuyển động", "Độ cao khi nảy", "Icon nảy cao bao nhiêu, tính theo cỡ icon (0.55 = hơn nửa icon)", n(0.1, 1.5, 0.05), true, num!(bounce_height)),
-    param!("bounce_time", "Chuyển động", "Thời gian một lần nảy", "Một lần nảy lên rồi rơi xuống mất mấy giây", n(0.25, 1.5, 0.01), true, num!(bounce_time)),
+    param!("style", "Giao diện", "Chất liệu", "Chất liệu của các bề mặt: 0 = kính lỏng (trong, viền sáng), 1 = sương mờ (đục hơn, dễ đọc hơn), 2 = mực (kính đen như đảo của iPhone), 3 = đặc (không làm nhoè phía sau, nhẹ máy nhất)", Kind::Choice(&["Kính lỏng", "Sương mờ", "Mực", "Đặc"]), true, num!(style)),
+    param!("theme", "Giao diện", "Sáng / tối", "Sáng hay tối: 0 = theo Windows, 1 = tối, 2 = sáng", Kind::Choice(&["Theo Windows", "Tối", "Sáng"]), true, num!(theme)),
+    param!("tint_opacity", "Giao diện", "Độ đục của kính", "Độ đục của kính: 0 = trong nhất, 1 = đục nhất", n(0.0, 1.0, 0.01), true, num!(tint_opacity)),
+    param!("blur_radius", "Giao diện", "Độ nhoè phía sau", "Kính làm nhoè những gì nằm sau nó bao nhiêu (0 = không nhoè)", n(0.0, 60.0, 1.0), true, num!(blur_radius)),
+    param!("accent_tint", "Giao diện", "Nhuộm màu nhấn", "Kính ngả sang màu nhấn của Windows bao nhiêu: 0 = không, 1 = nhiều nhất", n(0.0, 1.0, 0.01), true, num!(accent_tint)),
+    param!("shadow", "Giao diện", "Đổ bóng", "Bóng mềm dưới các bề mặt", Kind::Toggle, true, flag!(shadow)),
+    param!("anim_speed", "Chuyển động", "Tốc độ", "Tốc độ của mọi chuyển động. 1.0 = mặc định", n(0.5, 2.0, 0.05), true, num!(anim_speed)),
+    param!("elastic", "Chuyển động", "Độ đàn hồi", "Mọi thứ nảy và co giãn nhiều hay ít: 0 = dừng êm không nảy, 1 = nảy nhiều nhất", n(0.0, 1.0, 0.05), true, num!(elastic)),
+    param!("island", "Đảo động", "Bật đảo động", "Đảo động ở giữa mép trên màn hình: giờ, pin, mạng, nhạc đang phát và các thông báo nhanh", Kind::Toggle, true, flag!(island)),
+    param!("island_height", "Đảo động", "Chiều cao khi thu gọn", "Chiều cao của đảo khi thu gọn (điểm ảnh)", n(24.0, 40.0, 1.0), true, num!(island_height)),
+    param!("island_hover", "Đảo động", "Rê chuột để mở rộng", "Rê chuột lên đảo thì nó mở rộng thành bảng điều khiển (tắt: phải bấm)", Kind::Toggle, true, flag!(island_hover)),
+    param!("island_alerts", "Đảo động", "Thông báo nhanh", "Đảo nở ra báo khi đổi âm lượng, cắm / rút sạc, pin yếu, có / mất mạng", Kind::Toggle, true, flag!(island_alerts)),
+    param!("island_media", "Đảo động", "Nhạc đang phát", "Hiện bài đang phát và nút điều khiển trên đảo", Kind::Toggle, true, flag!(island_media)),
+    param!("icon_size", "Dock", "Cỡ icon", "Cỡ icon khi đứng yên (điểm ảnh, trước khi nhân tỉ lệ màn hình)", n(24.0, 96.0, 1.0), true, num!(icon_size)),
+    param!("gap", "Dock", "Khoảng cách giữa icon", "Khoảng cách giữa các icon", n(0.0, 30.0, 1.0), true, num!(gap)),
+    param!("padding", "Dock", "Lề trong", "Khoảng cách từ icon tới mép dock", n(4.0, 24.0, 1.0), true, num!(padding)),
+    param!("corner_radius", "Dock", "Độ bo góc", "Độ bo góc của dock, tính theo % chiều cao (50 = bo tròn thành viên thuốc)", n(0.0, 50.0, 1.0), true, num!(corner_radius)),
+    param!("margin_bottom", "Dock", "Cách mép dưới màn hình", "Khoảng cách từ dock tới mép dưới màn hình", n(0.0, 40.0, 1.0), true, num!(margin_bottom)),
+    param!("magnification", "Dock", "Độ phóng to", "Icon dưới con trỏ to gấp mấy lần. 1.0 = không phóng to", n(1.0, 2.5, 0.05), true, num!(magnification)),
+    param!("spread", "Dock", "Độ lan", "Phóng to lan ra mấy icon ở mỗi bên con trỏ", n(1.0, 6.0, 0.1), true, num!(spread)),
+    param!("lens", "Dock", "Giọt sáng theo chuột", "Giọt sáng trượt theo con trỏ giữa các icon", Kind::Toggle, true, flag!(lens)),
+    param!("indicator", "Dock", "Chấm báo app đang mở", "Chấm nhỏ dưới icon của ứng dụng đang mở", Kind::Toggle, true, flag!(indicator)),
+    param!("labels", "Dock", "Hiện tên khi rê chuột", "Hiện tên ứng dụng khi rê chuột", Kind::Toggle, true, flag!(labels)),
+    param!("label_size", "Dock", "Cỡ chữ tên", "Cỡ chữ của tên ứng dụng", n(9.0, 20.0, 1.0), true, num!(label_size)),
+    param!("bounce", "Dock", "Icon nảy khi mở app", "Icon nảy lên khi mở ứng dụng", Kind::Toggle, true, flag!(bounce)),
+    param!("bounce_height", "Dock", "Độ cao khi nảy", "Icon nảy cao bao nhiêu, tính theo cỡ icon (0.5 = nửa icon)", n(0.1, 1.5, 0.05), true, num!(bounce_height)),
+    param!("bounce_time", "Dock", "Thời gian một lần nảy", "Một lần nảy lên rồi rơi xuống mất mấy giây", n(0.25, 1.5, 0.01), true, num!(bounce_time)),
     param!("click_minimize", "Hành vi", "Bấm icon app đang ở trước để thu nhỏ", "Bấm vào icon của ứng dụng đang ở trước thì thu nhỏ nó", Kind::Toggle, true, flag!(click_minimize)),
-    param!("hide_on_fullscreen", "Hành vi", "Ẩn dock khi có app toàn màn hình", "Dock trượt xuống khi có ứng dụng chiếm toàn màn hình", Kind::Toggle, true, flag!(hide_on_fullscreen)),
+    param!("hide_on_fullscreen", "Hành vi", "Ẩn khi có app toàn màn hình", "Dock và đảo trượt khỏi màn hình khi có ứng dụng chiếm toàn màn hình", Kind::Toggle, true, flag!(hide_on_fullscreen)),
     param!("hide_taskbar", "Hành vi", "Ẩn taskbar của Windows", "Ẩn taskbar của Windows khi Bến chạy (thoát Bến thì taskbar trở lại)", Kind::Toggle, true, flag!(hide_taskbar)),
-    param!("reserve_space", "Hành vi", "Cửa sổ phóng to không che dock", "Giữ chỗ để cửa sổ phóng to không che dock", Kind::Toggle, true, flag!(reserve_space)),
-    param!("minimize_effect", "Cửa sổ", "Hiệu ứng thu nhỏ", "Hiệu ứng khi thu nhỏ cửa sổ và khi mở lại từ dock: 0 = tắt, 1 = co lại dần về icon, 2 = hút xuống icon, 3 = trượt xuống icon. Khi bật, Bến tạm tắt hiệu ứng thu nhỏ có sẵn của Windows để hai hiệu ứng không chồng lên nhau", Kind::Choice(&["Tắt", "Co lại", "Hút", "Trượt"]), true, num!(minimize_effect)),
-    param!("minimize_time", "Cửa sổ", "Thời gian hiệu ứng thu nhỏ", "Hiệu ứng thu nhỏ / mở lại kéo dài mấy giây", n(0.15, 1.2, 0.01), true, num!(minimize_time)),
+    param!("reserve_space", "Hành vi", "Cửa sổ phóng to không che dock và đảo", "Giữ chỗ để cửa sổ phóng to không che dock và đảo", Kind::Toggle, true, flag!(reserve_space)),
+    param!("launcher", "Hành vi", "Nút khay ứng dụng trong dock", "Icon đầu tiên của dock mở khay tất cả ứng dụng", Kind::Toggle, true, flag!(launcher)),
+    param!("launcher_icon", "Hành vi", "Cỡ icon trong khay ứng dụng", "Cỡ icon trong khay ứng dụng (điểm ảnh)", n(40.0, 96.0, 4.0), true, num!(launcher_icon)),
+    param!("float_windows", "Cửa sổ", "Cửa sổ mới mở dạng nổi", "Cửa sổ vừa mở không phóng to hết màn hình mà nổi ở giữa, chỉ chiếm một phần màn hình. Bến chỉ làm việc này một lần, lúc cửa sổ mở ra; sau đó phóng to hay kéo cỡ tuỳ ý. Cửa sổ vốn đã nhỏ, cửa sổ không đổi cỡ được và trò chơi, video toàn màn hình thì giữ nguyên", Kind::Toggle, true, flag!(float_windows)),
+    param!("float_size", "Cửa sổ", "Cỡ cửa sổ nổi", "Cửa sổ nổi chiếm nhiều nhất bao nhiêu phần chiều rộng và chiều cao của màn hình (0.7 = 70%)", n(0.4, 0.95, 0.01), true, num!(float_size)),
+    param!("minimize_effect", "Cửa sổ", "Hiệu ứng thu nhỏ", "Khi bấm icon trên dock để thu nhỏ hoặc mở lại cửa sổ: 0 = hoạt ảnh của Windows, 1 = co lại dần về icon, 2 = chảy vào icon qua một cái phễu cong, như hiệu ứng thần đèn trên Mac, 3 = trượt xuống icon. Thu nhỏ bằng cách khác (nút trên cửa sổ, bàn phím, Alt+Tab) luôn là hoạt ảnh của Windows; cách nào cửa sổ cũng bay về đúng icon của nó trên dock", Kind::Choice(&["Của Windows", "Co lại", "Chảy", "Trượt"]), true, num!(minimize_effect)),
+    param!("minimize_time", "Cửa sổ", "Thời gian hiệu ứng thu nhỏ", "Hiệu ứng của Bến (co lại, chảy, trượt) kéo dài mấy giây. Kiểu chảy trên Mac dài khoảng 0.45", n(0.15, 1.2, 0.01), true, num!(minimize_time)),
     param!("preview", "Cửa sổ", "Xem trước cửa sổ khi rê chuột", "Rê chuột lên icon của ứng dụng đang mở thì hiện hình thu nhỏ các cửa sổ của nó", Kind::Toggle, true, flag!(preview)),
     param!("preview_delay", "Cửa sổ", "Chờ bao lâu thì hiện xem trước", "Rê chuột bao nhiêu giây thì hiện xem trước", n(0.1, 1.5, 0.05), true, num!(preview_delay)),
     param!("preview_size", "Cửa sổ", "Cỡ hình xem trước", "Chiều rộng mỗi hình xem trước (điểm ảnh)", n(120.0, 400.0, 10.0), true, num!(preview_size)),
-    param!("stats", "Chẩn đoán", "", "Ghi tốc độ khung hình vào ben.log (để tìm nguyên nhân giật)", Kind::Toggle, false, flag!(stats)),
+    param!("stats", "Chẩn đoán", "", "Ghi tốc độ khung hình và lượng RAM vào ben.log", Kind::Toggle, false, flag!(stats)),
+    param!("hardware_gpu", "Chẩn đoán", "", "Vẽ icon và chữ bằng card đồ hoạ thay vì bộ xử lý. Tốn thêm vài chục MB RAM, chỉ nên bật nếu hình bị lỗi. Đổi xong cần mở lại Bến", Kind::Toggle, false, flag!(hardware_gpu)),
+    param!("ram_limit", "Chẩn đoán", "", "Giới hạn RAM (MB): Windows không cho Bến giữ nhiều hơn chừng này trong RAM. 0 = không giới hạn. Đổi xong cần mở lại Bến", n(0.0, 1024.0, 1.0), false, num!(ram_limit)),
 ];
 
 impl Param {
@@ -201,7 +232,9 @@ impl Param {
         match self.kind {
             Kind::Number { min, max, step } => {
                 let v = if step > 0.0 { (value / step).round() * step } else { value };
-                v.clamp(min, max)
+                // 30 steps of 0.01 come to 0.29999998, not 0.3: settle on the nearest thousandth,
+                // so a value written to the file and read back is the same number.
+                ((v * 1000.0).round() / 1000.0).clamp(min, max)
             }
             Kind::Toggle => b(value >= 0.5),
             Kind::Choice(names) => value.round().clamp(0.0, (names.len() - 1) as f32),
@@ -238,7 +271,7 @@ pub fn config_file() -> PathBuf {
     ini_path()
 }
 
-/// When ben.ini was last written, used to notice edits made while the dock runs.
+/// When ben.ini was last written, used to notice edits made while the app runs.
 pub fn config_modified() -> Option<SystemTime> {
     std::fs::metadata(ini_path()).and_then(|m| m.modified()).ok()
 }
@@ -247,12 +280,66 @@ fn parse_value(text: &str) -> Option<f32> {
     match text.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" => Some(1.0),
         "false" | "no" | "off" => Some(0.0),
-        // Older files spelled the theme out.
-        "auto" => Some(0.0),
-        "dark" => Some(1.0),
-        "light" => Some(2.0),
         other => other.replace(',', ".").parse::<f32>().ok().filter(|v| v.is_finite()),
     }
+}
+
+/// Settings of the first design (0.1) whose meaning is the same in this one. A file written
+/// by that version keeps these; everything about the look starts from the new defaults,
+/// because the old numbers were tuned for a different material.
+const CARRIED_OVER: &[&str] = &[
+    "icon_size",
+    "gap",
+    "margin_bottom",
+    "magnification",
+    "spread",
+    "theme",
+    "indicator",
+    "labels",
+    "label_size",
+    "bounce",
+    "anim_speed",
+    "click_minimize",
+    "hide_on_fullscreen",
+    "hide_taskbar",
+    "reserve_space",
+    "launcher",
+    "minimize_effect",
+    "minimize_time",
+    "preview",
+    "preview_delay",
+    "preview_size",
+    "stats",
+];
+
+/// Reads settings from the text of an ini file. Returns the settings and how many of the
+/// known keys the file did not mention.
+pub fn parse(text: &str) -> (Config, usize) {
+    let lines: Vec<(String, &str)> = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches('\u{feff}'))
+        .filter(|l| !(l.is_empty() || l.starts_with('#') || l.starts_with(';') || l.starts_with('[')))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim()))
+        .collect();
+    // A file from before the liquid design has no "style".
+    let old = !lines.is_empty() && !lines.iter().any(|(k, _)| k == "style");
+    let mut c = Config::default();
+    let mut missing = PARAMS.len();
+    for (key, value) in &lines {
+        if old && !CARRIED_OVER.contains(&key.as_str()) {
+            continue;
+        }
+        match (PARAMS.iter().find(|p| p.key == key), parse_value(value)) {
+            (Some(p), Some(v)) => {
+                (p.set)(&mut c, p.clean(v));
+                missing = missing.saturating_sub(1);
+            }
+            (Some(_), None) => crate::log!("ben.ini: '{value}' is not a valid value for {key}"),
+            (None, _) => crate::log!("ben.ini: unknown key '{key}'"),
+        }
+    }
+    (c, missing)
 }
 
 impl Config {
@@ -265,29 +352,21 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        let mut c = Config::default();
         let Ok(text) = std::fs::read_to_string(ini_path()) else {
+            let c = Config::default();
             c.save();
             return c;
         };
-        let mut missing = PARAMS.len();
-        for line in text.lines() {
-            let line = line.trim().trim_start_matches('\u{feff}');
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else { continue };
-            let key = k.trim().to_ascii_lowercase();
-            match (PARAMS.iter().find(|p| p.key == key), parse_value(v.trim())) {
-                (Some(p), Some(value)) => {
-                    (p.set)(&mut c, p.clean(value));
-                    missing = missing.saturating_sub(1);
-                }
-                (Some(_), None) => crate::log!("ben.ini: '{}' is not a valid value for {key}", v.trim()),
-                (None, _) => crate::log!("ben.ini: unknown key '{key}'"),
-            }
-        }
+        let (c, missing) = parse(&text);
         if missing > 0 {
+            if !text.contains("style") {
+                // Keep the file of the first design next to the new one.
+                let kept = data_dir().join("ben-0.1.ini");
+                if !kept.exists() {
+                    let _ = std::fs::write(&kept, &text);
+                    crate::log!("ben.ini was written by the first design; kept as ben-0.1.ini, look settings start from the new defaults");
+                }
+            }
             // The file predates some settings: rewrite it so every setting is listed.
             c.save();
         }
@@ -296,7 +375,13 @@ impl Config {
 
     /// Writes ben.ini with every setting and a comment explaining each one.
     pub fn save(&self) {
-        let mut text = String::from("# Bến - cấu hình.\n# Sửa rồi lưu file là dock đổi theo ngay, không cần mở lại.\n# Cũng có thể chỉnh bằng cửa sổ Cài đặt (chuột phải lên dock).\n");
+        if let Err(e) = std::fs::write(ini_path(), self.to_ini()) {
+            crate::log!("could not save ben.ini: {e}");
+        }
+    }
+
+    pub fn to_ini(&self) -> String {
+        let mut text = String::from("# Bến - cấu hình.\n# Sửa rồi lưu file là giao diện đổi theo ngay, không cần mở lại.\n# Cũng có thể chỉnh bằng cửa sổ Cài đặt (chuột phải lên dock).\n");
         let mut section = "";
         for p in PARAMS {
             if p.section != section {
@@ -309,9 +394,7 @@ impl Config {
             }
             text.push_str(&format!("\n{} = {}\n", p.key, p.format((p.get)(self))));
         }
-        if let Err(e) = std::fs::write(ini_path(), text) {
-            crate::log!("could not save ben.ini: {e}");
-        }
+        text
     }
 }
 
@@ -336,5 +419,52 @@ pub fn save_pins(pins: &[String]) {
     }
     if let Err(e) = std::fs::write(pins_path(), text) {
         crate::log!("could not save pins.txt: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn written_file_reads_back_the_same() {
+        let mut c = Config::default();
+        c.icon_size = 33.0;
+        c.style = 2.0;
+        c.elastic = 0.85;
+        c.island = false;
+        let (back, missing) = parse(&c.to_ini());
+        assert_eq!(missing, 0);
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn file_of_the_first_design_keeps_what_still_means_the_same() {
+        let old = "icon_size = 33\ncorner_radius = 30\ntint_opacity = 0.55\nblur = true\nblur_radius = 30\nminimize_time = 0.30\ntop_bar = true\nhide_taskbar = false\n";
+        let (c, missing) = parse(old);
+        assert!(missing > 0);
+        assert_eq!(c.icon_size, 33.0);
+        assert_eq!(c.minimize_time, 0.30);
+        assert!(!c.hide_taskbar);
+        // The look starts afresh.
+        let fresh = Config::default();
+        assert_eq!(c.corner_radius, fresh.corner_radius);
+        assert_eq!(c.tint_opacity, fresh.tint_opacity);
+        assert_eq!(c.blur_radius, fresh.blur_radius);
+    }
+
+    #[test]
+    fn values_are_cleaned() {
+        let (c, _) = parse("style = 0\nicon_size = 500\nelastic = 0,25\nmagnification = abc\n");
+        assert_eq!(c.icon_size, 96.0);
+        assert_eq!(c.elastic, 0.25);
+        assert_eq!(c.magnification, Config::default().magnification);
+    }
+
+    #[test]
+    fn every_key_is_unique() {
+        for (i, p) in PARAMS.iter().enumerate() {
+            assert!(!PARAMS[..i].iter().any(|q| q.key == p.key), "duplicate key {}", p.key);
+        }
     }
 }

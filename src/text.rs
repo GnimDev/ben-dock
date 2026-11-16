@@ -1,25 +1,31 @@
-//! Text for the top bar, the launcher and the previews: a line of text is
-//! painted once into a surface and shown by a sprite; it is painted again
-//! only when the words, the colour or the font change.
+//! Text: a line is painted once into a surface and shown by a sprite; it is
+//! painted again only when the words, the colour or the room it has change.
 
 use crate::gfx::Gfx;
-use crate::glass::{Glass, Sprite};
+use crate::scene::{Scene, Sprite};
 use crate::util::wide;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::UI::Composition::CompositionDrawingSurface;
+use windows::UI::Composition::{CompositionDrawingSurface, VisualCollection};
 
 pub const UI_FONT: &str = "Segoe UI Variable Text";
-/// Windows 11's symbol font (battery, volume, Wi-Fi, search...).
+/// The same family, cut for large sizes (the island's clock).
+pub const DISPLAY_FONT: &str = "Segoe UI Variable Display";
+/// Windows 11's symbol font (battery, volume, Wi-Fi, play, pause...).
 pub const ICON_FONT: &str = "Segoe Fluent Icons";
 
 pub fn format(gfx: &Gfx, family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
     unsafe {
-        let format = gfx.dwrite.CreateTextFormat(PCWSTR(wide(family).as_ptr()), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, PCWSTR(wide("").as_ptr()))?;
+        let format = gfx.dwrite.CreateTextFormat(PCWSTR(wide(family).as_ptr()), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size.max(1.0), PCWSTR(wide("").as_ptr()))?;
         format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         Ok(format)
     }
+}
+
+/// One symbol of the icon font, as text.
+pub fn glyph(code: u32) -> String {
+    char::from_u32(code).map(String::from).unwrap_or_default()
 }
 
 /// Lays out one line. If `max_width` is given and the text is wider, it is shortened and
@@ -59,22 +65,30 @@ impl Line {
         Line { sprite, _surface: None, shown: None, w: 0.0, h: 0.0 }
     }
 
+    pub fn new_in(scene: &Scene, parent: &VisualCollection) -> Result<Self> {
+        Ok(Line::new(scene.sprite_in(parent)?))
+    }
+
     /// Shows `text`. Repaints only if the text, colour or available width changed.
-    pub fn set(&mut self, glass: &Glass, gfx: &Gfx, format: &IDWriteTextFormat, text: &str, color: D2D1_COLOR_F, max_width: Option<f32>) -> Result<()> {
-        let key = (text.to_string(), [color.r.to_bits(), color.g.to_bits(), color.b.to_bits(), color.a.to_bits()], max_width.unwrap_or(0.0).to_bits());
-        if self.shown.as_ref() == Some(&key) {
+    pub fn set(&mut self, scene: &Scene, gfx: &Gfx, format: &IDWriteTextFormat, text: &str, color: D2D1_COLOR_F, max_width: Option<f32>) -> Result<()> {
+        let same = match &self.shown {
+            Some((t, c, w)) => t == text && *c == [color.r.to_bits(), color.g.to_bits(), color.b.to_bits(), color.a.to_bits()] && *w == max_width.unwrap_or(0.0).to_bits(),
+            None => false,
+        };
+        if same {
             return Ok(());
         }
+        let key = (text.to_string(), [color.r.to_bits(), color.g.to_bits(), color.b.to_bits(), color.a.to_bits()], max_width.unwrap_or(0.0).to_bits());
         if text.is_empty() {
-            self.w = 0.0;
-            self.sprite.set_opacity(0.0)?;
+            (self.w, self.h) = (0.0, 0.0);
+            self.sprite.place(0.0, 0.0, 0.0, 0.0)?;
+            self._surface = None;
             self.shown = Some(key);
             return Ok(());
         }
         let (layout, w, h) = fit(gfx, format, text, max_width)?;
-        let surface = glass.surface_from_text(&layout, w, h, color)?;
+        let surface = scene.surface_from_text(&layout, w, h, color)?;
         self.sprite.set_surface(&surface)?;
-        self.sprite.set_opacity(1.0)?;
         self._surface = Some(surface);
         self.shown = Some(key);
         (self.w, self.h) = (w, h);

@@ -1,25 +1,36 @@
-//! The "window flies into its dock icon" effect (and back out again).
+//! The "window flows into its dock icon" effect (and back out again), played
+//! when a window is minimised or brought back with a click on the dock.
 //!
-//! How it works, in three steps:
+//! Two things can fly.
 //!
-//! 1. Windows keeps a live picture of every window, including minimised ones,
-//!    and can show it anywhere as a "thumbnail". The effect window puts that
-//!    picture exactly where the real window is (or just was), so nothing
-//!    appears to change on screen.
-//! 2. Two frames later that part of the screen is copied once into a surface
-//!    owned by the dock.
-//! 3. From then on the effect is ordinary composition visuals: the picture is
-//!    cut into up to a few hundred horizontal slices, each a row or more
-//!    high, and the slices are squeezed along a funnel (see `warp.rs`). This
-//!    is the same machinery that moves the dock's icons, and just as cheap.
+//! The live picture: Windows keeps a live picture of every window, minimised
+//! ones included, and will show it anywhere on a window of ours (a
+//! "thumbnail"). Told every frame which rectangle to fill, it is the whole
+//! effect for the plain shapes (shrink, drop): nothing is copied, and what
+//! flies is the window itself, still playing its video.
 //!
-//! The picture taken when a window is minimised is kept, and replayed
-//! backwards when the window is brought back from the dock.
+//! The picture cut into slices: the genie bends the window's sides, which one
+//! rectangle cannot do, and showing the live picture a few hundred times over
+//! (once per slice) brings the desktop compositor down to a third of the
+//! display's frame rate. So the genie takes a photograph of the window (see
+//! `camera.rs`: off screen, on another thread), and shows bands of that one
+//! picture as ordinary composition visuals, which cost next to nothing. While
+//! the photograph is being taken, which is a few hundredths of a second, the
+//! live picture stands in for the window, so nothing is seen of the wait.
+//!
+//! Every other way a window gets minimised or restored (its own button, the
+//! keyboard, Alt+Tab) is animated by Windows, which the app only tells where
+//! the window's icon is (see `MIN_RECTS` in app.rs). While this effect plays
+//! for a window, Windows' own animation is switched off for that one window so
+//! the two never play on top of each other.
 
-use crate::glass::{Glass, Level, Slice, Stage};
+use crate::camera::Camera;
+use crate::scene::{Level, Scene, Slice, Stage};
 use crate::shell;
 use crate::util::wide;
 use crate::warp::{self, Strip, R};
+use std::collections::VecDeque;
+use std::time::Instant;
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
@@ -27,16 +38,34 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS_NAME: &str = "BenEffectWindow";
-/// Most slices the funnel is cut into. More gives smoother edges.
+/// Most slices the genie is cut into. More gives smoother sides.
 const MAX_SLICES: usize = 320;
-/// How many minimised windows' pictures are kept for the way back.
-const KEPT_PICTURES: usize = 8;
+/// How long the genie waits for the window's photograph before going on without it. Seconds.
+const WAIT_FOR_PICTURE: f32 = 0.25;
+/// Frames the live picture stays up over the slices that take its place, so that no frame
+/// goes by with neither on screen.
+const HANDOVER_FRAMES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
+    /// The whole picture scales down into the icon.
     Shrink,
-    Funnel,
+    /// The picture is drawn into the icon through a funnel with curved sides.
+    Genie,
+    /// The picture shrinks a little and slides down to the icon.
     Drop,
+}
+
+impl Style {
+    /// Where the live picture, flying as one piece, is at progress `p`: 0 = the window,
+    /// 1 = inside the icon. (The genie without its photograph keeps its outline.)
+    fn at(self, from: R, to: R, p: f32) -> R {
+        match self {
+            Style::Shrink => warp::shrink(from, to, p),
+            Style::Genie => warp::pour(from, to, p),
+            Style::Drop => warp::drop_down(from, to, p),
+        }
+    }
 }
 
 /// What just finished playing.
@@ -46,33 +75,11 @@ pub struct Finished {
     pub restoring: bool,
 }
 
-/// A window's picture and the part of the screen it was taken from.
-struct Picture {
-    /// The picture at full size, then pre-shrunk copies of it.
-    levels: Vec<Level>,
-    area: R,
-}
-
-enum Phase {
-    /// The live picture is up; waiting for it to reach the screen so it can be copied.
-    Settling(u32),
-    Playing,
-    /// No copy could be made: the live picture itself is scaled down instead.
-    LiveOnly,
-}
-
 struct Playing {
     window: HWND,
-    phase: Phase,
-    /// The live picture, while it is shown.
+    /// The live picture of the window, while it is in use.
     thumb: Option<isize>,
-    /// Frames to keep the live picture up after the slices have appeared underneath it.
-    thumb_frames: u32,
-    picture: Option<Picture>,
-    slices: Vec<Slice>,
-    /// Where the live picture is shown at its true size, and the drawn part of the window
-    /// that is on this monitor.
-    full: R,
+    /// Where the picture is at its true size, and the icon it flies to.
     from: R,
     to: R,
     style: Style,
@@ -81,7 +88,32 @@ struct Playing {
     duration: f32,
     /// Set once the end has been reported, so it is reported only once.
     reported: bool,
+
+    // The genie's photograph.
+    /// It has been asked for and is not there yet: the request, and since when.
+    waiting: Option<(u64, Instant)>,
+    /// Its sizes still to be handed to the compositor, largest first (one a frame).
+    pending: VecDeque<(u32, u32, Vec<u8>)>,
+    levels: Vec<Level>,
+    slices: Vec<Slice>,
     strips: Vec<Strip>,
+    /// Frames left before the live picture is taken off the slices.
+    handover: u32,
+
+    // For the log.
+    frames: u32,
+    /// When the last frame of the flight was shown, and the longest time between two.
+    last_frame: Option<Instant>,
+    longest_gap: f32,
+    /// The longest a frame's work on the effect took, in seconds.
+    worst: f32,
+    most_slices: usize,
+    /// The photograph: its size, how long the effect stood still for it, how long the camera
+    /// took, and how long handing its full size to the compositor took (milliseconds).
+    picture: (u32, u32),
+    held: f32,
+    camera: f32,
+    upload: f32,
 }
 
 pub struct Fx {
@@ -90,8 +122,8 @@ pub struct Fx {
     /// Top-left of the effect window on screen.
     origin: (i32, i32),
     playing: Option<Playing>,
-    /// Pictures of minimised windows, newest last.
-    kept: Vec<(isize, Picture)>,
+    /// Takes the genie's photographs. `None` if that is not possible on this system.
+    camera: Option<Camera>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -101,12 +133,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-fn to_rect(r: R) -> RECT {
-    RECT { left: r.l.round() as i32, top: r.t.round() as i32, right: r.r.round() as i32, bottom: r.b.round() as i32 }
+fn to_r(r: RECT) -> R {
+    R { l: r.left as f32, t: r.top as f32, r: r.right as f32, b: r.bottom as f32 }
 }
 
 impl Fx {
-    pub fn new(glass: &Glass) -> windows::core::Result<Self> {
+    pub fn new(scene: &Scene) -> windows::core::Result<Self> {
         unsafe {
             let instance: HINSTANCE = GetModuleHandleW(None)?.into();
             let class_name = wide(CLASS_NAME);
@@ -133,8 +165,14 @@ impl Fx {
                 Some(instance),
                 None,
             )?;
-            let stage = glass.stage(hwnd)?;
-            Ok(Fx { hwnd, stage, origin: (0, 0), playing: None, kept: Vec::new() })
+            let stage = scene.stage(hwnd)?;
+            // The slices are stretched and squeezed: smooth their edges.
+            stage.soften()?;
+            let camera = Camera::start();
+            if camera.is_none() {
+                crate::log!("no camera for window pictures; the genie will fly the live picture as one piece");
+            }
+            Ok(Fx { hwnd, stage, origin: (0, 0), playing: None, camera })
         }
     }
 
@@ -149,137 +187,230 @@ impl Fx {
 
     /// Starts flying `window` between its place on screen and its icon (`to`), all in screen
     /// pixels. `whole` is the window's own rectangle, `frame` the part of it that is drawn, and
-    /// `bounds` the monitor. Returns false if nothing can be shown.
-    pub fn start(&mut self, glass: &Glass, window: HWND, whole: RECT, frame: RECT, to: R, bounds: RECT, style: Style, restoring: bool, duration: f32) -> bool {
+    /// `bounds` the monitor it plays on. Returns false if nothing can be shown.
+    pub fn start(&mut self, window: HWND, whole: RECT, frame: RECT, to: R, bounds: RECT, style: Style, restoring: bool, duration: f32) -> bool {
         self.stop();
-        let full = R { l: whole.left as f32, t: whole.top as f32, r: whole.right as f32, b: whole.bottom as f32 };
-        // The drawn part of the window that is on this monitor: that is what gets pictured.
-        let visible = R {
-            l: (frame.left.max(bounds.left)) as f32,
-            t: (frame.top.max(bounds.top)) as f32,
-            r: (frame.right.min(bounds.right)) as f32,
-            b: (frame.bottom.min(bounds.bottom)) as f32,
+        let (whole, drawn) = (to_r(whole), to_r(frame));
+        let (thumb, from) = unsafe {
+            let thumb = match DwmRegisterThumbnail(self.hwnd, window) {
+                Ok(t) => t,
+                Err(e) => {
+                    crate::log!("no live picture available for the window: {e}");
+                    return false;
+                }
+            };
+            // Windows makes the live picture either as large as the whole window or only as
+            // large as its drawn part (the invisible edges left out). Shown over the wrong one
+            // it would be stretched by a few pixels and jump as the effect starts.
+            let from = match DwmQueryThumbnailSourceSize(thumb) {
+                Ok(size) if size.cx > 0 && size.cy > 0 => {
+                    let (w, h) = (size.cx as f32, size.cy as f32);
+                    let fits = |r: R| (r.w() - w).abs() <= 1.0 && (r.h() - h).abs() <= 1.0;
+                    if fits(drawn) || !fits(whole) {
+                        drawn
+                    } else {
+                        whole
+                    }
+                }
+                _ => {
+                    crate::log!("the window has no live picture to show");
+                    let _ = DwmUnregisterThumbnail(thumb);
+                    return false;
+                }
+            };
+            (thumb, from)
         };
-        if visible.w() < 8.0 || visible.h() < 8.0 {
-            return false;
+        // Cover the path of the picture on this monitor, and nothing else.
+        let mut path = from.union(to);
+        for step in 0..=16 {
+            path = path.union(style.at(from, to, step as f32 / 16.0));
         }
-        // The whole drawn part, also where it runs off the monitor.
-        let drawn = R { l: frame.left as f32, t: frame.top as f32, r: frame.right as f32, b: frame.bottom as f32 };
-        let id = window.0 as isize;
-        let kept = self.kept.iter().position(|(w, _)| *w == id).map(|i| self.kept.remove(i).1);
-
-        // Cover the path of the picture, and nothing else, so the rest of the screen stays clickable.
-        let left = (visible.l.min(to.l).floor() as i32).max(bounds.left);
-        let top = (visible.t.min(to.t).floor() as i32).max(bounds.top);
-        let right = (visible.r.max(to.r).ceil() as i32).min(bounds.right);
-        let bottom = (visible.b.max(to.b).ceil() as i32).min(bounds.bottom);
-        if right - left < 2 || bottom - top < 2 {
-            return false;
-        }
-        unsafe {
-            if SetWindowPos(self.hwnd, Some(HWND_TOPMOST), left, top, right - left, bottom - top, SWP_NOACTIVATE).is_err() {
-                return false;
+        let left = (path.l.floor() as i32).max(bounds.left);
+        let top = (path.t.floor() as i32).max(bounds.top);
+        let right = (path.r.ceil() as i32).min(bounds.right);
+        let bottom = (path.b.ceil() as i32).min(bounds.bottom);
+        let placed = from.w() >= 8.0 && from.h() >= 8.0 && right - left >= 2 && bottom - top >= 2 && unsafe { SetWindowPos(self.hwnd, Some(HWND_TOPMOST), left, top, right - left, bottom - top, SWP_NOACTIVATE).is_ok() };
+        if !placed {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(thumb);
             }
+            return false;
         }
         self.origin = (left, top);
-        let _ = self.stage.set_opacity(1.0);
-
-        let mut playing = Playing {
+        // The genie needs a photograph to cut up; until it is there, nothing moves.
+        let waiting = match (style, self.camera.as_mut()) {
+            (Style::Genie, Some(camera)) => camera.ask(window).map(|id| (id, Instant::now())),
+            _ => None,
+        };
+        self.playing = Some(Playing {
             window,
-            phase: Phase::Playing,
-            thumb: None,
-            thumb_frames: 0,
-            picture: None,
-            slices: Vec::new(),
-            full,
-            from: visible,
+            thumb: Some(thumb),
+            from,
             to,
             style,
             restoring,
             elapsed: 0.0,
             duration: duration.max(0.05),
             reported: false,
+            waiting,
+            pending: VecDeque::new(),
+            levels: Vec::new(),
+            slices: Vec::new(),
             strips: Vec::new(),
-        };
-
-        match (restoring, kept) {
-            // Coming back: replay the picture taken when it went in, if it is of the same place.
-            (true, Some(picture)) if (picture.area.w() - visible.w()).abs() < 2.0 && (picture.area.h() - visible.h()).abs() < 2.0 => {
-                playing.picture = Some(Picture { area: visible, ..picture });
-            }
-            // Coming back without a picture: scale the live picture up instead.
-            (true, _) => {
-                let Some((thumb, at)) = self.live_picture(window, full, drawn, false) else { return false };
-                playing.thumb = Some(thumb);
-                playing.full = at;
-                playing.phase = Phase::LiveOnly;
-                playing.style = if style == Style::Funnel { Style::Shrink } else { style };
-            }
-            // Going in: show the live picture where the window is, to be copied in two frames.
-            (false, _) => {
-                let Some((thumb, at)) = self.live_picture(window, full, drawn, true) else { return false };
-                playing.thumb = Some(thumb);
-                playing.full = at;
-                playing.phase = Phase::Settling(0);
-            }
-        }
-        self.playing = Some(playing);
-        // Place everything before the window becomes visible, so the first frame is already right.
-        self.apply(glass);
+            handover: 0,
+            frames: 0,
+            last_frame: None,
+            longest_gap: 0.0,
+            worst: 0.0,
+            most_slices: 0,
+            picture: (0, 0),
+            held: 0.0,
+            camera: 0.0,
+            upload: 0.0,
+        });
+        let _ = self.stage.set_opacity(1.0);
+        // This window is ours to animate until the effect is over.
+        shell::set_transitions(window, false);
+        // Place the picture before the effect window becomes visible, so the first frame is already right.
+        self.place_thumb();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         true
     }
 
-    /// Registers the live picture of `window` on the effect window and works out which
-    /// rectangle it has to be shown over to be exactly as large as the window is on screen.
-    /// Windows makes the live picture either as large as the whole window or only as large as
-    /// its drawn part (the invisible edges left out). Shown over the wrong one it is stretched
-    /// by a few pixels, and the copy made from it does not line up with the real window.
-    fn live_picture(&self, window: HWND, whole: R, drawn: R, show: bool) -> Option<(isize, R)> {
-        unsafe {
-            let thumb = match DwmRegisterThumbnail(self.hwnd, window) {
-                Ok(t) => t,
-                Err(e) => {
-                    crate::log!("no live picture available for the window: {e}");
-                    return None;
-                }
-            };
-            let at = match DwmQueryThumbnailSourceSize(thumb) {
-                Ok(size) => {
-                    let (w, h) = (size.cx as f32, size.cy as f32);
-                    let fits = |r: R| (r.w() - w).abs() <= 1.0 && (r.h() - h).abs() <= 1.0;
-                    let (at, over) = if fits(drawn) {
-                        (drawn, "the drawn part")
-                    } else if fits(whole) {
-                        (whole, "the whole window")
-                    } else {
-                        (drawn, "the drawn part, though it matches neither")
-                    };
-                    crate::log!("live picture is {w}x{h}; whole window {}x{}, drawn part {}x{}: shown over {over}", whole.w(), whole.h(), drawn.w(), drawn.h());
-                    at
-                }
-                Err(e) => {
-                    crate::log!("size of the live picture unknown ({e}); shown over the whole window");
-                    whole
-                }
-            };
-            if show {
-                self.place_live(thumb, at, 255);
-            }
-            Some((thumb, at))
+    /// Advances the effect by one frame. Returns what finished, once.
+    pub fn step(&mut self, scene: &Scene, dt: f32) -> Option<Finished> {
+        let playing = self.playing.as_mut()?;
+        if playing.reported {
+            return None;
         }
+
+        // The genie waits for its photograph. Minimising, the live picture stands where the
+        // window was meanwhile; coming back, there is nothing to see yet.
+        if let Some((id, since)) = playing.waiting {
+            let answer = self.camera.as_mut().and_then(|camera| camera.take(id));
+            let waited = since.elapsed().as_secs_f32();
+            match answer {
+                None if waited < WAIT_FOR_PICTURE => return None,
+                None | Some(None) => {
+                    crate::log!("no photograph of the window after {:.0} ms; its live picture flies as one piece", waited * 1000.0);
+                    playing.waiting = None;
+                }
+                Some(Some(shot)) => {
+                    playing.waiting = None;
+                    (playing.held, playing.camera) = (waited * 1000.0, shot.took);
+                    let started = Instant::now();
+                    let mut sizes: VecDeque<(u32, u32, Vec<u8>)> = shot.levels.into();
+                    // The full size now; the smaller ones follow, one a frame.
+                    let first = sizes.pop_front().and_then(|(w, h, pixels)| {
+                        playing.picture = (w, h);
+                        scene.picture_level(w, h, &pixels).ok()
+                    });
+                    let slice = first.and_then(|level| {
+                        playing.levels.push(level);
+                        scene.slice(&self.stage, &playing.levels).ok()
+                    });
+                    match slice {
+                        Some(slice) => {
+                            playing.slices.push(slice);
+                            playing.pending = sizes;
+                            playing.upload = started.elapsed().as_secs_f32() * 1000.0;
+                            if playing.restoring {
+                                // Nothing was showing; the photograph comes out of the icon.
+                                if let Some(thumb) = playing.thumb.take() {
+                                    unsafe {
+                                        let _ = DwmUnregisterThumbnail(thumb);
+                                    }
+                                }
+                            } else {
+                                playing.handover = HANDOVER_FRAMES;
+                            }
+                        }
+                        None => {
+                            crate::log!("the window's photograph could not be shown; its live picture flies as one piece");
+                            playing.levels.clear();
+                        }
+                    }
+                }
+            }
+            // The clock starts with the next frame: this one shows the effect's first picture.
+            self.apply(scene);
+            return None;
+        }
+
+        // The live picture stays over the slices for a moment; the clock waits until it is gone.
+        if playing.handover > 0 {
+            playing.handover -= 1;
+            if playing.handover == 0 {
+                if let Some(thumb) = playing.thumb.take() {
+                    unsafe {
+                        let _ = DwmUnregisterThumbnail(thumb);
+                    }
+                }
+            }
+            self.apply(scene);
+            return None;
+        }
+
+        // One more size of the photograph a frame. The small ones are only needed once the
+        // picture has shrunk, so they need not hold up its start.
+        if let Some((w, h, pixels)) = playing.pending.pop_front() {
+            match scene.picture_level(w, h, &pixels) {
+                Ok(level) => playing.levels.push(level),
+                Err(_) => playing.pending.clear(),
+            }
+        }
+
+        playing.frames += 1;
+        let now = Instant::now();
+        if let Some(last) = playing.last_frame.replace(now) {
+            playing.longest_gap = playing.longest_gap.max((now - last).as_secs_f32());
+        }
+        playing.elapsed += dt;
+        if playing.elapsed >= playing.duration {
+            playing.reported = true;
+            playing.elapsed = playing.duration;
+            let done = Finished { window: playing.window, restoring: playing.restoring };
+            if done.restoring {
+                // Leave the picture up at full size: the app restores the real window underneath
+                // and calls `stop` a moment later, so there is no flash of empty desktop.
+                self.apply(scene);
+            } else {
+                self.stop();
+            }
+            return Some(done);
+        }
+        self.apply(scene);
+        None
     }
 
-    fn place_live(&self, thumb: isize, at: R, alpha: u8) {
-        let dest = to_rect(R { l: at.l - self.origin.0 as f32, t: at.t - self.origin.1 as f32, r: at.r - self.origin.0 as f32, b: at.b - self.origin.1 as f32 });
+    /// Puts the live picture where it belongs at the current time.
+    fn place_thumb(&mut self) {
+        let (ox, oy) = (self.origin.0 as f32, self.origin.1 as f32);
+        let Some(playing) = self.playing.as_mut() else { return };
+        let Some(thumb) = playing.thumb else { return };
+        let t = (playing.elapsed / playing.duration).clamp(0.0, 1.0);
+        // 0 = the window where it is, 1 = inside the icon.
+        let p = if playing.restoring { 1.0 - t } else { t };
+        let (at, shown, opacity) = if playing.waiting.is_some() {
+            // Standing in for the window until its photograph is there. Coming back there is
+            // nothing to stand in for.
+            (playing.from, !playing.restoring, 1.0)
+        } else if !playing.levels.is_empty() {
+            // Over the slices that are taking its place.
+            (playing.from, true, 1.0)
+        } else {
+            (playing.style.at(playing.from, playing.to, p), true, warp::opacity(p))
+        };
+        let dest = RECT { left: (at.l - ox).round() as i32, top: (at.t - oy).round() as i32, right: (at.r - ox).round() as i32, bottom: (at.b - oy).round() as i32 };
+        let opacity = (opacity * 255.0).round() as u8;
         let props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
             rcDestination: dest,
             rcSource: RECT::default(),
-            opacity: alpha,
-            fVisible: BOOL((dest.right > dest.left && dest.bottom > dest.top && alpha > 0) as i32),
+            opacity,
+            fVisible: BOOL((shown && dest.right > dest.left && dest.bottom > dest.top && opacity > 0) as i32),
             fSourceClientAreaOnly: BOOL(0),
         };
         unsafe {
@@ -287,157 +418,40 @@ impl Fx {
         }
     }
 
-    /// Advances the effect by one frame. Returns what finished, once.
-    pub fn step(&mut self, glass: &Glass, dt: f32) -> Option<Finished> {
-        let playing = self.playing.as_mut()?;
-        if playing.reported {
-            return None;
-        }
-        match playing.phase {
-            Phase::Settling(frames) if frames < 2 => {
-                // Give the live picture two frames to be on screen for certain.
-                playing.phase = Phase::Settling(frames + 1);
-                return None;
-            }
-            Phase::Settling(_) => {
-                let area = playing.from;
-                let started = std::time::Instant::now();
-                let copied = shell::capture_screen(to_rect(area)).and_then(|(w, h, pixels)| match glass.picture_levels(w, h, &pixels) {
-                    Ok(levels) => {
-                        crate::log!("window picture {w}x{h} copied in {:.0} ms ({} sizes kept)", started.elapsed().as_secs_f32() * 1000.0, levels.len());
-                        Some(Picture { levels, area })
-                    }
-                    Err(e) => {
-                        crate::log!("could not store the window's picture: {e}");
-                        None
-                    }
-                });
-                // The first slice is made right here: if the picture cannot be shown at all,
-                // the live picture is still up and can be scaled instead.
-                let ready = copied.and_then(|picture| match glass.slice(&self.stage, &picture.levels) {
-                    Ok(slice) => Some((picture, slice)),
-                    Err(e) => {
-                        crate::log!("could not create a picture slice: {e}");
-                        None
-                    }
-                });
-                match ready {
-                    Some((picture, slice)) => {
-                        playing.slices.clear();
-                        playing.slices.push(slice);
-                        playing.picture = Some(picture);
-                        playing.phase = Phase::Playing;
-                        // The slices appear under the live picture first; then it is taken away.
-                        playing.thumb_frames = 2;
-                    }
-                    None => {
-                        crate::log!("scaling the live picture instead");
-                        playing.phase = Phase::LiveOnly;
-                        playing.style = if playing.style == Style::Funnel { Style::Shrink } else { playing.style };
-                    }
-                }
-                self.apply(glass);
-                return None;
-            }
-            _ => {}
-        }
-
-        if playing.thumb_frames > 0 {
-            playing.thumb_frames -= 1;
-            if playing.thumb_frames == 0 {
-                if let Some(thumb) = playing.thumb.take() {
-                    unsafe {
-                        let _ = DwmUnregisterThumbnail(thumb);
-                    }
-                }
-            }
-        }
-
-        playing.elapsed += dt;
-        if playing.elapsed >= playing.duration {
-            playing.reported = true;
-            playing.elapsed = playing.duration;
-            let done = Finished { window: playing.window, restoring: playing.restoring };
-            if done.restoring {
-                // Leave the picture up at full size: the dock restores the real window underneath
-                // and calls `stop` a moment later, so there is no flash of empty desktop.
-                self.apply(glass);
-            } else {
-                self.stop();
-            }
-            return Some(done);
-        }
-        self.apply(glass);
-        None
-    }
-
-    /// Puts every slice where it belongs at the current time.
-    fn apply(&mut self, glass: &Glass) {
+    /// Puts everything where it belongs at the current time.
+    fn apply(&mut self, scene: &Scene) {
+        let started = Instant::now();
+        self.place_thumb();
         let (ox, oy) = (self.origin.0 as f32, self.origin.1 as f32);
         let Some(playing) = self.playing.as_mut() else { return };
-        let t = (playing.elapsed / playing.duration).clamp(0.0, 1.0);
-        // 0 = the window where it is, 1 = inside the icon.
-        let p = if playing.restoring { 1.0 - t } else { t };
-        let alpha = warp::opacity(p);
-
-        if let Phase::LiveOnly = playing.phase {
-            // Fallback: one live picture, scaled as a whole.
-            let at = match playing.style {
-                Style::Drop => warp::drop_down(playing.full, playing.to, p),
-                _ => warp::shrink(playing.full, playing.to, p),
-            };
-            if let Some(thumb) = playing.thumb {
-                let props = DWM_THUMBNAIL_PROPERTIES {
-                    dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
-                    rcDestination: to_rect(R { l: at.l - ox, t: at.t - oy, r: at.r - ox, b: at.b - oy }),
-                    rcSource: RECT::default(),
-                    opacity: (alpha * 255.0).round() as u8,
-                    fVisible: BOOL(1),
-                    fSourceClientAreaOnly: BOOL(0),
-                };
-                unsafe {
-                    let _ = DwmUpdateThumbnailProperties(thumb, &props);
+        if !playing.levels.is_empty() {
+            let t = (playing.elapsed / playing.duration).clamp(0.0, 1.0);
+            let p = if playing.restoring { 1.0 - t } else { t };
+            warp::funnel(playing.from, playing.to, p, MAX_SLICES, &mut playing.strips);
+            // One visual per slice, created as the funnel needs them.
+            while playing.slices.len() < playing.strips.len() {
+                match scene.slice(&self.stage, &playing.levels) {
+                    Ok(slice) => playing.slices.push(slice),
+                    Err(e) => {
+                        crate::log!("could not create a picture slice: {e}");
+                        break;
+                    }
                 }
             }
-            return;
-        }
-        let Some(picture) = playing.picture.as_ref() else { return };
-
-        match playing.style {
-            Style::Shrink => {
-                playing.strips.clear();
-                playing.strips.push(Strip { src_top: 0.0, src_bottom: 1.0, dst: warp::shrink(playing.from, playing.to, p) });
-            }
-            Style::Drop => {
-                playing.strips.clear();
-                playing.strips.push(Strip { src_top: 0.0, src_bottom: 1.0, dst: warp::drop_down(playing.from, playing.to, p) });
-            }
-            Style::Funnel => warp::funnel(playing.from, playing.to, p, MAX_SLICES, &mut playing.strips),
-        }
-
-        // One visual per slice, created as the funnel needs them.
-        while playing.slices.len() < playing.strips.len() {
-            match glass.slice(&self.stage, &picture.levels) {
-                Ok(slice) => playing.slices.push(slice),
-                Err(e) => {
-                    crate::log!("could not create a picture slice: {e}");
+            for (index, slice) in playing.slices.iter_mut().enumerate() {
+                let shown = match playing.strips.get(index) {
+                    Some(strip) if strip.dst.w() > 0.01 && strip.dst.h() > 0.01 => slice.show(&playing.levels, strip.dst.l - ox, strip.dst.t - oy, strip.dst.w(), strip.dst.h(), strip.src_top, strip.src_bottom),
+                    _ => slice.hide(),
+                };
+                if let Err(e) = shown {
+                    crate::log!("could not move a picture slice: {e}");
                     break;
                 }
             }
+            let _ = self.stage.set_opacity(warp::opacity(p));
+            playing.most_slices = playing.most_slices.max(playing.strips.len());
         }
-        for (index, slice) in playing.slices.iter_mut().enumerate() {
-            let shown = match playing.strips.get(index) {
-                Some(strip) if strip.dst.w() > 0.01 && strip.dst.h() > 0.01 => {
-                    slice.show(&picture.levels, strip.dst.l - ox, strip.dst.t - oy, strip.dst.w(), strip.dst.h(), strip.src_top, strip.src_bottom)
-                }
-                _ => slice.hide(),
-            };
-            if let Err(e) = shown {
-                crate::log!("could not move a picture slice: {e}");
-                break;
-            }
-        }
-        let _ = self.stage.set_opacity(alpha);
+        playing.worst = playing.worst.max(started.elapsed().as_secs_f32());
     }
 
     /// Ends the effect and hides the effect window.
@@ -450,22 +464,28 @@ impl Fx {
             }
         }
         playing.slices.clear();
-        // Keep the picture of a window that went into the dock, for when it comes back.
-        if !playing.restoring {
-            if let Some(picture) = playing.picture.take() {
-                self.kept.retain(|(w, _)| unsafe { IsWindow(Some(HWND(*w as *mut _))).as_bool() });
-                self.kept.push((playing.window.0 as isize, picture));
-                if self.kept.len() > KEPT_PICTURES {
-                    self.kept.remove(0);
-                }
-            }
+        playing.levels.clear();
+        // From here on the window is Windows' to animate again.
+        shell::set_transitions(playing.window, true);
+        let what = if playing.restoring { "restore" } else { "minimise" };
+        if playing.picture.0 > 0 {
+            crate::log!(
+                "effect ({what}, {:?}): {} frames in {:.0} ms (longest wait for one {:.1} ms), {} slices at most, the app's work on a frame {:.1} ms at most; photograph {}x{} there after {:.0} ms (camera {:.0} ms), handed over in {:.1} ms",
+                playing.style,
+                playing.frames,
+                playing.elapsed * 1000.0,
+                playing.longest_gap * 1000.0,
+                playing.most_slices,
+                playing.worst * 1000.0,
+                playing.picture.0,
+                playing.picture.1,
+                playing.held,
+                playing.camera,
+                playing.upload
+            );
+        } else {
+            crate::log!("effect ({what}, {:?}): {} frames in {:.0} ms (longest wait for one {:.1} ms)", playing.style, playing.frames, playing.elapsed * 1000.0, playing.longest_gap * 1000.0);
         }
-    }
-
-    /// Forgets every kept picture (they were painted on a GPU device that has been reset).
-    pub fn forget_pictures(&mut self) {
-        self.stop();
-        self.kept.clear();
     }
 }
 

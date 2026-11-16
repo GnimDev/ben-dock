@@ -78,7 +78,7 @@ fn bump(t: f32, r: f32) -> f32 {
     }
 }
 
-/// The grid of the full-screen app launcher, in physical pixels.
+/// The grid of the app tray, in physical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Grid {
     pub cols: usize,
@@ -91,15 +91,20 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Fits a grid of cells into a screen, leaving room for the search field above and the
-    /// page dots and the dock below.
-    pub fn fit(screen_w: f32, screen_h: f32, cell_w: f32, cell_h: f32, top: f32, bottom: f32) -> Grid {
-        let margin = (screen_w * 0.08).max(cell_w * 0.4);
-        let cols = (((screen_w - margin * 2.0) / cell_w).floor() as usize).clamp(2, 9);
-        let rows = (((screen_h - top - bottom) / cell_h).floor() as usize).clamp(1, 6);
-        let x = (screen_w - cols as f32 * cell_w) * 0.5;
-        let y = top + ((screen_h - top - bottom) - rows as f32 * cell_h).max(0.0) * 0.5;
+    /// As many columns and rows of cells as fit into `width` by `height` (within sensible
+    /// limits), with its first cell at (`x`, `y`).
+    pub fn fit(width: f32, height: f32, cell_w: f32, cell_h: f32, x: f32, y: f32) -> Grid {
+        let cols = ((width / cell_w).floor() as usize).clamp(3, 9);
+        let rows = ((height / cell_h).floor() as usize).clamp(2, 6);
         Grid { cols, rows, cell_w, cell_h, x, y }
+    }
+
+    pub fn width(&self) -> f32 {
+        self.cols as f32 * self.cell_w
+    }
+
+    pub fn height(&self) -> f32 {
+        self.rows as f32 * self.cell_h
     }
 
     pub fn per_page(&self) -> usize {
@@ -139,17 +144,19 @@ mod tests {
 
     #[test]
     fn grid_fits_and_round_trips() {
-        for (w, h) in [(1920.0, 1080.0), (1366.0, 768.0), (2560.0, 1440.0), (3840.0, 2160.0), (800.0, 600.0)] {
-            let g = Grid::fit(w, h, 150.0, 140.0, 150.0, 150.0);
-            assert!(g.cols >= 2 && g.rows >= 1);
-            assert!(g.x >= 0.0 && g.x + g.cols as f32 * g.cell_w <= w + 0.5, "grid wider than the screen at {w}x{h}");
-            assert!(g.y + g.rows as f32 * g.cell_h <= h + 0.5);
+        for (w, h) in [(1267.0, 670.0), (900.0, 476.0), (1690.0, 890.0), (2534.0, 1340.0), (528.0, 372.0)] {
+            let g = Grid::fit(w, h, 102.0, 106.0, 22.0, 66.0);
+            assert!(g.cols >= 3 && g.rows >= 2);
+            assert!(g.cols <= 9 && g.rows <= 6);
+            if w >= 3.0 * 102.0 {
+                assert!(g.width() <= w + 0.5, "grid wider than its room at {w}x{h}");
+            }
             for i in 0..g.per_page() {
                 let (cx, cy) = g.cell_center(i);
                 assert_eq!(g.cell_at(cx, cy), Some(i));
             }
             assert_eq!(g.cell_at(g.x - 1.0, g.y + 5.0), None);
-            assert_eq!(g.cell_at(g.x + g.cols as f32 * g.cell_w + 1.0, g.y + 5.0), None);
+            assert_eq!(g.cell_at(g.x + g.width() + 1.0, g.y + 5.0), None);
             assert_eq!(g.pages(0), 1);
             assert_eq!(g.pages(g.per_page()), 1);
             assert_eq!(g.pages(g.per_page() + 1), 2);

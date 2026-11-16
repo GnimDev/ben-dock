@@ -1,21 +1,26 @@
-//! The window preview: rest the cursor on a running app's icon and a small
-//! glass panel appears above it with a live picture and the title of each of
-//! that app's windows. Click one to switch to it, middle-click to close it.
+//! The window preview: rest the cursor on a running app's icon and a piece of
+//! glass swells up above it with a live picture and the title of each of that
+//! app's windows. Click one to switch to it, middle-click to close it.
 
-use crate::dock::{self, Event};
-use crate::gfx::{color, Gfx};
-use crate::glass::{rgba, Glass, Palette, Pill, Popup, Sprite};
+use crate::app::{self, Event};
+use crate::gfx::Gfx;
+use crate::motion::{Glide, Motion};
+use crate::scene::{Bead, Glass, Scene, Sprite, Stage};
 use crate::spring::Spring;
+use crate::text;
+use crate::theme::Theme;
 use crate::util::{from_wide, wide};
 use windows::core::{Result, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::UI::Composition::CompositionDrawingSurface;
 
 const CLASS_NAME: &str = "BenPreviewWindow";
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Everything the preview needs to know to lay itself out.
 pub struct Layout {
@@ -27,7 +32,6 @@ pub struct Layout {
     pub scale: f32,
     /// Width of one window picture, in logical pixels.
     pub size: f32,
-    pub dark: bool,
 }
 
 struct Cell {
@@ -35,34 +39,62 @@ struct Cell {
     thumb: isize,
     /// The cell (title + picture) and the picture alone, in panel pixels.
     area: (f32, f32, f32, f32),
-    picture: RECT,
+    picture: (f32, f32, f32, f32),
     _title: Option<Sprite>,
     _title_surface: Option<CompositionDrawingSurface>,
 }
 
 pub struct Preview {
     hwnd: HWND,
-    popup: Popup,
-    highlight: Pill,
+    _stage: Stage,
+    glass: Glass,
+    highlight: Bead,
+    highlight_at: Glide,
     cells: Vec<Cell>,
-    /// Which dock item the preview is showing.
+    /// Which dock item the preview is showing. `None` once it is told to go, even while it
+    /// is still fading away.
     key: Option<String>,
+    /// The window is on screen (open, or fading away).
+    visible: bool,
     /// Panel rectangle on screen.
     rect: RECT,
-    opacity: Spring,
-    shown_opacity: u8,
-    dark: bool,
+    /// Space around the panel inside the window, for its shadow.
+    margin: f32,
+    size: (f32, f32),
+    scale: f32,
+    /// 0 = away, 1 = fully there.
+    show: Spring,
+    shown: Option<(u8, i32)>,
+}
+
+thread_local! {
+    static TRACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        // The cursor moving over the panel, or leaving it, is what moves the mark and what
+        // lets the panel close: tell the app, which sleeps while nothing happens.
+        WM_MOUSEMOVE => {
+            if !TRACKING.get() {
+                let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                TRACKING.set(unsafe { TrackMouseEvent(&mut track) }.is_ok());
+            }
+            app::post(Event::PreviewHover);
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            TRACKING.set(false);
+            app::post(Event::PreviewHover);
+            return LRESULT(0);
+        }
         WM_LBUTTONUP => {
-            dock::post(Event::PreviewClick(false));
+            app::post(Event::PreviewClick(false));
             return LRESULT(0);
         }
         WM_MBUTTONUP => {
-            dock::post(Event::PreviewClick(true));
+            app::post(Event::PreviewClick(true));
             return LRESULT(0);
         }
         _ => {}
@@ -71,7 +103,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 impl Preview {
-    pub fn new(glass: &Glass, blur_sigma: Option<f32>, palette: &Palette) -> Result<Self> {
+    pub fn new(scene: &Scene, theme: &Theme, motion: &Motion) -> Result<Self> {
         unsafe {
             let instance: HINSTANCE = GetModuleHandleW(None)?.into();
             let class_name = wide(CLASS_NAME);
@@ -98,9 +130,25 @@ impl Preview {
                 Some(instance),
                 None,
             )?;
-            let popup = glass.popup(hwnd, blur_sigma, palette)?;
-            let highlight = glass.pill_in(popup.content()?)?;
-            Ok(Preview { hwnd, popup, highlight, cells: Vec::new(), key: None, rect: RECT::default(), opacity: Spring::new(0.0, 30.0, 1.0), shown_opacity: 0, dark: true })
+            let stage = scene.stage(hwnd)?;
+            let glass = scene.glass_in(&stage.content()?, &theme.bubble)?;
+            let highlight = scene.bead_in(&glass.inner()?)?;
+            Ok(Preview {
+                hwnd,
+                _stage: stage,
+                glass,
+                highlight,
+                highlight_at: Glide::new(motion),
+                cells: Vec::new(),
+                key: None,
+                visible: false,
+                rect: RECT::default(),
+                margin: 0.0,
+                size: (1.0, 1.0),
+                scale: 1.0,
+                show: Spring::with(0.0, motion.small()),
+                shown: None,
+            })
         }
     }
 
@@ -116,8 +164,10 @@ impl Preview {
         self.cells.iter().map(|c| c.window).collect()
     }
 
-    pub fn set_palette(&self, palette: &Palette) {
-        let _ = self.popup.set_palette(palette);
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.glass.set_material(&theme.bubble);
+        // Titles are painted in the old colour.
+        self.hide_now();
     }
 
     /// True when a screen point is on the panel (with a little slack around it).
@@ -132,7 +182,7 @@ impl Preview {
     }
 
     /// Opens the preview for one dock item, or rebuilds it if it is already open.
-    pub fn show(&mut self, glass: &Glass, gfx: &Gfx, key: &str, windows: &[HWND], layout: &Layout) -> Result<()> {
+    pub fn show(&mut self, scene: &Scene, gfx: &Gfx, theme: &Theme, key: &str, windows: &[HWND], layout: &Layout) -> Result<()> {
         let was_open = self.is_open();
         self.clear();
         let s = layout.scale;
@@ -143,26 +193,19 @@ impl Preview {
         let fit = (((monitor_w - px(16.0) - pad * 2.0 + gap) / (box_w + gap)).floor() as usize).max(1);
         let windows = &windows[..windows.len().min(fit)];
         if windows.is_empty() {
-            self.hide();
+            self.hide_now();
             return Ok(());
         }
         let n = windows.len() as f32;
         let (w, h) = (pad * 2.0 + n * box_w + (n - 1.0) * gap, pad * 2.0 + title_h + box_h);
-        self.dark = layout.dark;
+        let margin = theme.bubble.shadow_reach + px(6.0);
+        (self.margin, self.size, self.scale) = (margin, (w, h), s);
+        // Blur and shadow are sized for the screen it opens on.
+        self.glass.set_material(&theme.bubble);
 
         unsafe {
-            let format = gfx.dwrite.CreateTextFormat(
-                PCWSTR(wide("Segoe UI Variable Text").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                12.0 * s,
-                PCWSTR(wide("").as_ptr()),
-            )?;
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let fg = if layout.dark { 1.0 } else { 0.08 };
-
+            let format = text::format(gfx, text::UI_FONT, 12.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let content = self.glass.outer()?;
             for (i, &window) in windows.iter().enumerate() {
                 let x = pad + i as f32 * (box_w + gap);
                 let area = (x, pad, x + box_w, pad + title_h + box_h);
@@ -175,94 +218,92 @@ impl Preview {
                 let (pw, ph) = ((sw * k).round(), (sh * k).round());
                 let left = (x + (box_w - pw) * 0.5).round();
                 let top = (pad + title_h + (box_h - ph) * 0.5).round();
-                let picture = RECT { left: left as i32, top: top as i32, right: (left + pw) as i32, bottom: (top + ph) as i32 };
+                let picture = (left, top, left + pw, top + ph);
 
                 // Title, shortened with an ellipsis until it fits above the picture.
                 let mut buf = [0u16; 256];
                 let len = GetWindowTextW(window, &mut buf).max(0) as usize;
-                let full: Vec<char> = from_wide(&buf[..len]).chars().collect();
-                let mut title = None;
-                let mut surface = None;
-                let mut keep = full.len();
-                for _ in 0..12 {
-                    let text: String = if keep < full.len() { full[..keep].iter().collect::<String>().trim_end().to_string() + "…" } else { full.iter().collect() };
-                    let utf16: Vec<u16> = text.encode_utf16().collect();
-                    let text_layout = gfx.dwrite.CreateTextLayout(&utf16, &format, 4000.0, 100.0)?;
-                    let mut tm = DWRITE_TEXT_METRICS::default();
-                    text_layout.GetMetrics(&mut tm)?;
-                    if tm.width <= box_w - px(4.0) || keep <= 1 {
-                        let (tw, th) = (tm.width.ceil().max(1.0), tm.height.ceil().max(1.0));
-                        let painted = glass.surface_from_text(&text_layout, tw, th, color(fg, fg, fg, 1.0))?;
-                        let mut sprite = glass.sprite_in(self.popup.content()?)?;
-                        sprite.set_surface(&painted)?;
-                        sprite.place((x + px(2.0)).round(), (pad + (title_h - th) * 0.5 - px(1.0)).round(), tw, th)?;
-                        sprite.set_opacity(0.9)?;
-                        title = Some(sprite);
-                        surface = Some(painted);
-                        break;
-                    }
-                    // Cut in proportion to how much too wide it is, then try again.
-                    keep = ((keep as f32 * (box_w - px(4.0)) / tm.width) as usize).min(keep - 1).max(1);
-                }
-                self.cells.push(Cell { window, thumb, area, picture, _title: title, _title_surface: surface });
+                let (text_layout, tw, th) = text::fit(gfx, &format, &from_wide(&buf[..len]), Some(box_w - px(4.0)))?;
+                let painted = scene.surface_from_text(&text_layout, tw, th, theme.text)?;
+                let mut sprite = scene.sprite_in(&content)?;
+                sprite.set_surface(&painted)?;
+                sprite.place((x + px(2.0)).round(), (pad + (title_h - th) * 0.5 - px(1.0)).round(), tw, th)?;
+                sprite.set_opacity(0.92)?;
+                self.cells.push(Cell { window, thumb, area, picture, _title: Some(sprite), _title_surface: Some(painted) });
             }
 
             // Centre above the icon, kept on screen.
             let x = (layout.anchor_x - (w * 0.5) as i32).clamp(layout.monitor.left + px(8.0) as i32, (layout.monitor.right - w as i32 - px(8.0) as i32).max(layout.monitor.left));
             let y = layout.bottom_y - h as i32;
             self.rect = RECT { left: x, top: y, right: x + w as i32, bottom: y + h as i32 };
-            self.popup.set_size(w, h, px(12.0))?;
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w as i32, h as i32, SWP_NOACTIVATE);
+            self.glass.set_rect(scene, margin, margin, w, h, px(14.0))?;
+            let m = margin as i32;
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x - m, y - m, w as i32 + 2 * m, h as i32 + 2 * m, SWP_NOACTIVATE);
 
             self.key = Some(key.to_string());
-            if !was_open {
-                // Fade in. When switching between apps the panel just changes in place.
-                self.opacity = Spring::new(0.0, 30.0, 1.0);
+            if !was_open && !self.visible {
+                // Swell in. When switching between apps the panel just changes in place.
+                self.show.snap(0.0);
             }
-            self.opacity.set(1.0);
-            self.shown_opacity = 0;
-            self.apply_opacity(true);
+            self.show.set(1.0);
+            self.shown = None;
+            self.apply()?;
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            self.visible = true;
         }
         Ok(())
     }
 
-    /// Fades the panel in and highlights the cell under the cursor. Call once per frame while open.
-    pub fn update(&mut self, cursor: POINT, dt: f32) {
-        if !self.is_open() {
-            return;
+    /// Fades the panel in or out and marks the cell under the cursor. Call once per frame.
+    /// Returns true while something is still moving.
+    pub fn update(&mut self, theme: &Theme, motion: &Motion, cursor: POINT, dt: f32) -> Result<bool> {
+        if !self.visible {
+            return Ok(false);
         }
-        self.opacity.step(dt);
-        self.apply_opacity(false);
+        self.show.tune(if self.key.is_some() { motion.small() } else { motion.fade() });
+        self.show.step(dt);
+        if self.key.is_none() && self.show.pos < 0.02 {
+            self.hide_now();
+            return Ok(false);
+        }
+        self.apply()?;
 
         let (x, y) = ((cursor.x - self.rect.left) as f32, (cursor.y - self.rect.top) as f32);
-        let hot = self.cells.iter().find(|c| x >= c.area.0 && x < c.area.2 && y >= c.area.1 && y < c.area.3).map(|c| c.area);
-        let c = if self.dark { 1.0 } else { 0.0 };
-        let _ = self.highlight.set_color(rgba(c, c, c, if self.dark { 0.12 } else { 0.08 }));
-        match hot {
-            Some(a) => {
-                let _ = self.highlight.place(a.0 - 5.0, a.1 - 5.0, a.2 - a.0 + 10.0, a.3 - a.1 + 10.0, 8.0);
-                let _ = self.highlight.set_opacity(1.0);
-            }
-            None => {
-                let _ = self.highlight.set_opacity(0.0);
-            }
-        }
+        let hot = self.cells.iter().find(|c| self.key.is_some() && x >= c.area.0 && x < c.area.2 && y >= c.area.1 && y < c.area.3).map(|c| c.area);
+        let grow = (5.0 * self.scale).round();
+        self.highlight_at.tune(motion);
+        self.highlight_at.aim(hot.map(|a| (a.0 - grow, a.1 - grow, a.2 - a.0 + 2.0 * grow, a.3 - a.1 + 2.0 * grow)));
+        self.highlight_at.step(dt);
+        let s = self.highlight_at.shape(motion.squash());
+        self.highlight.place(s.x, s.y, s.w, s.h, 9.0 * self.scale)?;
+        let (top, bottom, edge) = theme.bead;
+        self.highlight.set_colors(top, bottom, edge)?;
+        self.highlight.set_opacity(s.alpha)?;
+        Ok(!self.show.settled(1e-3) || !self.highlight_at.settled())
     }
 
-    /// Applies the current fade to the panel and to the window pictures.
-    fn apply_opacity(&mut self, force: bool) {
-        let alpha = self.opacity.pos.clamp(0.0, 1.0);
-        let _ = self.popup.set_opacity(alpha);
+    /// Applies the current size and fade to the panel and to the window pictures (those are
+    /// drawn by Windows, not by the scene, so they are moved by hand to match).
+    fn apply(&mut self) -> Result<()> {
+        let alpha = self.show.pos.clamp(0.0, 1.0);
+        let grow = 0.9 + 0.1 * self.show.pos.clamp(0.0, 1.1);
+        let (w, h) = self.size;
+        // It grows out of the icon below it.
+        self.glass.set_scale(grow, grow, w * 0.5, h)?;
+        self.glass.set_opacity(alpha)?;
         let byte = (alpha * 255.0).round() as u8;
-        if byte == self.shown_opacity && !force {
-            return;
+        let step = (grow * 2000.0) as i32;
+        if self.shown == Some((byte, step)) {
+            return Ok(());
         }
-        self.shown_opacity = byte;
+        self.shown = Some((byte, step));
+        let (cx, cy) = (self.margin + w * 0.5, self.margin + h);
+        let place = |v: f32, centre: f32| (centre + (v - centre) * grow).round() as i32;
         for cell in &self.cells {
+            let (l, t, r, b) = cell.picture;
             let props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
-                rcDestination: cell.picture,
+                rcDestination: RECT { left: place(l + self.margin, cx), top: place(t + self.margin, cy), right: place(r + self.margin, cx), bottom: place(b + self.margin, cy) },
                 rcSource: RECT::default(),
                 opacity: byte,
                 fVisible: BOOL(1),
@@ -272,6 +313,7 @@ impl Preview {
                 let _ = DwmUpdateThumbnailProperties(cell.thumb, &props);
             }
         }
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -282,19 +324,30 @@ impl Preview {
         }
     }
 
+    /// Sends the preview away; it fades out over the next frames.
     pub fn hide(&mut self) {
         if self.key.take().is_some() {
+            self.show.set(0.0);
+        }
+    }
+
+    /// Takes the preview off the screen at once.
+    pub fn hide_now(&mut self) {
+        self.key = None;
+        if self.visible {
+            self.visible = false;
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
         }
+        self.show.snap(0.0);
         self.clear();
     }
 }
 
 impl Drop for Preview {
     fn drop(&mut self) {
-        self.hide();
+        self.hide_now();
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }

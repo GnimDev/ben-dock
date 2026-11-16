@@ -1,10 +1,18 @@
-//! Geometry of the "window flies into its dock icon" effects.
+//! Geometry of the "window flows into its dock icon" effects.
 //!
-//! The window's picture is cut into thin horizontal slices. For the funnel
-//! effect each slice is squeezed to the width a funnel has at that height: a
-//! shape that is as wide as the window at the top and as narrow as the icon at
-//! the bottom. First the funnel forms (the bottom of the window narrows), then
-//! the picture slides down through it into the icon.
+//! Each effect maps progress (0 = the window where it is, 1 = inside its icon)
+//! to where the window's picture is shown.
+//!
+//! The genie is the one with a shape of its own: the picture is cut into thin
+//! horizontal slices, and each slice is squeezed to the width a funnel has at
+//! that height. The funnel is as wide as the window at the top and as narrow
+//! as the icon at the bottom, with sides that leave the window straight down
+//! and arrive at the icon straight down. First the funnel forms (the foot of
+//! the window reaches for the icon and narrows), then the picture is drawn
+//! down through it, its head last.
+//!
+//! The others move one rectangle: that is what the effect falls back on when
+//! it has no picture of its own to cut up (see `fx.rs`).
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct R {
@@ -20,6 +28,10 @@ impl R {
     }
     pub fn h(&self) -> f32 {
         self.b - self.t
+    }
+    /// The smallest rectangle holding both.
+    pub fn union(&self, other: R) -> R {
+        R { l: self.l.min(other.l), t: self.t.min(other.t), r: self.r.max(other.r), b: self.b.max(other.b) }
     }
 }
 
@@ -85,7 +97,7 @@ impl Funnel {
     }
 }
 
-/// Funnel effect. `p` runs from 0 (the window where it is) to 1 (inside the icon).
+/// Genie effect. `p` runs from 0 (the window where it is) to 1 (inside the icon).
 ///
 /// The picture is cut into horizontal slices on whole screen rows. Slices are tall where the
 /// funnel's sides are nearly vertical and only a row or two high where the sides sweep
@@ -151,6 +163,22 @@ pub fn shrink(win: R, icon: R, p: f32) -> R {
     R { l: lerp(win.l, icon.l, e), t: lerp(win.t, icon.t, e), r: lerp(win.r, icon.r, e), b: lerp(win.b, icon.b, e) }
 }
 
+/// The genie's stand-in when there is no picture to cut into slices: one rectangle that
+/// keeps the genie's outline. Its foot reaches the icon first, the body is drawn out into a
+/// narrowing column, and the head is pulled down through it last.
+pub fn pour(win: R, icon: R, p: f32) -> R {
+    let p = clamp01(p);
+    // The foot reaches for the icon during the first half.
+    let reach = smooth(p / 0.55);
+    // The body narrows to the icon's width from almost the start to three quarters of the way.
+    let narrow = smooth((p - 0.04) / 0.74);
+    // The head stays put for a moment, then goes down through the column.
+    let pull = clamp01((p - 0.22) / 0.78).powf(1.7);
+    let bottom = lerp(win.b, icon.b, reach);
+    let top = lerp(win.t, icon.t, pull).min(bottom);
+    R { l: lerp(win.l, icon.l, narrow), t: top, r: lerp(win.r, icon.r, narrow), b: bottom }
+}
+
 /// Drop effect: the picture shrinks a little and slides straight down towards the icon.
 pub fn drop_down(win: R, icon: R, p: f32) -> R {
     let p = clamp01(p);
@@ -169,18 +197,25 @@ mod tests {
     const WIN: R = R { l: 300.0, t: 120.0, r: 1500.0, b: 900.0 };
     const ICON: R = R { l: 940.0, t: 1030.0, r: 973.0, b: 1063.0 };
 
+    fn close(a: R, b: R) -> bool {
+        (a.l - b.l).abs() < 1e-2 && (a.t - b.t).abs() < 1e-2 && (a.r - b.r).abs() < 1e-2 && (a.b - b.b).abs() < 1e-2
+    }
+
     #[test]
-    fn starts_as_the_window() {
+    fn every_effect_starts_as_the_window() {
         let mut s = Vec::new();
         funnel(WIN, ICON, 0.0, 240, &mut s);
         assert!((s[0].dst.t - WIN.t).abs() < 1e-3 && (s.last().unwrap().dst.b - WIN.b).abs() < 1e-3);
         assert!((s[0].src_top).abs() < 1e-6 && (s.last().unwrap().src_bottom - 1.0).abs() < 1e-6);
         assert!(s.iter().all(|x| (x.dst.l - WIN.l).abs() < 1e-3 && (x.dst.r - WIN.r).abs() < 1e-3));
         assert_eq!(shrink(WIN, ICON, 0.0), WIN);
+        assert_eq!(pour(WIN, ICON, 0.0), WIN);
+        assert!(close(drop_down(WIN, ICON, 0.0), WIN));
+        assert!((opacity(0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn ends_inside_the_icon() {
+    fn genie_ends_inside_the_icon() {
         let mut s = Vec::new();
         funnel(WIN, ICON, 1.0, 240, &mut s);
         assert!(s.is_empty(), "nothing is left to show once the picture is inside the icon");
@@ -190,13 +225,11 @@ mod tests {
             assert!(x.dst.t >= ICON.t - 1.0 && x.dst.b <= ICON.b + 1.0);
             assert!(x.dst.l >= ICON.l - 1.0 && x.dst.r <= ICON.r + 1.0);
         }
-        let end = shrink(WIN, ICON, 1.0);
-        assert!((end.l - ICON.l).abs() < 1e-3 && (end.b - ICON.b).abs() < 1e-3);
-        assert!(opacity(1.0) < 1e-3 && (opacity(0.0) - 1.0).abs() < 1e-6);
+        assert!(opacity(1.0) < 1e-3);
     }
 
     #[test]
-    fn slices_stay_stacked_and_inside_the_path() {
+    fn genie_slices_stay_stacked_and_inside_the_path() {
         let mut s = Vec::new();
         for step in 0..=200 {
             let p = step as f32 / 200.0;
@@ -218,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn moves_steadily_towards_the_icon() {
+    fn genie_moves_steadily_towards_the_icon() {
         // The top edge never moves back up, and the picture never grows wider at the bottom.
         let mut s = Vec::new();
         let mut last_top = f32::MIN;
@@ -237,17 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_starts_as_the_window_and_ends_on_the_icon() {
-        let start = drop_down(WIN, ICON, 0.0);
-        assert!((start.l - WIN.l).abs() < 1e-3 && (start.b - WIN.b).abs() < 1e-3);
-        let end = drop_down(WIN, ICON, 1.0);
-        let (cx, cy) = ((end.l + end.r) * 0.5, (end.t + end.b) * 0.5);
-        assert!((cx - (ICON.l + ICON.r) * 0.5).abs() < 1e-2 && (cy - (ICON.t + ICON.b) * 0.5).abs() < 1e-2);
-        assert!(end.w() < WIN.w() * 0.31);
-    }
-
-    #[test]
-    fn works_when_the_window_reaches_below_the_icon() {
+    fn genie_works_when_the_window_reaches_below_the_icon() {
         // A window that overlaps the dock area.
         let low = R { l: 100.0, t: 500.0, r: 900.0, b: 1075.0 };
         let mut s = Vec::new();
@@ -255,5 +278,35 @@ mod tests {
             funnel(low, ICON, step as f32 / 50.0, 240, &mut s);
             assert!(s.iter().all(|x| x.dst.b >= x.dst.t - 1e-3 && x.dst.l.is_finite() && x.dst.r.is_finite()));
         }
+    }
+
+    #[test]
+    fn shrink_and_pour_end_as_the_icon() {
+        assert!(close(shrink(WIN, ICON, 1.0), ICON));
+        assert!(close(pour(WIN, ICON, 1.0), ICON));
+    }
+
+    #[test]
+    fn pour_runs_steadily_into_the_icon() {
+        // The head never moves back up, the column never gets wider, and the picture never
+        // leaves the space between the window and the icon.
+        let space = WIN.union(ICON);
+        let mut last = pour(WIN, ICON, 0.0);
+        for step in 1..=200 {
+            let now = pour(WIN, ICON, step as f32 / 200.0);
+            assert!(now.t >= last.t - 1e-3, "head moved up at step {step}");
+            assert!(now.w() <= last.w() + 1e-3, "column got wider at step {step}");
+            assert!(now.b >= now.t && now.r >= now.l);
+            assert!(now.l >= space.l - 1e-3 && now.r <= space.r + 1e-3 && now.t >= space.t - 1e-3 && now.b <= space.b + 1e-3);
+            last = now;
+        }
+    }
+
+    #[test]
+    fn drop_ends_on_the_icon() {
+        let end = drop_down(WIN, ICON, 1.0);
+        let (cx, cy) = ((end.l + end.r) * 0.5, (end.t + end.b) * 0.5);
+        assert!((cx - (ICON.l + ICON.r) * 0.5).abs() < 1e-2 && (cy - (ICON.t + ICON.b) * 0.5).abs() < 1e-2);
+        assert!(end.w() < WIN.w() * 0.31);
     }
 }

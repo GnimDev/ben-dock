@@ -1,29 +1,42 @@
-//! The app launcher: a full-screen glass sheet with every installed app in a
-//! grid of pages. Type to search, scroll or use the arrow keys to change
-//! page, click an app to open it, click anywhere else or press Esc to leave.
+//! The app tray: a sheet of glass that grows up out of the dock's first
+//! button, holding every installed app in pages. Type to search, scroll or
+//! use the arrow keys to change page, click an app to open it, click outside
+//! or press Esc to leave.
+//!
+//! Nothing is read for it until it is first opened, and then only the icons
+//! of the page on show (see `shell::scan_apps`); a while after it is closed
+//! it lets them go again.
 
-use crate::dock::{self, Event};
-use crate::gfx::{color, Gfx};
-use crate::glass::{rgba, Glass, Palette, Pill, Popup, Sprite};
+use crate::app::{self, Event};
+use crate::gfx::Gfx;
 use crate::layout::Grid;
-use crate::shell::{AppEntry, IconPixels};
+use crate::motion::{Glide, Motion};
+use crate::scene::{Bead, Glass, Pill, Scene, Sprite, Stage};
+use crate::shell::{self, AppScan, Found, IconPixels};
 use crate::spring::Spring;
-use crate::text::{self, Line, UI_FONT};
+use crate::text::{self, glyph, Line, ICON_FONT, UI_FONT};
+use crate::theme::Theme;
 use crate::util::wide;
+use std::cell::Cell;
+use std::time::Instant;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::UI::Composition::CompositionDrawingSurface;
 
 const CLASS_NAME: &str = "BenLauncherWindow";
+const WM_MOUSELEAVE: u32 = 0x02A3;
 /// How many icons and names are painted per frame at most, so opening never stutters.
-const PAINTS_PER_FRAME: usize = 14;
+const PAINTS_PER_FRAME: usize = 12;
 
-/// What the launcher window reports to the dock.
+/// What the tray's window reports to the app.
 #[derive(Clone, Copy, Debug)]
 pub enum Input {
+    Move(i32, i32),
+    Leave,
     Click(i32, i32),
     /// Mouse wheel; positive = away from the user.
     Wheel(i32),
@@ -40,22 +53,38 @@ struct Tile {
     /// Lower-case name, for searching.
     key: String,
     target: String,
-    pixels: IconPixels,
+    /// The icon, read but not painted yet.
+    pixels: Option<IconPixels>,
+    /// The icon has been asked for.
+    asked: bool,
     icon: Option<Sprite>,
-    _surface: Option<CompositionDrawingSurface>,
+    surface: Option<CompositionDrawingSurface>,
     label: Option<Line>,
     shown: bool,
+    /// 0 = a stand-in tile, 1 = the app's own icon, fully there. It swells in as it arrives.
+    arrive: Spring,
 }
 
 pub struct Launcher {
     hwnd: HWND,
-    popup: Popup,
+    _stage: Stage,
+    glass: Glass,
+    /// The drop of light under the cursor.
+    hot: Bead,
+    hot_at: Glide,
+    search_box: Pill,
+    search_icon: Line,
+    search_text: Line,
+    dots: Vec<Pill>,
     tiles: Vec<Tile>,
     /// Indices into `tiles` that match the search, in display order.
     matches: Vec<usize>,
     query: String,
+    /// What a tile shows until its icon has been read.
+    blank: Option<CompositionDrawingSurface>,
     open: bool,
-    window_shown: bool,
+    /// The window is on screen (open, or shrinking away).
+    visible: bool,
     /// 0 = closed, 1 = fully open.
     show: Spring,
     /// Current page, as a position that glides to `page`.
@@ -65,21 +94,41 @@ pub struct Launcher {
     icon: f32,
     scale: f32,
     size: (f32, f32),
-    origin: (i32, i32),
-    dark: bool,
-    search_box: Pill,
-    search_text: Line,
-    highlight: Pill,
-    dots: Vec<Pill>,
+    /// Room around the glass inside the window, for its shadow.
+    margin: f32,
+    /// The point the sheet grows out of, in its own coordinates.
+    root: (f32, f32),
+    cursor: Option<(f32, f32)>,
     label_font: Option<IDWriteTextFormat>,
     search_font: Option<IDWriteTextFormat>,
+    icon_font: Option<IDWriteTextFormat>,
+    /// When it was last closed (its icons are let go a while later).
+    closed: Option<Instant>,
+}
+
+thread_local! {
+    static TRACKING: Cell<bool> = const { Cell::new(false) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let send = |input: Input| dock::post(Event::Launcher(input));
+    let send = |input: Input| app::post(Event::Launcher(input));
+    let (x, y) = ((lparam.0 & 0xffff) as i16 as i32, ((lparam.0 >> 16) & 0xffff) as i16 as i32);
     match msg {
+        WM_MOUSEMOVE => {
+            if !TRACKING.get() {
+                let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                TRACKING.set(unsafe { TrackMouseEvent(&mut track) }.is_ok());
+            }
+            send(Input::Move(x, y));
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            TRACKING.set(false);
+            send(Input::Leave);
+            return LRESULT(0);
+        }
         WM_LBUTTONUP => {
-            send(Input::Click((lparam.0 & 0xffff) as i16 as i32, ((lparam.0 >> 16) & 0xffff) as i16 as i32));
+            send(Input::Click(x, y));
             return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
@@ -101,7 +150,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(0);
         }
         WM_CLOSE => {
-            // Alt+F4 on the launcher closes the launcher, not the dock.
+            // Alt+F4 on the tray closes the tray, not the app.
             send(Input::Lost);
             return LRESULT(0);
         }
@@ -111,7 +160,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 impl Launcher {
-    pub fn new(glass: &Glass, blur_sigma: Option<f32>, palette: &Palette) -> Result<Self> {
+    pub fn new(scene: &Scene, theme: &Theme, motion: &Motion) -> Result<Self> {
         unsafe {
             let instance: HINSTANCE = GetModuleHandleW(None)?.into();
             let class_name = wide(CLASS_NAME);
@@ -139,33 +188,44 @@ impl Launcher {
                 Some(instance),
                 None,
             )?;
-            let popup = glass.popup(hwnd, blur_sigma, palette)?;
-            let highlight = glass.pill_in(popup.content()?)?;
-            let search_box = glass.pill_in(popup.content()?)?;
-            let search_text = Line::new(glass.sprite_in(popup.content()?)?);
+            let stage = scene.stage(hwnd)?;
+            let glass = scene.glass_in(&stage.content()?, &theme.sheet)?;
+            // Everything stays inside the sheet's shape: pages slide in and out under its edge.
+            let inside = glass.inner()?;
+            let hot = scene.bead_in(&inside)?;
+            let search_box = scene.pill_in(&inside)?;
+            let search_icon = Line::new_in(scene, &inside)?;
+            let search_text = Line::new_in(scene, &inside)?;
             Ok(Launcher {
                 hwnd,
-                popup,
+                _stage: stage,
+                glass,
+                hot,
+                hot_at: Glide::new(motion),
+                search_box,
+                search_icon,
+                search_text,
+                dots: Vec::new(),
                 tiles: Vec::new(),
                 matches: Vec::new(),
                 query: String::new(),
+                blank: None,
                 open: false,
-                window_shown: false,
-                show: Spring::new(0.0, 20.0, 1.0),
-                scroll: Spring::new(0.0, 16.0, 0.9),
+                visible: false,
+                show: Spring::with(0.0, motion.large()),
+                scroll: Spring::with(0.0, motion.medium()),
                 page: 0,
                 grid: Grid { cols: 1, rows: 1, cell_w: 1.0, cell_h: 1.0, x: 0.0, y: 0.0 },
-                icon: 72.0,
+                icon: 0.0,
                 scale: 1.0,
                 size: (1.0, 1.0),
-                origin: (0, 0),
-                dark: true,
-                search_box,
-                search_text,
-                highlight,
-                dots: Vec::new(),
+                margin: 0.0,
+                root: (0.0, 0.0),
+                cursor: None,
                 label_font: None,
                 search_font: None,
+                icon_font: None,
+                closed: None,
             })
         }
     }
@@ -174,40 +234,75 @@ impl Launcher {
         self.open
     }
 
-    /// True while the launcher is on screen (open, or still fading out).
-    pub fn is_visible(&self) -> bool {
-        self.window_shown
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.glass.set_material(&theme.sheet);
+        self.forget_text();
     }
 
-    pub fn set_palette(&self, palette: &Palette) {
-        let _ = self.popup.set_palette(palette);
-    }
-
-    /// Forgets everything painted (after the GPU device was reset); it is painted again when shown.
-    pub fn forget(&mut self) {
+    /// Forgets painted names (they are painted for one size and one theme).
+    fn forget_text(&mut self) {
+        self.label_font = None;
+        self.search_font = None;
+        self.icon_font = None;
         for tile in &mut self.tiles {
-            tile.icon = None;
-            tile._surface = None;
             tile.label = None;
         }
         self.search_text.forget();
+        self.search_icon.forget();
     }
 
-    /// Adds apps as the background scan finds them, keeping the list in alphabetical order.
-    pub fn absorb(&mut self, entries: impl Iterator<Item = AppEntry>) {
-        let mut added = false;
-        for entry in entries {
-            let key = entry.name.to_lowercase();
-            if self.tiles.iter().any(|t| t.target == entry.target) {
-                continue;
+    /// Lets go of every icon and name that was painted; they are read again when next shown.
+    /// Returns true if there was anything to let go.
+    pub fn release(&mut self) -> bool {
+        let had = self.blank.is_some() || self.tiles.iter().any(|t| t.icon.is_some() || t.pixels.is_some());
+        for tile in &mut self.tiles {
+            tile.icon = None;
+            tile.surface = None;
+            tile.label = None;
+            tile.pixels = None;
+            tile.asked = false;
+            tile.arrive.snap(0.0);
+        }
+        self.blank = None;
+        self.closed = None;
+        had
+    }
+
+    /// Seconds since the tray was closed, if it has been open and still holds its icons.
+    pub fn idle_for(&self) -> Option<f32> {
+        if self.visible {
+            return None;
+        }
+        self.closed.map(|t| t.elapsed().as_secs_f32())
+    }
+
+    /// Takes in what the background reader found: apps (kept in alphabetical order) and icons.
+    /// Returns true if anything arrived.
+    pub fn absorb(&mut self, found: impl Iterator<Item = Found>, motion: &Motion) -> bool {
+        let (mut added, mut any) = (false, false);
+        for item in found {
+            any = true;
+            match item {
+                Found::App { name, target } => {
+                    if self.tiles.iter().any(|t| t.target == target) {
+                        continue;
+                    }
+                    let key = name.to_lowercase();
+                    let at = self.tiles.partition_point(|t| t.key <= key);
+                    self.tiles.insert(at, Tile { name, key, target, pixels: None, asked: false, icon: None, surface: None, label: None, shown: false, arrive: Spring::with(0.0, motion.small()) });
+                    added = true;
+                }
+                Found::Icon { target, pixels } => {
+                    if let Some(tile) = self.tiles.iter_mut().find(|t| t.target == target) {
+                        tile.pixels = Some(pixels);
+                    }
+                }
             }
-            let at = self.tiles.partition_point(|t| t.key <= key);
-            self.tiles.insert(at, Tile { name: entry.name, key, target: entry.target, pixels: entry.icon, icon: None, _surface: None, label: None, shown: false });
-            added = true;
         }
         if added {
             self.search();
         }
+        any
     }
 
     /// Recomputes which apps match the search text.
@@ -219,38 +314,59 @@ impl Launcher {
         self.scroll.set(self.page as f32);
     }
 
-    /// Opens the launcher over `monitor`. `icon` is the icon size in logical pixels.
-    pub fn open(&mut self, monitor: RECT, scale: f32, icon: f32, dark: bool) {
-        let (w, h) = ((monitor.right - monitor.left) as f32, (monitor.bottom - monitor.top) as f32);
+    /// Opens the tray on `monitor`, its bottom edge at screen row `bottom`, growing out of
+    /// screen column `from_x`. `icon` is the icon size in logical pixels.
+    pub fn open(&mut self, scene: &Scene, theme: &Theme, motion: &Motion, monitor: RECT, scale: f32, icon: f32, bottom: i32, from_x: i32) -> Result<()> {
+        let (mw, mh) = ((monitor.right - monitor.left) as f32, (monitor.bottom - monitor.top) as f32);
         let px = |v: f32| (v * scale).round();
-        if (self.scale, self.icon, self.dark) != (scale, px(icon), dark) {
-            // Names are painted for one size and one theme.
-            self.label_font = None;
-            self.search_font = None;
-            for tile in &mut self.tiles {
-                tile.label = None;
-            }
-            self.search_text.forget();
+        if self.scale != scale {
+            self.forget_text();
         }
-        (self.scale, self.icon, self.dark, self.size, self.origin) = (scale, px(icon), dark, (w, h), (monitor.left, monitor.top));
-        // Room above for the search field, below for the page dots and the dock.
-        self.grid = Grid::fit(w, h, self.icon + px(74.0), self.icon + px(62.0), px(150.0), px(170.0));
+        if self.icon != px(icon) {
+            // The icons that were read are the wrong size.
+            self.release();
+        }
+        (self.scale, self.icon) = (scale, px(icon));
+        let (pad, head, foot) = (px(22.0), px(72.0), px(36.0));
+        let (cell_w, cell_h) = (self.icon + px(46.0), self.icon + px(50.0));
+        let room = ((bottom - monitor.top) as f32 - px(48.0) - head - foot).min(mh * 0.64);
+        self.grid = Grid::fit(mw * 0.68 - 2.0 * pad, room, cell_w, cell_h, pad, head);
+        let (w, h) = (self.grid.width() + 2.0 * pad, head + self.grid.height() + foot);
+        self.size = (w, h);
+        let left = monitor.left + ((mw - w) * 0.5).round() as i32;
+        let top = bottom - h as i32;
+        self.root = (((from_x - left) as f32).clamp(px(40.0), w - px(40.0)), h);
+        let margin = theme.sheet.shadow_reach + px(10.0);
+        self.margin = margin;
+        // Blur and shadow are sized for the screen it opens on.
+        self.glass.set_material(&theme.sheet);
+        self.glass.set_rect(scene, margin, margin, w, h, px(26.0))?;
+
         self.query.clear();
         self.page = 0;
-        self.scroll = Spring::new(0.0, 16.0, 0.9);
+        self.scroll = Spring::with(0.0, motion.medium());
         self.search();
         self.open = true;
-        self.show.set(1.0);
-        unsafe {
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), monitor.left, monitor.top, w as i32, h as i32, SWP_SHOWWINDOW);
-            let _ = SetForegroundWindow(self.hwnd);
+        self.cursor = None;
+        if !self.visible {
+            self.show.snap(0.0);
         }
-        self.window_shown = true;
+        self.show.set(1.0);
+        self.apply()?;
+        let m = margin as i32;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), left - m, top - m, w as i32 + 2 * m, h as i32 + 2 * m, SWP_SHOWWINDOW);
+        }
+        shell::activate(self.hwnd);
+        self.visible = true;
+        Ok(())
     }
 
     pub fn close(&mut self) {
-        self.open = false;
-        self.show.set(0.0);
+        if self.open {
+            self.open = false;
+            self.show.set(0.0);
+        }
     }
 
     fn turn_page(&mut self, by: i32) {
@@ -265,8 +381,10 @@ impl Launcher {
             return None;
         }
         match input {
+            Input::Move(x, y) => self.cursor = Some((x as f32 - self.margin, y as f32 - self.margin)),
+            Input::Leave => self.cursor = None,
             Input::Click(x, y) => {
-                let (x, y) = (x as f32, y as f32);
+                let (x, y) = (x as f32 - self.margin, y as f32 - self.margin);
                 if let Some(target) = self.tile_at(x, y).map(|i| self.tiles[i].target.clone()) {
                     self.close();
                     return Some(target);
@@ -274,7 +392,8 @@ impl Launcher {
                 if let Some(page) = self.dot_at(x, y) {
                     self.page = page;
                     self.scroll.set(page as f32);
-                } else if !self.in_search_box(x, y) {
+                } else if x < 0.0 || y < 0.0 || x >= self.size.0 || y >= self.size.1 {
+                    // On the shadow around the sheet: the same as clicking outside.
                     self.close();
                 }
             }
@@ -322,7 +441,7 @@ impl Launcher {
         None
     }
 
-    /// The app tile under a point (window pixels), on the current page.
+    /// The app tile under a point (sheet pixels), on the current page.
     fn tile_at(&self, x: f32, y: f32) -> Option<usize> {
         let cell = self.grid.cell_at(x, y)?;
         self.matches.get(self.page * self.grid.per_page() + cell).copied()
@@ -330,20 +449,15 @@ impl Launcher {
 
     fn search_rect(&self) -> (f32, f32, f32, f32) {
         let s = self.scale;
-        let (w, h) = (300.0 * s, 36.0 * s);
-        (((self.size.0 - w) * 0.5).round(), (64.0 * s).round(), w, h)
-    }
-
-    fn in_search_box(&self, x: f32, y: f32) -> bool {
-        let (bx, by, bw, bh) = self.search_rect();
-        x >= bx && x < bx + bw && y >= by && y < by + bh
+        let (w, h) = ((300.0 * s).round().min(self.size.0 - 40.0 * s), (36.0 * s).round());
+        (((self.size.0 - w) * 0.5).round(), (20.0 * s).round(), w, h)
     }
 
     fn dot_rect(&self, index: usize, count: usize) -> (f32, f32, f32) {
         let s = self.scale;
-        let spacing = 18.0 * s;
+        let spacing = 16.0 * s;
         let x = self.size.0 * 0.5 + (index as f32 - (count as f32 - 1.0) * 0.5) * spacing;
-        (x, self.grid.y + self.grid.rows as f32 * self.grid.cell_h + 26.0 * s, 4.0 * s)
+        (x, self.grid.y + self.grid.height() + 16.0 * s, 3.5 * s)
     }
 
     fn dot_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -354,54 +468,64 @@ impl Launcher {
         })
     }
 
-    /// Advances the open / close and page-turn motion and lays everything out. Returns true
-    /// while the launcher is on screen.
-    pub fn update(&mut self, glass: &Glass, gfx: &Gfx, cursor: POINT, dt: f32) -> Result<bool> {
-        if !self.window_shown {
+    fn apply(&mut self) -> Result<()> {
+        let shown = self.show.pos;
+        // It grows out of the button it belongs to.
+        let grow = 0.55 + 0.45 * shown.clamp(0.0, 1.1);
+        self.glass.set_scale(grow, grow, self.root.0, self.root.1)?;
+        self.glass.set_opacity((shown * 1.6).clamp(0.0, 1.0))
+    }
+
+    /// Advances the open / close and page-turn motion and lays everything out. `scan` is
+    /// where missing icons are asked for. Returns true while something is still moving.
+    pub fn update(&mut self, scene: &Scene, gfx: &Gfx, theme: &Theme, motion: &Motion, scan: Option<&AppScan>, dt: f32) -> Result<bool> {
+        if !self.visible {
             return Ok(false);
         }
+        self.show.tune(if self.open { motion.large() } else { motion.calm() });
+        self.scroll.tune(motion.medium());
         self.show.step(dt);
         self.scroll.step(dt);
-        if !self.open && self.show.pos < 0.01 {
-            // Faded out: take the window away, and drop the search.
+        if !self.open && self.show.pos < 0.02 {
+            // Shrunk away: take the window off the screen.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
-            self.window_shown = false;
-            self.popup.set_opacity(0.0)?;
+            self.visible = false;
+            self.show.snap(0.0);
+            self.closed = Some(Instant::now());
             return Ok(false);
         }
-        let (s, (w, h)) = (self.scale, self.size);
-        let dark = self.dark;
-        let shown = self.show.pos.clamp(0.0, 1.0);
-        self.popup.set_frame(-1.0, -1.0, w + 2.0, h + 2.0, 0.0)?;
-        self.popup.set_opacity(shown)?;
-        // The grid settles into place from slightly enlarged.
-        self.popup.set_content_scale(1.0 + 0.1 * (1.0 - shown), w * 0.5 + 1.0, h * 0.5 + 1.0)?;
+        self.apply()?;
+        let (s, (w, _)) = (self.scale, self.size);
+        let content = self.glass.inner()?;
 
         if self.label_font.is_none() {
-            self.label_font = Some(text::format(gfx, UI_FONT, (12.5 * s).round(), DWRITE_FONT_WEIGHT_NORMAL)?);
-            self.search_font = Some(text::format(gfx, UI_FONT, (14.5 * s).round(), DWRITE_FONT_WEIGHT_NORMAL)?);
+            self.label_font = Some(text::format(gfx, UI_FONT, (12.0 * s).round(), DWRITE_FONT_WEIGHT_NORMAL)?);
+            self.search_font = Some(text::format(gfx, UI_FONT, (14.0 * s).round(), DWRITE_FONT_WEIGHT_NORMAL)?);
+            self.icon_font = Some(text::format(gfx, ICON_FONT, (13.0 * s).round(), DWRITE_FONT_WEIGHT_NORMAL)?);
         }
         let label_font = self.label_font.clone().unwrap();
-        let fg = if dark { color(1.0, 1.0, 1.0, 0.95) } else { color(0.0, 0.0, 0.0, 0.88) };
-        let dim = if dark { color(1.0, 1.0, 1.0, 0.5) } else { color(0.0, 0.0, 0.0, 0.5) };
-        let tone = if dark { 1.0 } else { 0.0 };
+        let (fg, dim) = (theme.text, theme.text_dim);
 
-        // Search field.
+        // Search field: a magnifying glass, then what was typed.
         let (bx, by, bw, bh) = self.search_rect();
         self.search_box.place(bx, by, bw, bh, bh * 0.5)?;
-        self.search_box.set_color(rgba(tone, tone, tone, 0.14))?;
+        self.search_box.set_color(theme.track)?;
+        self.search_icon.set(scene, gfx, self.icon_font.as_ref().unwrap(), &glyph(0xE721), dim, None)?;
+        let iy = by + ((bh - self.search_icon.h) * 0.5).round();
+        self.search_icon.place(bx + (13.0 * s).round(), iy)?;
         let placeholder = self.query.is_empty();
-        self.search_text.set(glass, gfx, self.search_font.as_ref().unwrap(), if placeholder { "Tìm ứng dụng" } else { &self.query }, if placeholder { dim } else { fg }, Some(bw - 32.0 * s))?;
-        let (tw, th) = (self.search_text.w, self.search_text.h);
-        self.search_text.place(bx + (bw - tw) * 0.5, by + (bh - th) * 0.5)?;
+        self.search_text.set(scene, gfx, self.search_font.as_ref().unwrap(), if placeholder { "Tìm ứng dụng" } else { &self.query }, if placeholder { dim } else { fg }, Some(bw - 60.0 * s))?;
+        let ty = by + ((bh - self.search_text.h) * 0.5).round();
+        self.search_text.place(bx + (36.0 * s).round(), ty)?;
 
         // Tiles: the current page and, while a page turn is in motion, its neighbours.
         let per_page = self.grid.per_page();
         let icon = self.icon;
         let cell_w = self.grid.cell_w;
         let mut paints = 0;
+        let mut arriving = false;
         for tile in &mut self.tiles {
             tile.shown = false;
         }
@@ -412,36 +536,55 @@ impl Launcher {
                 continue;
             }
             let tile = &mut self.tiles[index];
-            // Paint the icon and the name the first time they are needed, a few per frame.
+            // A stand-in at first; the app's own icon swells in when it has been read.
             if tile.icon.is_none() {
-                if paints >= PAINTS_PER_FRAME {
-                    continue;
+                if self.blank.is_none() {
+                    self.blank = Some(scene.surface_from_pixels(&shell::placeholder_icon(icon as u32))?);
                 }
-                let surface = glass.surface_from_pixels(&tile.pixels)?;
-                let sprite = glass.sprite_in(self.popup.content()?)?;
-                sprite.set_surface(&surface)?;
+                let sprite = scene.sprite_in(&content)?;
+                sprite.set_surface(self.blank.as_ref().unwrap())?;
                 tile.icon = Some(sprite);
-                tile._surface = Some(surface);
-                paints += 1;
             }
-            if tile.label.is_none() {
-                if paints >= PAINTS_PER_FRAME {
-                    continue;
+            if tile.surface.is_none() {
+                match tile.pixels.take() {
+                    Some(pixels) if paints < PAINTS_PER_FRAME => {
+                        paints += 1;
+                        let surface = scene.surface_from_pixels(&pixels)?;
+                        tile.icon.as_ref().unwrap().set_surface(&surface)?;
+                        tile.surface = Some(surface);
+                        tile.arrive.snap(0.0);
+                        tile.arrive.set(1.0);
+                    }
+                    Some(pixels) => tile.pixels = Some(pixels),
+                    None if !tile.asked => {
+                        if let Some(scan) = scan {
+                            scan.want_icon(&tile.target, icon as u32);
+                            tile.asked = true;
+                        }
+                    }
+                    None => {}
                 }
+            }
+            if tile.label.is_none() && paints < PAINTS_PER_FRAME {
                 paints += 1;
-                let mut line = Line::new(glass.sprite_in(self.popup.content()?)?);
-                line.set(glass, gfx, &label_font, &tile.name, fg, Some(cell_w - 14.0 * s))?;
+                let mut line = Line::new_in(scene, &content)?;
+                line.set(scene, gfx, &label_font, &tile.name, fg, Some(cell_w - 12.0 * s))?;
                 tile.label = Some(line);
             }
+            tile.arrive.tune(motion.small());
+            tile.arrive.step(dt);
+            arriving |= !tile.arrive.settled(1e-3);
             let (cx, cy) = self.grid.cell_center(position % per_page);
             let x = cx + away * w;
-            let top = cy - (icon + 30.0 * s) * 0.5;
+            let top = cy - (icon + 26.0 * s) * 0.5;
+            let size = if tile.surface.is_some() { icon * (0.7 + 0.3 * tile.arrive.pos.clamp(0.0, 1.15)) } else { icon };
             let sprite = tile.icon.as_mut().unwrap();
-            sprite.place((x - icon * 0.5).round(), top.round(), icon, icon)?;
-            sprite.set_opacity(1.0)?;
-            let label = tile.label.as_mut().unwrap();
-            label.place(x - label.w * 0.5, top + icon + 9.0 * s)?;
-            label.set_opacity(1.0)?;
+            sprite.place((x - size * 0.5).round(), (top + (icon - size) * 0.5).round(), size, size)?;
+            sprite.set_opacity(if tile.surface.is_some() { 1.0 } else { 0.55 })?;
+            if let Some(label) = tile.label.as_mut() {
+                label.place(x - label.w * 0.5, top + icon + 8.0 * s)?;
+                label.set_opacity(1.0)?;
+            }
             tile.shown = true;
         }
         for tile in &mut self.tiles {
@@ -455,36 +598,41 @@ impl Launcher {
             }
         }
 
-        // Highlight under the cursor.
-        let (mx, my) = ((cursor.x - self.origin.0) as f32, (cursor.y - self.origin.1) as f32);
-        match self.grid.cell_at(mx, my).filter(|&c| self.matches.get(self.page * per_page + c).is_some()) {
-            Some(cell) if self.open => {
-                let (cx, cy) = self.grid.cell_center(cell);
-                let (hw, hh) = (self.grid.cell_w - 10.0 * s, self.grid.cell_h - 8.0 * s);
-                self.highlight.place(cx - hw * 0.5, cy - hh * 0.5, hw, hh, 14.0 * s)?;
-                self.highlight.set_color(rgba(tone, tone, tone, 0.12))?;
-                self.highlight.set_opacity(1.0)?;
-            }
-            _ => self.highlight.set_opacity(0.0)?,
-        }
+        // The drop of light under the cursor.
+        let hot = self.cursor.filter(|_| self.open).and_then(|(mx, my)| self.grid.cell_at(mx, my)).filter(|&cell| self.matches.get(self.page * per_page + cell).is_some());
+        self.hot_at.tune(motion);
+        self.hot_at.aim(hot.map(|cell| {
+            let (cx, cy) = self.grid.cell_center(cell);
+            let (hw, hh) = (self.grid.cell_w - 8.0 * s, self.grid.cell_h - 6.0 * s);
+            (cx - hw * 0.5, cy - hh * 0.5, hw, hh)
+        }));
+        self.hot_at.step(dt);
+        let shape = self.hot_at.shape(motion.squash());
+        self.hot.place(shape.x, shape.y, shape.w, shape.h, (16.0 * s).round())?;
+        let (bead_top, bead_bottom, bead_edge) = theme.bead;
+        self.hot.set_colors(bead_top, bead_bottom, bead_edge)?;
+        self.hot.set_opacity(shape.alpha)?;
 
         // Page dots.
         let pages = self.grid.pages(self.matches.len());
         while self.dots.len() < pages.min(24) {
-            self.dots.push(glass.pill_in(self.popup.content()?)?);
+            self.dots.push(scene.pill_in(&content)?);
         }
         for i in 0..self.dots.len() {
             if i < pages && pages > 1 {
                 let (cx, cy, r) = self.dot_rect(i, pages);
+                // The dot of the page on show is a short dash.
+                let near = (1.0 - (i as f32 - self.scroll.pos).abs()).clamp(0.0, 1.0);
+                let half = r + near * r * 1.6;
                 let dot = &mut self.dots[i];
-                dot.place(cx - r, cy - r, r * 2.0, r * 2.0, r)?;
-                dot.set_color(rgba(tone, tone, tone, if i == self.page { 0.9 } else { 0.32 }))?;
+                dot.place(cx - half, cy - r, half * 2.0, r * 2.0, r)?;
+                dot.set_color(theme.tone(0.30 + 0.6 * near))?;
                 dot.set_opacity(1.0)?;
             } else {
                 self.dots[i].set_opacity(0.0)?;
             }
         }
-        Ok(true)
+        Ok(arriving || paints > 0 || !self.show.settled(1e-3) || !self.scroll.settled(1e-3) || !self.hot_at.settled())
     }
 }
 

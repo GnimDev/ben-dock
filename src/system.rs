@@ -1,22 +1,135 @@
 //! Windows settings the dock reads or changes: theme, accent colour,
 //! start-with-Windows, and the taskbar.
 
-use crate::util::{data_dir, wide};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::*;
+use crate::util::{data_dir, from_wide, wide};
 use std::time::Instant;
+use windows::core::{implement, PCWSTR};
+use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
+use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA};
 use windows::Win32::Networking::NetworkListManager::{INetworkListManager, NetworkListManager};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+use windows::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, SETPROCESSWORKINGSETSIZEEX_FLAGS};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SetSuspendState, SYSTEM_POWER_STATUS};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::System::Registry::*;
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT};
-use windows::Win32::System::Registry::*;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessInformation, ProcessMemoryPriority, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+// ------------------------------------------------------------------ display
+
+/// A screen.
+#[derive(Clone, Copy, Debug)]
+pub struct Monitor {
+    /// Windows' handle for it, as a number.
+    pub handle: isize,
+    pub rect: RECT,
+    pub work: RECT,
+    pub dpi: u32,
+    pub primary: bool,
+}
+
+impl Monitor {
+    /// Physical pixels per logical pixel.
+    pub fn scale(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    pub fn width(&self) -> i32 {
+        self.rect.right - self.rect.left
+    }
+}
+
+unsafe fn describe(handle: HMONITOR) -> Monitor {
+    unsafe {
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(handle, &mut info);
+        let (mut dx, mut dy) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+        // Flag 1 = this is the primary monitor.
+        Monitor { handle: handle.0 as isize, rect: info.rcMonitor, work: info.rcWork, dpi: dx.max(48), primary: info.dwFlags & 1 != 0 }
+    }
+}
+
+pub fn primary_monitor() -> Monitor {
+    unsafe { describe(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)) }
+}
+
+/// Every screen: the primary one first, then the others from left to right.
+pub fn monitors() -> Vec<Monitor> {
+    unsafe extern "system" fn each(handle: HMONITOR, _dc: HDC, _rect: *mut RECT, data: LPARAM) -> windows::core::BOOL {
+        let list = unsafe { &mut *(data.0 as *mut Vec<Monitor>) };
+        list.push(unsafe { describe(handle) });
+        windows::core::BOOL(1)
+    }
+    let mut list: Vec<Monitor> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut list as *mut _ as isize));
+    }
+    if list.is_empty() {
+        list.push(primary_monitor());
+    }
+    list.sort_by_key(|m| (!m.primary, m.rect.left, m.rect.top));
+    list
+}
+
+/// True when "Animation effects" is switched off in Windows' accessibility settings: then
+/// nothing here bounces or stretches either.
+pub fn reduce_motion() -> bool {
+    let mut on = windows::core::BOOL(1);
+    let read = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    read.is_ok() && !on.as_bool()
+}
+
+// ------------------------------------------------------------------- memory
+
+/// How much memory the app is using, in megabytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryUse {
+    /// What is in RAM right now (what Task Manager's "Memory" is about).
+    pub in_ram: f32,
+    /// What the app has asked for and nothing else can use, in RAM or paged out.
+    pub private: f32,
+}
+
+pub fn memory_use() -> Option<MemoryUse> {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS, counters.cb) }.ok()?;
+    const MB: f32 = 1024.0 * 1024.0;
+    Some(MemoryUse { in_ram: counters.WorkingSetSize as f32 / MB, private: counters.PrivateUsage as f32 / MB })
+}
+
+/// Hands back to Windows every page the app is not using this instant. Pages it needs again
+/// come back on their own, at the price of a moment's delay the first time, so this is done
+/// once the app has been at rest for a while, not while it is busy.
+pub fn release_memory() {
+    if let Err(e) = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, SETPROCESSWORKINGSETSIZEEX_FLAGS(0)) } {
+        crate::log!("could not release memory: {e}");
+    }
+}
+
+/// Tells Windows never to let the app keep more than `megabytes` in RAM, whatever it does:
+/// past that, Windows pages the oldest parts out instead. A safety net, not a diet. Also
+/// marks the app's memory as the first to give up when the machine runs short.
+pub fn limit_memory(megabytes: u32) {
+    unsafe {
+        let process = GetCurrentProcess();
+        if megabytes > 0 {
+            let most = (megabytes as usize).max(48) * 1024 * 1024;
+            if let Err(e) = SetProcessWorkingSetSizeEx(process, 4 * 1024 * 1024, most, QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE) {
+                crate::log!("could not set the {megabytes} MB memory limit: {e}");
+            }
+        }
+        let priority = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY_LOW };
+        let _ = SetProcessInformation(process, ProcessMemoryPriority, &priority as *const _ as *const _, std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32);
+    }
+}
 
 fn read_dword(subkey: &str, value: &str) -> Option<u32> {
     let (subkey, value) = (wide(subkey), wide(value));
@@ -263,6 +376,12 @@ impl AppBar {
     }
 }
 
+impl Drop for AppBar {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 // -------------------------------------------------------- window animations
 
 fn animation_file() -> std::path::PathBuf {
@@ -271,34 +390,28 @@ fn animation_file() -> std::path::PathBuf {
 
 fn set_minimize_animation(on: bool) {
     let mut info = ANIMATIONINFO { cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32, iMinAnimate: on as i32 };
-    // SPIF_SENDCHANGE without "update ini file": the change lasts for this sign-in session only,
-    // so even in the worst case a sign-out brings the user's own setting back.
+    // SPIF_SENDCHANGE without "update ini file": the change is for this sign-in session only; the
+    // user's own saved setting is never written.
     let r = unsafe { SystemParametersInfoW(SPI_SETANIMATION, info.cbSize, Some(&mut info as *mut _ as *mut _), SPIF_SENDCHANGE) };
     if let Err(e) = r {
         crate::log!("could not change the minimise animation setting: {e}");
     }
 }
 
-/// Turns off Windows' own minimise / restore animation, so that it does not play on top of
-/// the dock's "window flies into its icon" effect. Remembered in `animation.state` and undone
-/// by `restore_window_animations`.
-pub fn disable_window_animations() {
-    let mut info = ANIMATIONINFO { cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32, iMinAnimate: 0 };
-    let read = unsafe { SystemParametersInfoW(SPI_GETANIMATION, info.cbSize, Some(&mut info as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
-    if read.is_err() || info.iMinAnimate == 0 {
-        // Already off (by the user, or by an earlier run that is recorded in the file).
-        return;
-    }
-    if std::fs::write(animation_file(), "1").is_ok() {
-        set_minimize_animation(false);
-    }
-}
-
+/// Versions before 0.2 switched Windows' own minimise animation off while they ran, and noted
+/// it in `animation.state`. This puts it back if such a run was stopped without doing so.
 pub fn restore_window_animations() {
     if animation_file().exists() {
         set_minimize_animation(true);
         let _ = std::fs::remove_file(animation_file());
     }
+}
+
+/// True if Windows animates windows as they are minimised and restored (a setting of the user's).
+pub fn window_animations_on() -> bool {
+    let mut info = ANIMATIONINFO { cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32, iMinAnimate: 0 };
+    let read = unsafe { SystemParametersInfoW(SPI_GETANIMATION, info.cbSize, Some(&mut info as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    read.is_ok() && info.iMinAnimate != 0
 }
 
 // ------------------------------------------------------------ status readers
@@ -313,10 +426,34 @@ pub struct Status {
     pub online: bool,
 }
 
+/// Tells the app's window the moment the volume changes, so it does not have to keep asking.
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolumeWatch {
+    window: isize,
+    message: u32,
+}
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeWatch_Impl {
+    fn OnNotify(&self, _data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        // This runs on one of Windows' own threads: only pass the news on.
+        unsafe {
+            let _ = PostMessageW(Some(HWND(self.window as *mut _)), self.message, WPARAM(0), LPARAM(0));
+        }
+        Ok(())
+    }
+}
+
 /// Reads battery, volume and network state. The sound device and the network manager are
 /// looked up once and kept; if a call on them fails they are looked up again next time.
 pub struct StatusReader {
+    devices: Option<IMMDeviceEnumerator>,
     volume: Option<IAudioEndpointVolume>,
+    /// Identity of the device `volume` belongs to, and when it was last checked to still be the default.
+    device: String,
+    device_checked: Option<Instant>,
+    /// The window to tell about volume changes, and the message to send it.
+    notify: Option<(isize, u32)>,
+    watch: Option<IAudioEndpointVolumeCallback>,
     network: Option<INetworkListManager>,
     online: bool,
     network_read: Option<Instant>,
@@ -324,26 +461,73 @@ pub struct StatusReader {
 
 impl StatusReader {
     pub fn new() -> Self {
-        Self { volume: None, network: None, online: true, network_read: None }
+        Self { devices: None, volume: None, device: String::new(), device_checked: None, notify: None, watch: None, network: None, online: true, network_read: None }
+    }
+
+    /// From now on `window` gets `message` whenever the volume or mute changes.
+    pub fn watch_volume(&mut self, window: HWND, message: u32) {
+        self.notify = Some((window.0 as isize, message));
+        self.drop_volume();
     }
 
     pub fn read(&mut self) -> Status {
         Status { battery: battery(), volume: self.read_volume(), online: self.read_online() }
     }
 
+    fn drop_volume(&mut self) {
+        if let (Some(endpoint), Some(watch)) = (self.volume.take(), self.watch.take()) {
+            unsafe {
+                let _ = endpoint.UnregisterControlChangeNotify(&watch);
+            }
+        }
+        self.device_checked = None;
+    }
+
+    /// The identity of the speaker Windows currently plays through.
+    unsafe fn default_speaker(&mut self) -> Option<(windows::Win32::Media::Audio::IMMDevice, String)> {
+        unsafe {
+            if self.devices.is_none() {
+                self.devices = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok();
+            }
+            let speaker = self.devices.as_ref()?.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            let id = speaker.GetId().ok()?;
+            let name = from_wide(id.as_wide());
+            CoTaskMemFree(Some(id.0 as *const _));
+            Some((speaker, name))
+        }
+    }
+
     fn read_volume(&mut self) -> Option<(f32, bool)> {
         unsafe {
-            if self.volume.is_none() {
-                let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-                let speaker = devices.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
-                self.volume = speaker.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+            // The user may switch to headphones or another output at any time: every few
+            // seconds make sure the device being read is still the one in use.
+            let stale = self.device_checked.map(|t| t.elapsed().as_secs_f32() > 4.0).unwrap_or(true);
+            if self.volume.is_none() || stale {
+                self.device_checked = Some(Instant::now());
+                match self.default_speaker() {
+                    Some((speaker, id)) => {
+                        if self.volume.is_none() || id != self.device {
+                            self.drop_volume();
+                            self.device_checked = Some(Instant::now());
+                            self.device = id;
+                            self.volume = speaker.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+                            if let (Some(endpoint), Some((window, message))) = (self.volume.as_ref(), self.notify) {
+                                let watch: IAudioEndpointVolumeCallback = VolumeWatch { window, message }.into();
+                                if endpoint.RegisterControlChangeNotify(&watch).is_ok() {
+                                    self.watch = Some(watch);
+                                }
+                            }
+                        }
+                    }
+                    None => self.drop_volume(),
+                }
             }
             let endpoint = self.volume.as_ref()?;
             match (endpoint.GetMasterVolumeLevelScalar(), endpoint.GetMute()) {
                 (Ok(level), Ok(muted)) => Some((level, muted.as_bool())),
                 _ => {
-                    // The default device changed or went away: look it up again next time.
-                    self.volume = None;
+                    // The device went away: look it up again next time.
+                    self.drop_volume();
                     None
                 }
             }
@@ -401,7 +585,7 @@ fn battery() -> Option<(u8, bool)> {
     Some((status.BatteryLifePercent, status.ACLineStatus == 1))
 }
 
-/// More about the battery, for its menu.
+/// More about the battery, for its page.
 #[derive(Clone, Copy, Debug)]
 pub struct Battery {
     pub percent: u8,
@@ -432,53 +616,28 @@ pub fn today() -> (i32, u32, u32) {
     (now.wYear as i32, now.wMonth as u32, now.wDay as u32)
 }
 
-/// Day and time for the top bar, for example "CN, 15 thg 11   13:49".
-pub fn clock_text() -> String {
+/// The time and date as the island writes them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Clock {
+    /// "13:49"
+    pub time: String,
+    /// "CN, 15 thg 11"
+    pub day: String,
+    /// "Chủ nhật, 15 tháng 11"
+    pub date: String,
+}
+
+pub fn clock() -> Clock {
     let now = unsafe { GetLocalTime() };
     format_clock(now.wDayOfWeek, now.wDay, now.wMonth, now.wHour, now.wMinute)
 }
 
 /// `weekday`: 0 = Sunday.
-pub fn format_clock(weekday: u16, day: u16, month: u16, hour: u16, minute: u16) -> String {
-    const DAYS: [&str; 7] = ["CN", "Th 2", "Th 3", "Th 4", "Th 5", "Th 6", "Th 7"];
-    format!("{}, {} thg {}   {:02}:{:02}", DAYS[(weekday % 7) as usize], day, month, hour, minute)
-}
-
-/// Presses Windows + a letter, as if typed. Used to open Windows' own panels:
-/// Win+A = quick settings (Wi-Fi, sound, battery), Win+N = notifications and calendar.
-pub fn press_windows_key(letter: char) {
-    let key = VIRTUAL_KEY(letter.to_ascii_uppercase() as u16);
-    let stroke = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, time: 0, dwExtraInfo: 0 } },
-    };
-    let inputs = [stroke(VK_LWIN, false), stroke(key, false), stroke(key, true), stroke(VK_LWIN, true)];
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Modifier keys for `press_keys`.
-pub const CTRL: u8 = 1;
-pub const SHIFT: u8 = 2;
-pub const ALT: u8 = 4;
-pub const WIN: u8 = 8;
-
-/// Presses a keyboard shortcut, as if typed: the modifiers go down, the key is tapped, the
-/// modifiers come up. It goes to whichever window is in front.
-pub fn press_keys(mods: u8, key: u16) {
-    let stroke = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, time: 0, dwExtraInfo: 0 } },
-    };
-    let held: Vec<VIRTUAL_KEY> = [(CTRL, VK_CONTROL), (SHIFT, VK_SHIFT), (ALT, VK_MENU), (WIN, VK_LWIN)].iter().filter(|(bit, _)| mods & bit != 0).map(|(_, vk)| *vk).collect();
-    let mut inputs: Vec<INPUT> = held.iter().map(|vk| stroke(*vk, false)).collect();
-    inputs.push(stroke(VIRTUAL_KEY(key), false));
-    inputs.push(stroke(VIRTUAL_KEY(key), true));
-    inputs.extend(held.iter().rev().map(|vk| stroke(*vk, true)));
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
+pub fn format_clock(weekday: u16, day: u16, month: u16, hour: u16, minute: u16) -> Clock {
+    const SHORT: [&str; 7] = ["CN", "Th 2", "Th 3", "Th 4", "Th 5", "Th 6", "Th 7"];
+    const LONG: [&str; 7] = ["Chủ nhật", "Thứ hai", "Thứ ba", "Thứ tư", "Thứ năm", "Thứ sáu", "Thứ bảy"];
+    let w = (weekday % 7) as usize;
+    Clock { time: format!("{hour:02}:{minute:02}"), day: format!("{}, {} thg {}", SHORT[w], day, month), date: format!("{}, {} tháng {}", LONG[w], day, month) }
 }
 
 /// Locks the screen (the same as Win+L).

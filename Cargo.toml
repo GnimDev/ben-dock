@@ -1,22 +1,27 @@
 [package]
 name = "ben"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Bến — a dock for Windows 11 with cursor-following magnification"
+description = "Bến — a liquid interface for Windows 11: a dock and a dynamic island made of glass"
 
 [dependencies]
 windows-core = "0.62"
 windows-numerics = "0.3"
 windows = { version = "0.62", features = [
+  "Devices_Bluetooth",
+  "Devices_Enumeration",
+  "Devices_Radios",
   "Foundation",
   "Foundation_Collections",
   "Foundation_Numerics",
   "Graphics_DirectX",
   "Graphics_Effects",
+  "Media_Control",
   "System",
   "UI",
   "UI_Composition",
   "UI_Composition_Desktop",
+  "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
@@ -34,12 +39,15 @@ windows = { version = "0.62", features = [
   "Win32_Networking_NetworkListManager",
   "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_Storage_Xps",
   "Win32_Storage_Packaging_Appx",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_LibraryLoader",
-  "Win32_System_Registry",
+  "Win32_System_Memory",
   "Win32_System_Power",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
   "Win32_System_Shutdown",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
@@ -56,6 +64,19 @@ windows = { version = "0.62", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+# The build that is shipped: as small and as fast as the compiler can make it. A panic
+# stops the program at once (after the hook in main.rs has put the taskbar back) instead of
+# unwinding, which leaves the unwinding tables out of the file.
 [profile.release]
 opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
+
+# For trying a change quickly: `cargo build --profile quick`.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
