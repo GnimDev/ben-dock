@@ -18,11 +18,14 @@
 //! the photograph is being taken, which is a few hundredths of a second, the
 //! live picture stands in for the window, so nothing is seen of the wait.
 //!
-//! Every other way a window gets minimised or restored (its own button, the
-//! keyboard, Alt+Tab) is animated by Windows, which the app only tells where
-//! the window's icon is (see `MIN_RECTS` in app.rs). While this effect plays
-//! for a window, Windows' own animation is switched off for that one window so
-//! the two never play on top of each other.
+//! A window minimised by other means (its own button, the keyboard) gets this
+//! effect too: Windows' own animation is kept off for the windows that are
+//! open (see `keep_windows_still` in app.rs), so the window is gone at once
+//! and the effect plays over where it was. Restored by other means (Alt+Tab)
+//! it is animated by Windows, which the app only tells where the window's icon
+//! is (see `MIN_RECTS` in app.rs). While this effect plays for a window,
+//! Windows' own animation is switched off for that one window so the two never
+//! play on top of each other.
 
 use crate::camera::Camera;
 use crate::scene::{Level, Scene, Slice, Stage};
