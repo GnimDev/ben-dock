@@ -6,7 +6,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 - https://github.com/GnimDev/ben-dock/releases/tag/test
 ## Features
 
-- **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. Drag an app, shortcut or file onto the dock to pin it: the glass strains like the skin of a water drop, then lets the icon slip in. Dividers group the pinned apps. The first icon opens an app launcher with search.
+- **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. Drag an app, shortcut or file onto the dock to pin it: the glass strains like the skin of a water drop, then lets the icon slip in. Dividers group the pinned apps. The first icon opens an app launcher with search, made of the same glass as the dock; tapping the Windows key opens it too, in place of the Start menu.
 - **App tray:** every installed app, the ones you use most on the first page and installers and admin tools on the last. Icons are kept in a file (`icons.cache`), so the tray opens full. Search ignores case and accents and finds apps by initials (`vsc`), short names (`cmd`, `calc`), program names (`winword`), several words (`ms word`) and small typos (`notepda`); what you picked before comes first. Drag a tile onto the dock to pin it.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
 - **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
@@ -31,6 +31,7 @@ Both Rust toolchains work: MSVC (needs the C++ Build Tools) or GNU (needs MinGW'
 
 ## Usage
 
+- **Windows key:** a tap of the Windows key on its own opens the app tray; start typing to search. A dock that is tucked away comes into view with it. Win+D, Win+E and the like work as before, and Ctrl+Esc still opens the Start menu. Turn it off with **Phím Windows mở khay ứng dụng** in the settings, or `win_key = false` in `ben.ini`.
 - **Pinning by drag and drop:** drag an app, shortcut or file from Explorer, the desktop or the app launcher onto the dock. Its icon squeezes in and follows the cursor; drop it where it should stay. A tile dragged out of the app launcher closes the launcher and travels in a glass bubble under the cursor.
 - **Unpinning by drag:** drag a pinned icon up out of the dock and let go. It leaves in a bubble that bursts. Bring it back over the dock before letting go to keep it. An app that is open stays in the dock, among the open apps, until it closes.
 - **Dividers:** right-click a pinned icon and choose **Thêm vách ngăn phía sau** to put a divider after it. Drag a divider to move it; right-click it to remove it. Dividers are saved in `pins.txt` as `---` lines.

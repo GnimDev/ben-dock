@@ -132,7 +132,9 @@ pub fn build(cfg: &Config, system_dark: bool, accent: (f32, f32, f32), scale: f3
         dock: piece(0.0, 1.0, 22.0),
         island: piece(0.20, 1.0, 20.0),
         bubble: piece(0.36, 1.1, 18.0),
-        sheet: piece(0.30, 1.4, 28.0),
+        // The app tray is made of the same glass as the dock (a little denser, for the
+        // writing on it), so that it reads as part of it.
+        sheet: piece(0.10, 1.0, 22.0),
         text: if dark { color(1.0, 1.0, 1.0, 0.95) } else { color(0.0, 0.0, 0.0, 0.88) },
         text_dim: if dark { color(1.0, 1.0, 1.0, 0.56) } else { color(0.0, 0.0, 0.0, 0.52) },
         bead: if dark { (white(0.27), white(0.09), white(0.36)) } else { (black(0.045), black(0.11), white(0.78)) },

@@ -66,6 +66,8 @@ pub struct Config {
     pub reserve_space: bool,
     pub launcher: bool,
     pub launcher_icon: f32,
+    /// A tap of the Windows key opens the app tray instead of the Start menu.
+    pub win_key: bool,
 
     // Windows
     /// A window that has just opened floats in the middle of its screen instead of filling it.
@@ -128,6 +130,7 @@ impl Default for Config {
             reserve_space: false,
             launcher: true,
             launcher_icon: 56.0,
+            win_key: true,
             float_windows: true,
             float_size: 0.7,
             minimize_effect: 2.0,
@@ -234,6 +237,7 @@ pub const PARAMS: &[Param] = &[
     param!("reserve_space", "Hành vi", "Cửa sổ phóng to không che dock và đảo", "Giữ chỗ ở mép trên và mép dưới để cửa sổ phóng to không che dock và đảo. Chỉ nên bật cùng với \"Luôn hiện khi có cửa sổ phóng to\"", Kind::Toggle, true, flag!(reserve_space)),
     param!("launcher", "Hành vi", "Nút khay ứng dụng trong dock", "Icon đầu tiên của dock mở khay tất cả ứng dụng", Kind::Toggle, true, flag!(launcher)),
     param!("launcher_icon", "Hành vi", "Cỡ icon trong khay ứng dụng", "Cỡ icon trong khay ứng dụng (điểm ảnh)", n(40.0, 96.0, 4.0), true, num!(launcher_icon)),
+    param!("win_key", "Hành vi", "Phím Windows mở khay ứng dụng", "Bấm phím Windows một mình thì mở khay ứng dụng của Bến thay cho menu Start (gõ ngay để tìm ứng dụng). Phím Windows bấm cùng phím khác (Win+D, Win+E...) vẫn như cũ, và Ctrl+Esc vẫn mở menu Start. Cần bật nút khay ứng dụng", Kind::Toggle, true, flag!(win_key)),
     param!("float_windows", "Cửa sổ", "Cửa sổ mới mở dạng nổi", "Cửa sổ vừa mở không phóng to hết màn hình mà nổi ở giữa, chỉ chiếm một phần màn hình. Bến chỉ làm việc này một lần, lúc cửa sổ mở ra; sau đó phóng to hay kéo cỡ tuỳ ý. Cửa sổ vốn đã nhỏ, cửa sổ không đổi cỡ được và trò chơi, video toàn màn hình thì giữ nguyên", Kind::Toggle, true, flag!(float_windows)),
     param!("float_size", "Cửa sổ", "Cỡ cửa sổ nổi", "Cửa sổ nổi chiếm nhiều nhất bao nhiêu phần chiều rộng và chiều cao của màn hình (0.7 = 70%)", n(0.4, 0.95, 0.01), true, num!(float_size)),
     param!("minimize_effect", "Cửa sổ", "Hiệu ứng thu nhỏ", "Khi bấm icon trên dock để thu nhỏ hoặc mở lại cửa sổ: 0 = hoạt ảnh của Windows, 1 = co lại dần về icon, 2 = chảy vào icon qua một cái phễu cong, như hiệu ứng thần đèn trên Mac, 3 = trượt xuống icon. Thu nhỏ bằng nút trên cửa sổ hay bằng bàn phím cũng dùng hiệu ứng này (Bến tắt hoạt ảnh của Windows cho các cửa sổ đang mở). Mở lại bằng Alt+Tab hay cách khác vẫn là hoạt ảnh của Windows, và cách nào cửa sổ cũng bay về đúng icon của nó trên dock", Kind::Choice(&["Của Windows", "Co lại", "Chảy", "Trượt"]), true, num!(minimize_effect)),

@@ -52,6 +52,7 @@ mod vitals;
 mod warp;
 mod weather;
 mod wifi;
+mod winkey;
 
 use std::time::Instant;
 use util::wide;
