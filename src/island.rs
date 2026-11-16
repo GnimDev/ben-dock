@@ -52,8 +52,6 @@ const TIMER_LEAVE: usize = 3;
 /// How long an alert stays, how long the cursor must rest before the island opens, and how
 /// long after it left before the island closes. Milliseconds.
 const ALERT_MS: u32 = 2400;
-/// Another app's notification takes reading, so it stays longer.
-const NOTICE_MS: u32 = 5200;
 const DWELL_MS: u32 = 110;
 const LEAVE_MS: u32 = 320;
 
@@ -90,8 +88,6 @@ pub enum Alert {
     LowBattery(u8),
     Network(bool),
     Track { title: String, artist: String, art: Option<Art> },
-    /// Another app's notification.
-    Notice { app: String, title: String, body: String, logo: Option<Art> },
 }
 
 /// The pages of the open panel.
@@ -103,8 +99,11 @@ pub enum Page {
     Bluetooth,
     Battery,
     Calendar,
+    // Pages only a corner opens (see `corner.rs`).
     Notices,
     Claude,
+    Weather,
+    System,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,6 +193,8 @@ pub enum Action {
     Row(Page, usize),
     /// The cross at the end of a row was clicked.
     Close(Page, usize),
+    /// The very corner of the screen was clicked: every window out of the way, or back.
+    Desktop,
     /// Enter was pressed in a page's text field (what was typed is in `Island::typed`).
     Enter(Page),
 }
@@ -301,9 +302,7 @@ pub struct Island {
     a_icon: Line,
     a_text: Line,
     a_value: Line,
-    /// A notification's second line.
-    a_body: Line,
-    /// A cover or an app's own mark, in the symbol's place; and which picture it shows.
+    /// A track's cover, in the symbol's place; and which picture it shows.
     a_art: Sprite,
     a_art_of: Option<Art>,
 
@@ -544,7 +543,7 @@ impl Island {
             let alert = scene.layer_in(&inside)?;
             let a = alert.content()?;
             let (a_track, a_fill) = (scene.pill_in(&a)?, scene.pill_in(&a)?);
-            let (a_icon, a_text, a_value, a_body) = (line(&a)?, line(&a)?, line(&a)?, line(&a)?);
+            let (a_icon, a_text, a_value) = (line(&a)?, line(&a)?, line(&a)?);
             let a_art = scene.sprite_in(&a)?;
 
             let home = scene.layer_in(&inside)?;
@@ -553,7 +552,7 @@ impl Island {
             let (p_tile, p_track, p_fill) = (scene.pill_in(&p)?, scene.pill_in(&p)?, scene.pill_in(&p)?);
             let p_art = scene.sprite_in(&p)?;
             let (p_seek_track, p_seek_fill) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
-            let backs = (0..10).map(|_| scene.pill_in(&p)).collect::<Result<Vec<_>>>()?;
+            let backs = (0..8).map(|_| scene.pill_in(&p)).collect::<Result<Vec<_>>>()?;
             let hot_home = scene.bead_in(&p)?;
             let (p_knob, p_seek_knob) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
             let specs = [
@@ -561,8 +560,6 @@ impl Island {
                 (Zone::Card(Page::Bluetooth), 0xE702, "Bluetooth"),
                 (Zone::Card(Page::Sound), 0xE767, "Âm thanh"),
                 (Zone::Card(Page::Battery), 0xE83F, "Pin"),
-                (Zone::Card(Page::Notices), 0xEA8F, "Thông báo"),
-                (Zone::Card(Page::Claude), 0xE706, "Claude"),
                 (Zone::Settings, 0xE713, "Cài đặt"),
                 (Zone::Lock, 0xE72E, "Khoá"),
                 (Zone::Sleep, 0xE708, "Ngủ"),
@@ -572,7 +569,7 @@ impl Island {
             for (back, (zone, code, text)) in backs.into_iter().zip(specs) {
                 made.push(Button { zone, code, text, back, icon: line(&p)?, label: line(&p)? });
             }
-            let buttons = made.split_off(6);
+            let buttons = made.split_off(4);
             let cards = made;
 
             let list = scene.layer_in(&inside)?;
@@ -601,7 +598,6 @@ impl Island {
                 a_icon,
                 a_text,
                 a_value,
-                a_body,
                 a_art,
                 a_art_of: None,
                 alert,
@@ -750,7 +746,6 @@ impl Island {
             &mut self.a_icon,
             &mut self.a_text,
             &mut self.a_value,
-            &mut self.a_body,
             &mut self.p_elapsed,
             &mut self.p_length,
             &mut self.p_shuffle,
@@ -826,13 +821,12 @@ impl Island {
                 self.level.snap(self.level.target);
             }
         }
-        let stay = if matches!(alert, Alert::Notice { .. }) { NOTICE_MS } else { ALERT_MS };
         self.current = Some(alert);
         self.alerting = true;
         if self.mode != Mode::Open {
             self.mode = Mode::Alert;
         }
-        self.timer(TIMER_ALERT, stay);
+        self.timer(TIMER_ALERT, ALERT_MS);
     }
 
     /// Closes the open panel (something else took the stage).
@@ -973,11 +967,9 @@ impl Island {
                 }
                 if self.mode != Mode::Open {
                     self.cancel(TIMER_DWELL);
-                    // A click on a notification that is showing opens the list of them.
-                    let notice = self.alerting && matches!(self.current, Some(Alert::Notice { .. }));
                     self.mode = Mode::Open;
                     self.page = Page::Home;
-                    return if notice { Action::Open(Page::Notices) } else { Action::None };
+                    return Action::None;
                 }
                 let page = self.page;
                 return match self.zone_at(x as f32, y as f32).filter(|zone| Some(*zone) == pressed) {
@@ -1184,36 +1176,23 @@ impl Island {
                 Alert::LowBattery(percent) => (0xE850, "Pin yếu".to_string(), format!("{percent}%"), false),
                 Alert::Network(online) => (0xE701, (if *online { "Đã có mạng" } else { "Mất kết nối mạng" }).to_string(), String::new(), false),
                 Alert::Track { title, artist, .. } => (0xEC4F, title.clone(), artist.clone(), false),
-                // Two lines. With the app's own mark beside them the app need not be named;
-                // a notification of one line is told under the app's name.
-                Alert::Notice { app, title, body, logo } => match (title.is_empty(), body.is_empty(), logo.is_some()) {
-                    (true, ..) => (0xEA8F, app.clone(), body.clone(), false),
-                    (false, true, _) => (0xEA8F, app.clone(), title.clone(), false),
-                    (false, false, true) => (0xEA8F, title.clone(), body.clone(), false),
-                    (false, false, false) => (0xEA8F, format!("{app} · {title}"), body.clone(), false),
-                },
             };
             let warn = matches!(alert, Alert::LowBattery(_)) || matches!(alert, Alert::Network(false));
-            let tall = matches!(alert, Alert::Notice { .. });
             let picture = match alert {
                 Alert::Track { art, .. } => art.as_ref(),
-                Alert::Notice { logo, .. } => logo.as_ref(),
                 _ => None,
             };
-            // A notification's two lines need a taller shape.
-            let ah = if tall { h0 + px(24.0) } else { ah };
             self.a_icon.set(scene, gfx, &f.icons_big, &glyph(code), if warn { theme.text_dim } else { theme.accent_text() }, None)?;
-            self.a_text.set(scene, gfx, &f.bold, &words, fg, Some(px(if tall { 270.0 } else { 210.0 })))?;
-            self.a_value.set(scene, gfx, &f.text, if tall { "" } else { value.as_str() }, dim, Some(px(150.0)))?;
-            self.a_body.set(scene, gfx, &f.small, if tall { value.as_str() } else { "" }, dim, Some(px(270.0)))?;
-            let mut x = px(if tall { 13.0 } else { 16.0 });
-            // A cover or an app's own mark takes the symbol's place.
+            self.a_text.set(scene, gfx, &f.bold, &words, fg, Some(px(210.0)))?;
+            self.a_value.set(scene, gfx, &f.text, &value, dim, Some(px(150.0)))?;
+            let mut x = px(16.0);
+            // A track's cover takes the symbol's place.
             if let Some(art) = picture {
                 if self.a_art_of.as_ref() != Some(art) {
                     self.a_art.set_surface(&scene.surface_from_pixels(&art.0)?)?;
                     self.a_art_of = Some(art.clone());
                 }
-                let side = px(if tall { 30.0 } else { 22.0 });
+                let side = px(22.0);
                 self.a_art.place(x, ((ah - side) * 0.5).round(), side, side)?;
                 x += side + px(10.0);
             } else {
@@ -1223,17 +1202,7 @@ impl Island {
             }
             self.a_art.set_opacity(if picture.is_some() { 1.0 } else { 0.0 })?;
             self.a_icon.set_opacity(if picture.is_some() { 0.0 } else { 1.0 })?;
-            if tall {
-                if self.a_body.w > 0.0 {
-                    let low = ah - px(9.0) - self.a_body.h;
-                    self.a_text.place(x, px(8.0))?;
-                    self.a_body.place(x, low)?;
-                } else {
-                    let y = mid(&self.a_text, ah);
-                    self.a_text.place(x, y)?;
-                }
-                x += self.a_text.w.max(self.a_body.w) + px(12.0);
-            } else if self.a_text.w > 0.0 {
+            if self.a_text.w > 0.0 {
                 let y = mid(&self.a_text, ah);
                 self.a_text.place(x, y)?;
                 x += self.a_text.w + px(10.0);
@@ -1382,7 +1351,11 @@ impl Island {
                         Some(share) => share * track.length,
                         None => (track.position + track.read.filter(|_| track.playing).map(|read| read.elapsed().as_secs_f32()).unwrap_or(0.0)).min(track.length),
                     };
-                    self.p_elapsed.set(scene, gfx, &f.small, &minutes(played), dim, None)?;
+                    // The time gone by changes every second: it is only written again while the
+                    // panel is open to show it.
+                    if open || self.p_elapsed.w == 0.0 {
+                        self.p_elapsed.set(scene, gfx, &f.small, &minutes(played), dim, None)?;
+                    }
                     self.p_length.set(scene, gfx, &f.small, &minutes(track.length), dim, None)?;
                     // Both times get the room of the wider, so the bar keeps still as the digits change.
                     let (ew, lw) = (self.p_elapsed.w, self.p_length.w);

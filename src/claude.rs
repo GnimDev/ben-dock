@@ -239,7 +239,7 @@ fn limits(home: &Path, now: i64) -> (Option<(u32, i64)>, Option<(u32, i64)>) {
 }
 
 /// The number that follows `key` in a piece of JSON.
-fn number(text: &str, key: &str) -> Option<f64> {
+pub fn number(text: &str, key: &str) -> Option<f64> {
     let rest = &text[text.find(key)? + key.len()..];
     let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(rest.len());
     rest[..end].parse().ok()

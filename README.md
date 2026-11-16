@@ -7,8 +7,11 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 - **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. The first icon opens an app launcher with search.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
 - **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
-- **Notifications:** the island shows each app notification as it arrives, and a page lists the recent ones. Click one to open its app, or the ✕ to dismiss it.
-- **Claude:** a page with today's Claude Code usage (replies and tokens), read from the files Claude Code keeps on this computer. It never reads Claude's sign-in.
+- **Four corners:** a small glass pill in each corner of the screen. Hover one to open its list.
+  - Top-left, **Claude:** the share of the weekly limit used when Claude Code has a current figure, otherwise today's tokens. Read from the files Claude Code keeps on this computer; it never reads Claude's sign-in.
+  - Top-right, **notifications:** a bell with a count. Each new app notification swells out as a card. In the list, click one to open its app or the ✕ to dismiss it.
+  - Bottom-left, **weather:** temperature and sky for where the computer is. The location, rounded to about 10 km, is sent to Open-Meteo.
+  - Bottom-right, **system:** CPU and memory in use. Click the very corner of the screen to show the desktop.
 - **Floating windows:** new windows open centered at up to 70% of the screen instead of maximized.
 - **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon.
 - **Themes:** four glass materials, light/dark mode, accent tint.

@@ -22,6 +22,7 @@ mod bubble;
 mod camera;
 mod claude;
 mod config;
+mod corner;
 mod dates;
 mod dock;
 mod fx;
@@ -42,7 +43,9 @@ mod system;
 mod text;
 mod theme;
 mod util;
+mod vitals;
 mod warp;
+mod weather;
 mod wifi;
 
 use std::time::Instant;

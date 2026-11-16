@@ -10,6 +10,7 @@ use crate::audio;
 use crate::bluetooth;
 use crate::bubble::{self, Bubble, Entry};
 use crate::config::{self, Config};
+use crate::corner::{self, Corner, Kind};
 use crate::dock::{self, Dock, Released, LAUNCHER_KEY};
 use crate::fx::{self, Fx};
 use crate::gfx::Gfx;
@@ -27,6 +28,8 @@ use crate::spring::Spring;
 use crate::system::{self, AppBar, Clock, Monitor, Taskbar};
 use crate::theme::{self, Theme};
 use crate::util::wide;
+use crate::vitals::{self, Vitals};
+use crate::weather::{self, Weather};
 use crate::wifi;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -51,6 +54,7 @@ const WM_APPS_FOUND: u32 = WM_APP + 5;
 const WM_PAGE_DATA: u32 = WM_APP + 6;
 const WM_NOTICES_CHANGED: u32 = WM_APP + 7;
 const WM_CLAUDE_READ: u32 = WM_APP + 8;
+const WM_WEATHER_READ: u32 = WM_APP + 9;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
@@ -117,6 +121,9 @@ const TICK: u32 = 0xE73E;
 const LOCK: u32 = 0xE72E;
 const GEAR: u32 = 0xE713;
 const BELL: u32 = 0xEA8F;
+const SPARK: u32 = 0xE706;
+const PULSE: u32 = 0xE9D9;
+const SCREEN: u32 = 0xE7F4;
 const BIN: u32 = 0xE74D;
 const CLOCK: u32 = 0xE823;
 const WEEK: u32 = 0xE787;
@@ -209,6 +216,10 @@ pub enum Event {
     Notices,
     /// Claude's usage has been read.
     Claude,
+    /// The weather has been asked for.
+    Weather,
+    /// From a corner (its window comes first).
+    Corner(isize, island::Input),
     /// From an island (its window comes first).
     Island(isize, island::Input),
     Bubble(bubble::Input),
@@ -351,6 +362,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_CLAUDE_READ => {
             push(Event::Claude);
+            return LRESULT(0);
+        }
+        WM_WEATHER_READ => {
+            push(Event::Weather);
             return LRESULT(0);
         }
         WM_POWERBROADCAST => push(Event::Power),
@@ -508,15 +523,13 @@ const DEMO: &[(f32, Act)] = &[
     (23.5, Act::OpenPage(Page::Sound)),
     (26.0, Act::OpenPage(Page::Bluetooth)),
     (28.5, Act::OpenPage(Page::Battery)),
-    (31.0, Act::OpenPage(Page::Notices)),
-    (33.5, Act::OpenPage(Page::Claude)),
-    (37.0, Act::OpenPage(Page::Calendar)),
-    (39.5, Act::CloseIsland),
-    (40.0, Act::OpenMenu),
-    (42.5, Act::CloseMenu),
-    (43.0, Act::OpenTray),
-    (46.5, Act::CloseTray),
-    (47.5, Act::End),
+    (31.0, Act::OpenPage(Page::Calendar)),
+    (33.5, Act::CloseIsland),
+    (34.0, Act::OpenMenu),
+    (36.5, Act::CloseMenu),
+    (37.0, Act::OpenTray),
+    (40.5, Act::CloseTray),
+    (41.5, Act::End),
 ];
 
 /// The picture of a window that has flown back out is kept up until the real window is there.
@@ -559,6 +572,8 @@ struct Screen {
     appbar: AppBar,
     dock: Dock,
     island: Option<Island>,
+    /// The pieces of glass in the screen's corners that are switched on.
+    corners: Vec<Corner>,
     /// Bottom edge of the dock's strip on screen, as last granted by the shell.
     bottom_line: i32,
     /// 0 = shown, 1 = out of the way of a full-screen app on this screen.
@@ -611,6 +626,13 @@ pub struct App {
     claude: Option<Claude>,
     usage: Option<claude::Usage>,
     claude_asked: Instant,
+    /// The asker for the weather, and what it last heard.
+    weather: Option<Weather>,
+    sky: Option<weather::Report>,
+    /// How busy the processor is and how full the memory, as last read.
+    vitals: Vitals,
+    vital: vitals::Reading,
+    vital_at: Instant,
 
     // What the island's pages show.
     /// The Wi-Fi networks as last listed (the page's rows point into this).
@@ -715,6 +737,11 @@ impl App {
             claude: None,
             usage: None,
             claude_asked: Instant::now(),
+            weather: None,
+            sky: None,
+            vitals: Vitals::default(),
+            vital: vitals::Reading::default(),
+            vital_at: Instant::now(),
             wifi_list: Vec::new(),
             wifi_asking: None,
             wifi_note: None,
@@ -833,7 +860,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, bottom_line: monitor.rect.bottom, hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -850,6 +877,21 @@ impl App {
             if let Some(island) = screen.island.as_mut() {
                 island.place(&screen.monitor, &self.cfg, &screen.theme);
             }
+            for (kind, wanted) in [(Kind::Claude, self.cfg.corner_claude), (Kind::Notices, self.cfg.corner_notices), (Kind::Weather, self.cfg.corner_weather), (Kind::System, self.cfg.corner_system)] {
+                match (wanted, screen.corners.iter().position(|corner| corner.kind() == kind)) {
+                    (true, None) => match Corner::new(&self.scene, &screen.theme, &self.motion, kind) {
+                        Ok(corner) => screen.corners.push(corner),
+                        Err(e) => crate::log!("a corner is unavailable: {e}"),
+                    },
+                    (false, Some(index)) => {
+                        screen.corners.remove(index);
+                    }
+                    _ => {}
+                }
+            }
+            for corner in &mut screen.corners {
+                corner.place(&screen.monitor, &self.cfg, &screen.theme, screen.bottom_line);
+            }
             if screen.dock.set_launcher_button(self.cfg.launcher, &self.motion) {
                 self.refresh_due = true;
             }
@@ -862,19 +904,26 @@ impl App {
             self.media = None;
             self.playing = None;
         }
-        let want_notices = self.cfg.island && self.cfg.island_notices;
+        let want_notices = self.cfg.corner_notices;
         if want_notices && self.notices.is_none() {
             self.notices = Some(Notices::start(self.hwnd, WM_NOTICES_CHANGED));
         } else if !want_notices {
             self.notices = None;
             self.noticed.clear();
         }
-        let want_claude = self.cfg.island && self.cfg.island_claude;
+        let want_claude = self.cfg.corner_claude;
         if want_claude && self.claude.is_none() {
             self.claude = Some(Claude::start(self.hwnd, WM_CLAUDE_READ));
+            self.ask_claude();
         } else if !want_claude {
             self.claude = None;
             self.usage = None;
+        }
+        if self.cfg.corner_weather && self.weather.is_none() {
+            self.weather = Some(Weather::start(self.hwnd, WM_WEATHER_READ));
+        } else if !self.cfg.corner_weather {
+            self.weather = None;
+            self.sky = None;
         }
 
         let first = &self.screens[0].theme;
@@ -936,6 +985,9 @@ impl App {
                     island.place(&monitor, &self.cfg, &screen.theme);
                 }
             }
+            for corner in &mut screen.corners {
+                corner.place(&monitor, &self.cfg, &screen.theme, screen.bottom_line);
+            }
         }
         self.publish_min_rects();
     }
@@ -969,6 +1021,7 @@ impl App {
             self.screens.truncate(1);
             self.screens[0].monitor = monitors[0];
             self.screens[0].island = None;
+            self.screens[0].corners.clear();
             for monitor in monitors.into_iter().skip(1) {
                 match new_dock_window().and_then(|w| self.make_screen(monitor, w, true)) {
                     Ok(screen) => self.screens.push(screen),
@@ -988,10 +1041,10 @@ impl App {
 
     pub fn handle(&mut self, ev: Event) {
         self.touched = true;
-        if !matches!(ev, Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude) {
+        if !matches!(ev, Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude | Event::Weather) {
             self.busy();
         }
-        if matches!(ev, Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Bubble(_) | Event::Launcher(_)) {
+        if matches!(ev, Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Corner(..) | Event::Bubble(_) | Event::Launcher(_)) {
             self.last_input = Instant::now();
         }
         match ev {
@@ -1068,11 +1121,26 @@ impl App {
                 }
                 self.follow_wifi();
                 // A page that is open keeps up with what it shows.
-                for page in [Page::Wifi, Page::Sound, Page::Battery, Page::Notices] {
+                // The corner for the computer follows the processor and the memory: every few
+                // seconds, since each new number is a line of text painted again.
+                if self.cfg.corner_system && self.vital_at.elapsed().as_secs() >= 3 {
+                    self.vital = self.vitals.read();
+                    self.vital_at = Instant::now();
+                }
+                for page in [Page::Wifi, Page::Sound, Page::Battery, Page::Notices, Page::System] {
                     self.refresh_pages(page);
                 }
-                // The Claude page has its numbers read again every few seconds while it is open.
-                if self.claude_asked.elapsed().as_secs() >= 5 && self.screens.iter().any(|screen| screen.island.as_ref().and_then(|i| i.page()) == Some(Page::Claude)) {
+                // Claude's numbers are read again every few seconds while they are open to
+                // view, and now and then for the corner that shows them at rest.
+                let open = self.screens.iter().any(|screen| screen.island.as_ref().and_then(|i| i.page()) == Some(Page::Claude) || screen.corners.iter().any(|corner| corner.page() == Some(Page::Claude)));
+                let every = if open {
+                    5
+                } else if self.cfg.corner_claude {
+                    20
+                } else {
+                    u64::MAX
+                };
+                if self.claude_asked.elapsed().as_secs() >= every {
                     self.ask_claude();
                 }
                 self.housekeeping();
@@ -1170,6 +1238,8 @@ impl App {
             Event::Media => self.take_media(),
             Event::Notices => self.take_notices(),
             Event::Claude => self.take_usage(),
+            Event::Weather => self.take_weather(),
+            Event::Corner(window, input) => self.corner_input(window, input),
             Event::Apps => self.take_found_apps(),
             Event::PageData => {
                 if let Some(read) = self.bluetooth_reading.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -1288,14 +1358,23 @@ impl App {
         self.playing = latest;
     }
 
-    /// Takes what the notification watcher has sent; a new one gets a moment on the islands.
+    /// Takes what the notification watcher has sent; a new one swells out of the corners for them.
     fn take_notices(&mut self) {
         let Some((all, fresh)) = self.notices.as_ref().and_then(|n| n.take()) else { return };
         for notice in fresh {
-            self.alert(Alert::Notice { app: notice.app, title: notice.title, body: notice.body, logo: notice.logo });
+            for corner in self.screens.iter_mut().flat_map(|screen| screen.corners.iter_mut()).filter(|corner| corner.kind() == Kind::Notices) {
+                corner.alert(&notice.app, &notice.title, &notice.body, notice.logo.clone());
+            }
         }
         self.noticed = all;
         self.refresh_pages(Page::Notices);
+    }
+
+    /// Takes what the asker for the weather has heard.
+    fn take_weather(&mut self) {
+        let Some(report) = self.weather.as_ref().and_then(|w| w.take()) else { return };
+        self.sky = Some(report);
+        self.refresh_pages(Page::Weather);
     }
 
     /// Takes what the reader of Claude's usage has sent.
@@ -1328,6 +1407,35 @@ impl App {
             Some(island) => island.handle(input),
             None => return,
         };
+        self.act(s, action);
+    }
+
+    /// A click or a timer on a corner.
+    fn corner_input(&mut self, window: isize, input: island::Input) {
+        let Some((s, c)) = self.screens.iter().enumerate().find_map(|(s, screen)| screen.corners.iter().position(|corner| corner.hwnd().0 as isize == window).map(|c| (s, c))) else { return };
+        match self.screens[s].corners[c].handle(input) {
+            // It opened: fill it with its page.
+            Action::Open(page) => {
+                match page {
+                    Page::Claude => self.ask_claude(),
+                    // Weather that could not be had is asked for again.
+                    Page::Weather if !matches!(self.sky, Some(weather::Report::Known(_))) => {
+                        if let Some(weather) = self.weather.as_ref() {
+                            weather.look();
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((title, rows)) = self.page_rows(page) {
+                    self.screens[s].corners[c].show_rows(title, rows);
+                }
+            }
+            action => self.act(s, action),
+        }
+    }
+
+    /// Does what a click on the island or a corner of screen `s` asked for.
+    fn act(&mut self, s: usize, action: Action) {
         let collapse = |app: &mut App| {
             if let Some(island) = app.screens[s].island.as_mut() {
                 island.collapse();
@@ -1377,6 +1485,13 @@ impl App {
                 }
             }
             Action::Close(..) => {}
+            // What a click on the far end of the taskbar does. The taskbar is hidden, not
+            // gone, and still takes the order.
+            Action::Desktop => unsafe {
+                if let Ok(tray) = FindWindowW(PCWSTR(wide("Shell_TrayWnd").as_ptr()), PCWSTR::null()) {
+                    let _ = PostMessageW(Some(tray), WM_COMMAND, WPARAM(407), LPARAM(0));
+                }
+            },
             Action::Enter(Page::Wifi) => self.wifi_row(s, row::JOIN),
             Action::Enter(_) => {}
         }
@@ -1415,6 +1530,8 @@ impl App {
             Page::Battery => Some(("Pin", self.battery_rows())),
             Page::Notices => Some(("Thông báo", self.notice_rows())),
             Page::Claude => Some(("Claude", self.claude_rows())),
+            Page::Weather => Some(("Thời tiết", self.weather_rows())),
+            Page::System => Some(("Máy tính", self.system_rows())),
             Page::Home | Page::Calendar => None,
         }
     }
@@ -1441,7 +1558,8 @@ impl App {
     /// Hands new rows to every island that is showing `page`.
     fn refresh_pages(&mut self, page: Page) {
         let showing: Vec<usize> = self.screens.iter().enumerate().filter(|(_, screen)| screen.island.as_ref().and_then(|i| i.page()) == Some(page)).map(|(s, _)| s).collect();
-        if showing.is_empty() {
+        let cornered = self.screens.iter().any(|screen| screen.corners.iter().any(|corner| corner.page() == Some(page)));
+        if showing.is_empty() && !cornered {
             return;
         }
         let Some((title, rows)) = self.page_rows(page) else { return };
@@ -1450,6 +1568,10 @@ impl App {
                 island.show_page(page, title, rows.clone());
             }
         }
+        // And to every corner that is open on it.
+        for corner in self.screens.iter_mut().flat_map(|screen| screen.corners.iter_mut()).filter(|corner| corner.page() == Some(page)) {
+            corner.show_rows(title, rows.clone());
+        }
     }
 
     /// A row of a page on the island of screen `s` was clicked.
@@ -1457,6 +1579,9 @@ impl App {
         let settings_page = |app: &mut App, uri: &str| {
             if let Some(island) = app.screens[s].island.as_mut() {
                 island.collapse();
+            }
+            for corner in &mut app.screens[s].corners {
+                corner.collapse();
             }
             shell::launch_soon(uri);
         };
@@ -1485,6 +1610,8 @@ impl App {
             }
             (Page::Battery, row::SETTINGS) => settings_page(self, "ms-settings:powersleep"),
             (Page::Notices, row::SETTINGS) => settings_page(self, "ms-settings:notifications"),
+            (Page::Weather, row::LOCATION) => settings_page(self, "ms-settings:privacy-location"),
+            (Page::System, row::SETTINGS) => settings_page(self, "taskmgr.exe"),
             (Page::Notices, row::CLEAR) => {
                 if let Some(notices) = self.notices.as_ref() {
                     notices.clear();
@@ -1729,9 +1856,6 @@ impl App {
     /// The notifications page: the latest few, newest first. A click on one goes to its app;
     /// the cross at its end takes it off the list.
     fn notice_rows(&self) -> Vec<Row> {
-        if self.notices.is_none() {
-            return vec![Row::note("Đang tắt. Bật \"Thông báo của ứng dụng\" trong Cài đặt Bến.")];
-        }
         let mut rows = Vec::new();
         let now = media::ticks_now();
         for (index, notice) in self.noticed.iter().take(NOTICES_LISTED).enumerate() {
@@ -1752,12 +1876,41 @@ impl App {
         rows
     }
 
+    /// The weather page: what it is like now and what today brings, or how to let Windows
+    /// say where the computer is.
+    fn weather_rows(&self) -> Vec<Row> {
+        match self.sky {
+            None => vec![Row::note("Đang hỏi thời tiết…")],
+            Some(weather::Report::NoPlace) => vec![Row::note("Windows chưa cho Bến biết máy đang ở đâu"), Row::item(row::LOCATION, GEAR, "Cài đặt Vị trí của Windows…")],
+            Some(weather::Report::NoAnswer) => vec![Row::note("Chưa hỏi được thời tiết. Bến sẽ thử lại sau.")],
+            Some(weather::Report::Known(sky)) => {
+                let (sign, words) = weather::sign(sky.code, sky.day);
+                let degrees = |value: f32| format!("{}°", value.round() as i32);
+                vec![
+                    Row::item(0, 0, &format!("{sign}  {words}")).hint(&degrees(sky.now)),
+                    Row::note(&format!("Cảm giác như {} · độ ẩm {}% · gió {} km/h", degrees(sky.feels), sky.humidity.round() as i32, sky.wind.round() as i32)),
+                    Row::item(0, WEEK, "Hôm nay").hint(&format!("{} đến {}", degrees(sky.low), degrees(sky.high))),
+                    Row::note(&format!("Khả năng mưa {}%", sky.rain.round() as i32)),
+                    Row::note("Theo Open-Meteo, cho vùng quanh đây khoảng 10 km"),
+                ]
+            }
+        }
+    }
+
+    /// The computer's page: how busy the processor is and how full the memory.
+    fn system_rows(&self) -> Vec<Row> {
+        let gigabytes = |value: f32| format!("{value:.1}").replace('.', ",");
+        vec![
+            Row::item(0, PULSE, "Bộ xử lý").hint(&format!("{}%", self.vital.processor)),
+            Row::item(0, SCREEN, "Bộ nhớ").hint(&format!("{}% · {} / {} GB", self.vital.memory, gigabytes(self.vital.used), gigabytes(self.vital.total))),
+            Row::item(row::SETTINGS, GEAR, "Mở Task Manager…"),
+            Row::note("Bấm vào đúng góc màn hình để hiện màn hình nền"),
+        ]
+    }
+
     /// The Claude page: how much of the plan's limits is used, where Claude Code has noted
     /// that down, and what Claude Code took today.
     fn claude_rows(&self) -> Vec<Row> {
-        if self.claude.is_none() {
-            return vec![Row::note("Đang tắt. Bật \"Claude\" trong Cài đặt Bến.")];
-        }
         let Some(usage) = &self.usage else { return vec![Row::note("Đang đọc…")] };
         let mut rows = Vec::new();
         for (glyph, name, limit) in [(CLOCK, "Phiên 5 giờ", usage.session), (WEEK, "Tuần này", usage.week)] {
@@ -1767,7 +1920,7 @@ impl App {
             }
         }
         if usage.session.is_none() && usage.week.is_none() {
-            rows.push(Row::note("Chưa có số liệu giới hạn mới từ Claude Code"));
+            rows.push(Row::note("Chưa có phần trăm giới hạn: Claude Code chưa ghi số mới"));
         }
         rows.push(Row::note("Hôm nay"));
         rows.push(Row::item(0, SPEECH, "Lượt trả lời").hint(&usage.today.replies.to_string()));
@@ -2190,7 +2343,7 @@ impl App {
         if cfg.preview_size != old.preview_size || !cfg.preview {
             self.close_preview();
         }
-        if done || cfg.island != old.island || cfg.launcher != old.launcher || cfg.island_media != old.island_media || cfg.island_notices != old.island_notices || cfg.island_claude != old.island_claude {
+        if done || cfg.island != old.island || cfg.launcher != old.launcher || cfg.island_media != old.island_media || cfg.corner_claude != old.corner_claude || cfg.corner_notices != old.corner_notices || cfg.corner_weather != old.corner_weather || cfg.corner_system != old.corner_system {
             self.setup_surfaces();
         }
         if cfg.ram_limit != old.ram_limit && done {
@@ -2222,6 +2375,9 @@ impl App {
             screen.dock.set_theme(&screen.theme);
             if let Some(island) = screen.island.as_mut() {
                 island.set_theme(&screen.theme);
+            }
+            for corner in &mut screen.corners {
+                corner.set_theme(&screen.theme);
             }
         }
         if !changed {
@@ -2331,6 +2487,9 @@ impl App {
                 if let Some(island) = screen.island.as_mut() {
                     island.collapse();
                 }
+                for corner in &mut screen.corners {
+                    corner.collapse();
+                }
             }
         }
         if changed {
@@ -2423,6 +2582,25 @@ impl App {
         let mut errors: Vec<windows::core::Error> = Vec::new();
         let previewing = self.preview.as_ref().map(|p| p.is_open()).unwrap_or(false);
         let info = island::Info { time: &self.clock.time, day: &self.clock.day, date: &self.clock.date, today: self.today, status: self.last_status, media: self.playing.as_ref() };
+        // What each corner says at rest. Claude's: the share of the week's limit used where
+        // Claude Code has a current note of it, otherwise the tokens taken today.
+        let (claude_text, claude_sub) = match self.usage.as_ref() {
+            Some(usage) => match usage.week {
+                Some((percent, _)) => (format!("{percent}%"), "tuần này"),
+                None => (short_count(usage.today.read + usage.today.written), "token hôm nay"),
+            },
+            None => (String::new(), ""),
+        };
+        let claude_busy = self.usage.as_ref().map(|usage| usage.running > 0).unwrap_or(false);
+        let notices_text = if self.noticed.is_empty() { String::new() } else { self.noticed.len().to_string() };
+        let (sky_text, sky_words) = match self.sky {
+            Some(weather::Report::Known(sky)) => {
+                let (sign, words) = weather::sign(sky.code, sky.day);
+                (format!("{sign} {}°", sky.now.round() as i32), words)
+            }
+            _ => ("☁ Thời tiết".to_string(), ""),
+        };
+        let (vital_text, vital_sub) = (format!("CPU {}%", self.vital.processor), format!("RAM {}%", self.vital.memory));
         for (s, screen) in self.screens.iter_mut().enumerate() {
             let mut cursor = have_cursor.then(|| ((pt.x - screen.dock.win_x) as f32, (pt.y - screen.dock.win_y) as f32));
             if s == 0 && fake.is_some() {
@@ -2445,6 +2623,18 @@ impl App {
             }
             if let Some(island) = screen.island.as_mut() {
                 match island.update(&self.scene, &self.gfx, &self.cfg, &screen.theme, &self.motion, &info, &screen.hide, dt) {
+                    Ok(more) => moving |= more,
+                    Err(e) => errors.push(e),
+                }
+            }
+            for corner in &mut screen.corners {
+                let show = match corner.kind() {
+                    Kind::Claude => corner::Show { there: true, glyph: SPARK, text: &claude_text, sub: claude_sub, busy: claude_busy },
+                    Kind::Notices => corner::Show { there: true, glyph: BELL, text: &notices_text, sub: "", busy: false },
+                    Kind::Weather => corner::Show { there: true, glyph: 0, text: &sky_text, sub: sky_words, busy: false },
+                    Kind::System => corner::Show { there: true, glyph: PULSE, text: &vital_text, sub: &vital_sub, busy: false },
+                };
+                match corner.update(&self.scene, &self.gfx, &screen.theme, &self.motion, &show, &screen.hide, dt) {
                     Ok(more) => moving |= more,
                     Err(e) => errors.push(e),
                 }
@@ -2650,7 +2840,11 @@ impl App {
             Act::LeaveDock => self.demo_cursor = None,
             Act::AlertVolume => self.alert(Alert::Volume { level: 0.62, muted: false }),
             Act::AlertTrack => self.alert(Alert::Track { title: "Bài hát đang phát".to_string(), artist: "Nghệ sĩ".to_string(), art: self.playing.as_ref().and_then(|track| track.art.clone()) }),
-            Act::AlertNotice => self.alert(Alert::Notice { app: "Tin nhắn".to_string(), title: "Lan".to_string(), body: "Tối nay mình ăn gì nhỉ?".to_string(), logo: None }),
+            Act::AlertNotice => {
+                for corner in self.screens[0].corners.iter_mut().filter(|corner| corner.kind() == Kind::Notices) {
+                    corner.alert("Tin nhắn", "Lan", "Tối nay mình ăn gì nhỉ?", None);
+                }
+            }
             Act::OpenIsland => {
                 if let Some(island) = self.screens[0].island.as_mut() {
                     island.open();
@@ -2713,6 +2907,9 @@ impl App {
             if let Some(island) = screen.island.as_mut() {
                 island.forget();
             }
+            for corner in &mut screen.corners {
+                corner.forget();
+            }
         }
         if let Some(fx) = self.fx.as_mut() {
             fx.stop();
@@ -2752,6 +2949,7 @@ impl App {
         self.media = None;
         self.notices = None;
         self.claude = None;
+        self.weather = None;
         system::restore_window_animations();
         // Each screen's dock and island give their strip of screen back as they go.
         self.screens.clear();
