@@ -435,45 +435,202 @@ pub fn launcher_icon(size: u32, accent: (f32, f32, f32)) -> IconPixels {
 
 /// What the background reader of the app list has found.
 pub enum Found {
-    /// An app in the Start menu's "all apps" list.
-    App { name: String, target: String },
+    /// An app in the Start menu's "all apps" list, and how popular it is (see `ranking.rs`).
+    App { name: String, target: String, score: f32 },
+    /// How popular every app is now, after the list was scored again.
+    Scores(Vec<(String, f32)>),
     /// The icon that was asked for with `AppScan::want_icon`.
     Icon { target: String, pixels: IconPixels },
 }
 
-/// The app list, read on a background thread: first every app's name, then icons, but only
-/// the ones that are asked for. Reading an icon is slow (the shell takes around 40 ms for
-/// each) and most are never looked at, so none is read until the tray shows it.
+/// An icon to read.
+struct Job {
+    target: String,
+    size: u32,
+    /// Only to have it in the cache for later: nobody is waiting for it.
+    quiet: bool,
+}
+
+/// What the icon readers are doing together: for the log, once a burst of icons is through.
+struct Burst {
+    started: std::time::Instant,
+    read: usize,
+    cached: usize,
+    work: std::time::Duration,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// Icons the tray is waiting for, and icons only wanted for later; the first are read first.
+    urgent: std::collections::VecDeque<Job>,
+    later: std::collections::VecDeque<Job>,
+    closed: bool,
+    busy: usize,
+    burst: Option<Burst>,
+}
+
+struct Shared {
+    queue: std::sync::Mutex<Queue>,
+    wake: std::sync::Condvar,
+    workers: usize,
+}
+
+impl Shared {
+    fn push(&self, job: Job, urgent: bool) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if urgent {
+            queue.urgent.push_back(job);
+        } else {
+            queue.later.push_back(job);
+        }
+        drop(queue);
+        self.wake.notify_one();
+    }
+
+    /// The next icon to read; waits for one. None once the scan is dropped.
+    fn next(&self) -> Option<Job> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if queue.closed {
+                return None;
+            }
+            if let Some(job) = queue.urgent.pop_front().or_else(|| queue.later.pop_front()) {
+                queue.busy += 1;
+                queue.burst.get_or_insert_with(|| Burst { started: std::time::Instant::now(), read: 0, cached: 0, work: std::time::Duration::ZERO });
+                return Some(job);
+            }
+            queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// An icon has been dealt with.
+    fn done(&self, cached: bool, work: std::time::Duration) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.busy -= 1;
+        if let Some(burst) = queue.burst.as_mut() {
+            burst.work += work;
+            if cached {
+                burst.cached += 1;
+            } else {
+                burst.read += 1;
+            }
+        }
+        if queue.busy == 0 && queue.urgent.is_empty() && queue.later.is_empty() {
+            // (A few at a time, as pages turn, is not worth a line.)
+            if let Some(burst) = queue.burst.take().filter(|burst| burst.read + burst.cached >= 8) {
+                crate::log!(
+                    "icons: {} ready in {} ms ({} read from the shell, {} from the cache; {} ms of work across {} threads)",
+                    burst.read + burst.cached,
+                    burst.started.elapsed().as_millis(),
+                    burst.read,
+                    burst.cached,
+                    burst.work.as_millis(),
+                    self.workers
+                );
+            }
+        }
+    }
+}
+
+/// The app list, read on background threads: first every app's name and how popular it is,
+/// then icons, but only the ones that are asked for (the most popular are read ahead into
+/// a file, `icon_cache.rs`). Reading an icon is slow (the shell takes around 40 ms for
+/// each) and most are never looked at, so a few threads read them side by side, and one that
+/// was read once is kept for later.
 pub struct AppScan {
-    wanted: std::sync::mpsc::Sender<(String, u32)>,
+    shared: std::sync::Arc<Shared>,
+    rank: std::sync::mpsc::Sender<()>,
     pub found: std::sync::mpsc::Receiver<Found>,
 }
 
 impl AppScan {
     /// Asks for an app's icon at `size` pixels. It arrives on `found` when it has been read.
     pub fn want_icon(&self, target: &str, size: u32) {
-        let _ = self.wanted.send((target.to_string(), size));
+        self.shared.push(Job { target: target.to_string(), size, quiet: false }, true);
+    }
+
+    /// Asks for the apps to be scored again (they have been started since). The scores
+    /// arrive on `found`.
+    pub fn rescore(&self) {
+        let _ = self.rank.send(());
     }
 }
 
-/// Starts reading the app list. `window` gets `message` whenever something new is on `found`.
-/// The thread sleeps between requests and ends when the `AppScan` is dropped.
-pub fn scan_apps(window: HWND, message: u32) -> AppScan {
+impl Drop for AppScan {
+    fn drop(&mut self) {
+        self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.shared.wake.notify_all();
+    }
+}
+
+/// Starts reading the app list, and `prefetch` pixels is the size of the icons of the most
+/// popular ones to read ahead (0: none). `window` gets `message` whenever something new is
+/// on `found`. The threads sleep between requests and end when the `AppScan` is dropped.
+pub fn scan_apps(window: HWND, message: u32, prefetch: u32) -> AppScan {
     let (tx, found) = std::sync::mpsc::channel();
-    let (wanted, requests) = std::sync::mpsc::channel::<(String, u32)>();
+    let (rank, rank_requests) = std::sync::mpsc::channel::<()>();
     let window = window.0 as isize;
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4);
+    let shared = std::sync::Arc::new(Shared { queue: std::sync::Mutex::new(Queue::default()), wake: std::sync::Condvar::new(), workers });
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(crate::icon_cache::IconCache::open()));
+    let nudge = move || unsafe {
+        let _ = PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0));
+    };
+
+    for _ in 0..workers {
+        let (shared, cache, tx) = (shared.clone(), cache.clone(), tx.clone());
+        let spawned = std::thread::Builder::new().name("icons".into()).spawn(move || unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+            if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                return;
+            }
+            // Never in the way of the thread that animates.
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            while let Some(job) = shared.next() {
+                let started = std::time::Instant::now();
+                let kept = cache.lock().ok().and_then(|cache| cache.get(&job.target, job.size));
+                let cached = kept.is_some();
+                let pixels = match kept {
+                    Some(pixels) => pixels,
+                    None => {
+                        // Asked of the shell at twice the size wanted: enough to shrink cleanly, and
+                        // it reads smaller pictures faster.
+                        match load_icon(&job.target, (job.size * 2).clamp(96, 256)).map(|icon| resample(&icon, job.size)) {
+                            Some(pixels) => {
+                                if let Ok(mut cache) = cache.lock() {
+                                    cache.put(&job.target, job.size, &pixels);
+                                }
+                                pixels
+                            }
+                            // An app whose icon cannot be read gets a stand-in, not kept.
+                            None => placeholder_icon(job.size),
+                        }
+                    }
+                };
+                shared.done(cached, started.elapsed());
+                if !job.quiet {
+                    if tx.send(Found::Icon { target: job.target, pixels }).is_err() {
+                        break;
+                    }
+                    nudge();
+                }
+            }
+            CoUninitialize();
+        });
+        if let Err(e) = spawned {
+            crate::log!("could not start reading icons: {e}");
+        }
+    }
+
+    let lister = shared.clone();
     let spawned = std::thread::Builder::new().name("apps".into()).spawn(move || unsafe {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
         if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
             return;
         }
-        // Never in the way of the thread that animates.
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        let nudge = || {
-            let _ = PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0));
-        };
         let started = std::time::Instant::now();
-        let mut count = 0;
+        let mut apps: Vec<(String, String)> = Vec::new();
         let listed = (|| -> windows::core::Result<()> {
             let folder: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide("shell:AppsFolder").as_ptr()), None)?;
             let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
@@ -495,21 +652,34 @@ pub fn scan_apps(window: HWND, message: u32) -> AppScan {
                 if name.is_empty() || id.is_empty() || !is_launchable_name(&name) {
                     continue;
                 }
-                count += 1;
-                if tx.send(Found::App { name, target: format!("{APPS_FOLDER}{id}") }).is_err() {
-                    break;
-                }
+                apps.push((name, format!("{APPS_FOLDER}{id}")));
             }
             Ok(())
         })();
+        let scores = crate::ranking::popularity(&apps);
         match listed {
-            Ok(()) => crate::log!("app list read: {count} apps in {:.1} s", started.elapsed().as_secs_f32()),
+            Ok(()) => crate::log!("app list read: {} apps in {:.1} s", apps.len(), started.elapsed().as_secs_f32()),
             Err(e) => crate::log!("could not read the app list: {e}"),
         }
+        for ((name, target), score) in apps.iter().zip(&scores) {
+            if tx.send(Found::App { name: name.clone(), target: target.clone(), score: *score }).is_err() {
+                CoUninitialize();
+                return;
+            }
+        }
         nudge();
-        while let Ok((target, size)) = requests.recv() {
-            let pixels = load_icon(&target, 256).map(|icon| resample(&icon, size)).unwrap_or_else(|| placeholder_icon(size));
-            if tx.send(Found::Icon { target, pixels }).is_err() {
+        // The most popular apps' icons are read now, into the cache, so that the tray finds them there.
+        if prefetch > 0 {
+            let mut order: Vec<usize> = (0..apps.len()).collect();
+            order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+            for &i in order.iter().take(48) {
+                lister.push(Job { target: apps[i].1.clone(), size: prefetch, quiet: true }, false);
+            }
+        }
+        while rank_requests.recv().is_ok() {
+            let scores = crate::ranking::popularity(&apps);
+            let list = apps.iter().zip(scores).map(|((_, target), score)| (target.clone(), score)).collect();
+            if tx.send(Found::Scores(list)).is_err() {
                 break;
             }
             nudge();
@@ -519,7 +689,7 @@ pub fn scan_apps(window: HWND, message: u32) -> AppScan {
     if let Err(e) = spawned {
         crate::log!("could not start reading the app list: {e}");
     }
-    AppScan { wanted, found }
+    AppScan { shared, rank, found }
 }
 
 /// What a drag from another program carries (files and shortcuts from Explorer, apps from
@@ -854,6 +1024,30 @@ pub fn is_minimized(hwnd: HWND) -> bool {
 
 pub fn is_maximized(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd).as_bool() }
+}
+
+/// Tells `window` (with `message`) whenever the window in front is maximised, put back, or
+/// moved to another screen. Windows sends no word of that by itself, so a small thread of
+/// its own looks five times a second; it ends when `window` is gone.
+pub fn watch_front(window: HWND, message: u32) {
+    let window = window.0 as isize;
+    let spawned = std::thread::Builder::new().name("front".into()).stack_size(64 * 1024).spawn(move || {
+        let mut last = (0isize, false, false, 0isize);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let front = unsafe { GetForegroundWindow() };
+            let now = (front.0 as isize, is_maximized(front), is_minimized(front), monitor_of(front));
+            if now != last {
+                last = now;
+                if unsafe { PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0)) }.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        crate::log!("could not start watching the window in front: {e}");
+    }
 }
 
 pub fn window_rect(hwnd: HWND) -> Option<RECT> {

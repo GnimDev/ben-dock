@@ -350,6 +350,11 @@ impl Corner {
         self.hwnd
     }
 
+    /// True while the corner is in use: under the cursor or open.
+    pub fn engaged(&self) -> bool {
+        self.hovering || self.mode == Mode::Open
+    }
+
     pub fn kind(&self) -> Kind {
         self.kind
     }

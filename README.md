@@ -7,6 +7,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 ## Features
 
 - **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. Drag an app, shortcut or file onto the dock to pin it: the glass strains like the skin of a water drop, then lets the icon slip in. Dividers group the pinned apps. The first icon opens an app launcher with search.
+- **App tray:** every installed app, the ones you use most on the first page and installers and admin tools on the last. Icons are kept in a file (`icons.cache`), so the tray opens full. Search ignores case and accents and finds apps by initials (`vsc`), short names (`cmd`, `calc`), program names (`winword`), several words (`ms word`) and small typos (`notepda`); what you picked before comes first. Drag a tile onto the dock to pin it.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
 - **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
 - **Four corners:** a small glass pill in each corner of the screen. Hover one to open its list.
@@ -14,6 +15,7 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
   - Top-right, **notifications:** a bell with a count. Each new app notification swells out as a card. In the list, click one to open its app or the ✕ to dismiss it.
   - Bottom-left, **weather:** temperature and sky for where the computer is. The location, rounded to about 10 km, is sent to Open-Meteo.
   - Bottom-right, **system:** CPU and memory in use. Click the very corner of the screen to show the desktop.
+- **Out of the way of maximized windows:** no screen space is reserved. While a maximized window is showing, the dock, the island and the corners leave, and a small white bar stays at the bottom edge. Put the cursor on the bar and the dock and island come back; 2 seconds after the cursor leaves, the dock goes again and the island shrinks to the time alone for 8 more seconds (hover it to get the whole island back). Volume, charging and now-playing changes still bring the island in for a moment.
 - **Floating windows:** new windows open centered at up to 70% of the screen instead of maximized.
 - **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon.
 - **Themes:** four glass materials, light/dark mode, accent tint.
@@ -29,10 +31,12 @@ Both Rust toolchains work: MSVC (needs the C++ Build Tools) or GNU (needs MinGW'
 
 ## Usage
 
-- **Pinning by drag and drop:** drag an app, shortcut or file from Explorer, the desktop or the app launcher onto the dock. Its icon squeezes in and follows the cursor; drop it where it should stay.
+- **Pinning by drag and drop:** drag an app, shortcut or file from Explorer, the desktop or the app launcher onto the dock. Its icon squeezes in and follows the cursor; drop it where it should stay. A tile dragged out of the app launcher closes the launcher and travels in a glass bubble under the cursor.
+- **Unpinning by drag:** drag a pinned icon up out of the dock and let go. It leaves in a bubble that bursts. Bring it back over the dock before letting go to keep it. An app that is open stays in the dock, among the open apps, until it closes.
 - **Dividers:** right-click a pinned icon and choose **Thêm vách ngăn phía sau** to put a divider after it. Drag a divider to move it; right-click it to remove it. Dividers are saved in `pins.txt` as `---` lines.
 - **Dock:** right-click an icon for app actions. Right-click empty space on the dock for settings, showing the Windows taskbar, autostart and quit.
 - **Settings:** open them from the dock menu, or edit `ben.ini` next to `ben.exe`. Changes apply immediately.
+- **Always shown or tucked away:** `show_on_desktop` (on by default) keeps the dock, island and corners in view while no window is maximized; `show_when_maximized` (off by default) keeps the dock and island in view over a maximized window. Turned off, each tucks them away behind the white bar. With `show_when_maximized` on, `reserve_space` stops maximized windows from covering them.
 - **Taskbar:** the Windows taskbar is hidden while Bến runs and comes back when it quits. If Bến crashes and the taskbar stays hidden, run `restore-taskbar.bat`.
 
 ## Command line

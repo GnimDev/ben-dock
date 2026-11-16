@@ -388,6 +388,8 @@ pub enum Released {
     Click(usize),
     /// The end of a drag that changed the order of the pinned apps (now saved).
     Reordered,
+    /// A pinned app was dragged out of the dock and let go there: it is off the dock (now saved).
+    Removed,
     Nothing,
 }
 
@@ -443,6 +445,15 @@ pub struct Dock {
     drag: Option<f32>,
     /// Where the mouse button went down, in window pixels.
     press_x: f32,
+    /// The dragged pinned app has been pulled up out of the dock: its room is closed, and the
+    /// app is told (see `pull`) so that a bubble can carry the icon. Let go there, it comes off.
+    pulled: bool,
+    pull_told: bool,
+    /// Tucked out of view, the dock leaves a small bar at the screen's bottom edge to come
+    /// back by (see `set_bar`): white, with a faint dark rim that shows it on a white window.
+    bar: bool,
+    bar_rim: Pill,
+    bar_pill: Pill,
     pub win_x: i32,
     pub win_y: i32,
     region: Option<(i32, i32, i32, i32)>,
@@ -465,6 +476,8 @@ impl Dock {
         };
         let lens = scene.bead_in(&glass.inner()?)?;
         let layer = scene.layer_in(&stage.content()?)?;
+        let bar_rim = scene.pill_in(&stage.content()?)?;
+        let bar_pill = scene.pill_in(&stage.content()?)?;
         let mut dock = Dock {
             hwnd,
             owned,
@@ -501,6 +514,11 @@ impl Dock {
             label_index: None,
             drag: None,
             press_x: 0.0,
+            pulled: false,
+            pull_told: false,
+            bar: false,
+            bar_rim,
+            bar_pill,
             win_x: 0,
             win_y: 0,
             region: None,
@@ -580,6 +598,7 @@ impl Dock {
         self.pressed = None;
         self.label_index = None;
         self.drag = None;
+        self.pulled = false;
     }
 
     pub fn save_pins(&self) {
@@ -602,6 +621,7 @@ impl Dock {
         self.hovered = None;
         self.label_index = None;
         self.drag = None;
+        self.pulled = false;
         true
     }
 
@@ -692,13 +712,15 @@ impl Dock {
         let mut pinned = 0;
         let mut unpinned = 0;
         let held_out = self.intake.as_ref().map(|i| !i.through).unwrap_or(false);
+        // The app being pulled out of the dock keeps its room closed until it is let go.
+        let pulled_key = if self.pulled { self.pressed.and_then(|p| self.items.get(p)).map(|i| i.key.clone()) } else { None };
         for item in self.items.iter_mut().filter(|i| i.is_app()) {
             let running = !item.windows.is_empty();
             item.running.set(if running { 1.0 } else { 0.0 });
             item.active.set(if item.windows.contains(&front) { 1.0 } else { 0.0 });
             let stays = item.pinned || running || item.bounce.is_some();
             // An icon the skin of the glass still holds out has only part of its room yet.
-            if !(item.ghost && held_out) {
+            if !(item.ghost && held_out) && pulled_key.as_deref() != Some(item.key.as_str()) {
                 item.presence.set(if stays { 1.0 } else { 0.0 });
             }
             if item.pinned {
@@ -973,13 +995,40 @@ impl Dock {
         self.pressed = self.app_at(x, y).or(self.divider_at(x, y));
         self.press_x = x;
         self.drag = None;
+        self.pulled = false;
         self.pressed
+    }
+
+    /// If a pinned app has just been pulled out of the dock (true) or put back (false) since the
+    /// last time this was asked.
+    pub fn pull(&mut self) -> Option<bool> {
+        (self.pulled != self.pull_told).then(|| {
+            self.pull_told = self.pulled;
+            self.pulled
+        })
+    }
+
+    /// The picture of the app being pulled out of the dock, and its size in pixels.
+    pub fn pulled_icon(&self) -> Option<(CompositionDrawingSurface, f32)> {
+        let item = self.items.get(self.pressed?)?;
+        let size = self.m.icon;
+        let (_, surface) = item.surfaces.iter().find(|(s, _)| *s >= size - 0.5).or(item.surfaces.last())?;
+        Some((surface.clone(), size))
     }
 
     /// The mouse button came up: a click, the end of a drag, or a release somewhere else.
     pub fn release(&mut self, x: f32, y: f32) -> Released {
         let Some(index) = self.pressed.take() else { return Released::Nothing };
         if self.drag.take().is_some() {
+            if std::mem::take(&mut self.pulled) {
+                // Let go outside the dock: the app comes off it. (One that is open stays among the
+                // open apps.)
+                self.toggle_pin(index);
+                if let Some(item) = self.items.last_mut().filter(|i| !i.windows.is_empty()) {
+                    item.presence.set(1.0);
+                }
+                return Released::Removed;
+            }
             // Dropped after dragging: keep the new order, do not treat it as a click.
             if self.items.get(index).map(|i| i.pinned).unwrap_or(false) {
                 self.save_pins();
@@ -1116,7 +1165,7 @@ impl Dock {
         }
 
         // Dragging an icon sideways moves it to a new place among its neighbours.
-        let moved = self.drag_icon(cx);
+        let moved = self.drag_icon(cx, cy);
 
         // Layout: rest widths, then the magnifier stretches them around the cursor.
         self.widths.clear();
@@ -1185,6 +1234,17 @@ impl Dock {
         if let Some(shade) = self.shade.as_mut() {
             shade.set_offset(0.0, slide)?;
         }
+        // The bar the tucked-away dock leaves at the bottom edge. It does not slide with the
+        // rest, and shows as the dock goes.
+        let (bar_w, bar_h, rim) = ((120.0 * m.scale).round(), (4.0 * m.scale).round(), m.scale.round().max(1.0));
+        let (bar_x, bar_y) = (((m.win_w as f32 - bar_w) * 0.5).round(), m.win_h as f32 - bar_h - (3.0 * m.scale).round() - slide);
+        let bar_shown = if self.bar { hide.pos.clamp(0.0, 1.0) } else { 0.0 };
+        self.bar_rim.place(bar_x - rim, bar_y - rim, bar_w + 2.0 * rim, bar_h + 2.0 * rim, bar_h * 0.5 + rim)?;
+        self.bar_rim.set_color(rgba(0.0, 0.0, 0.0, 0.32))?;
+        self.bar_rim.set_opacity(bar_shown)?;
+        self.bar_pill.place(bar_x, bar_y, bar_w, bar_h, bar_h * 0.5)?;
+        self.bar_pill.set_color(rgba(1.0, 1.0, 1.0, 0.92))?;
+        self.bar_pill.set_opacity(bar_shown)?;
         // While an icon is pushed in from outside, and for a moment after, the glass is a
         // drop of water: its top edge dents and waves run along it. The glass gets room above
         // its resting edge for the highest of them, and is cut to the line they make.
@@ -1399,21 +1459,39 @@ impl Dock {
 
     /// Handles dragging an icon sideways. Returns the icons that changed places this frame, as
     /// (new index, where its centre was on screen), so they can glide instead of jumping.
-    fn drag_icon(&mut self, cx: f32) -> Vec<(usize, f32)> {
+    fn drag_icon(&mut self, cx: f32, cy: f32) -> Vec<(usize, f32)> {
         let mut moved = Vec::new();
         let Some(mut index) = self.pressed else { return moved };
         if index >= self.items.len() || index >= self.slots.len() || !cx.is_finite() {
             return moved;
         }
         if self.drag.is_none() {
-            // A press turns into a drag once the cursor has clearly moved.
-            if (cx - self.press_x).abs() < 6.0 * self.m.scale {
+            // A press turns into a drag once the cursor has clearly moved sideways, or has left
+            // the dock upwards, past where a magnified icon reaches. (A hand that only trembles
+            // on a click must not start one: the click would be lost.)
+            let lifted = cy.is_finite() && cy < self.m.panel_top - self.m.icon * (self.m.amp + 0.5);
+            if (cx - self.press_x).abs() < 6.0 * self.m.scale && !lifted {
                 return moved;
             }
             if self.items[index].is_special() {
                 return moved;
             }
             self.drag = Some(self.press_x - self.slots[index].center());
+        }
+        // Pulled up out of the dock, a pinned app is on its way off it: its room closes. Taken
+        // back over the dock, it is let in again.
+        if cy.is_finite() && self.items[index].is_app() && self.items[index].pinned && !self.items[index].ghost {
+            // (Higher than a magnified icon stands; and once out, it takes coming well back to be in again.)
+            let line = self.m.panel_top - self.m.icon * (self.m.amp + if self.pulled { 0.1 } else { 0.5 });
+            let out = cy < line;
+            if out != self.pulled {
+                self.pulled = out;
+                self.items[index].presence.set(if out { 0.0 } else { 1.0 });
+                self.label_index = None;
+            }
+        }
+        if self.pulled {
+            return moved;
         }
         let grab = self.drag.unwrap_or(0.0);
         let centre = cx - grab;
@@ -1459,7 +1537,11 @@ impl Dock {
         let watery = self.intake.is_some() || !self.spray.is_empty() || !self.surface.calm();
         let lively = watery || self.mag.pos > 0.001 || self.label_alpha.pos > 0.001 || self.items.iter().any(|i| i.bounce.is_some());
         let (px, _, pw, _) = self.panel;
-        let wanted = if hidden {
+        let wanted = if hidden && self.bar {
+            // Out of view, but for the strip at the bottom edge that brings it back.
+            let (l, t, r, b) = self.bar_zone();
+            (l.floor() as i32, t.floor() as i32, r.ceil() as i32, b.ceil() as i32)
+        } else if hidden {
             (0, 0, 0, 0)
         } else if lively {
             let grow = m.amp * m.mag_radius * 0.5 + 24.0 * m.scale;
@@ -1478,6 +1560,21 @@ impl Dock {
             let rgn = CreateRectRgn(wanted.0, wanted.1, wanted.2, wanted.3);
             SetWindowRgn(self.hwnd, Some(rgn), false);
         }
+    }
+
+    /// Whether the dock, when it is out of view, leaves a bar at the screen's bottom edge to
+    /// come back by (it does when it is only tucked away, not for a full-screen app).
+    pub fn set_bar(&mut self, on: bool) {
+        self.bar = on;
+    }
+
+    /// The strip at the screen's bottom edge that brings the tucked-away dock back: as wide
+    /// as the dock at rest, in window coordinates (left, top, right, bottom).
+    pub fn bar_zone(&self) -> (f32, f32, f32, f32) {
+        let m = self.m;
+        let half = (self.widths.iter().sum::<f32>() * 0.5 + m.pad_x).max(90.0 * m.scale);
+        let mid = m.win_w as f32 * 0.5;
+        (mid - half, m.win_h as f32 - (10.0 * m.scale).round(), mid + half, m.win_h as f32)
     }
 
     /// Where the glass is on the screen: left, top, right, bottom.
