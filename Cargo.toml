@@ -8,6 +8,7 @@ description = "Bến — a liquid interface for Windows 11: a dock and a dynamic
 windows-core = "0.62"
 windows-numerics = "0.3"
 windows = { version = "0.62", features = [
+  "ApplicationModel",
   "Devices_Bluetooth",
   "Devices_Enumeration",
   "Devices_Radios",
@@ -16,11 +17,15 @@ windows = { version = "0.62", features = [
   "Foundation_Numerics",
   "Graphics_DirectX",
   "Graphics_Effects",
+  "Graphics_Imaging",
   "Media_Control",
+  "Storage_Streams",
   "System",
   "UI",
   "UI_Composition",
   "UI_Composition_Desktop",
+  "UI_Notifications",
+  "UI_Notifications_Management",
   "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
   "Win32_Graphics_Direct2D",

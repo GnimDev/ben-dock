@@ -15,8 +15,10 @@ use crate::fx::{self, Fx};
 use crate::gfx::Gfx;
 use crate::island::{self, Action, Alert, Island, Page, Row};
 use crate::launcher::{self, Launcher};
+use crate::claude::{self, Claude};
 use crate::media::{self, Media, NowPlaying};
 use crate::motion::Motion;
+use crate::notices::{Notice, Notices};
 use crate::preview::{self, Preview};
 use crate::scene::Scene;
 use crate::settings;
@@ -47,6 +49,8 @@ const WM_VOLUME_CHANGED: u32 = WM_APP + 3;
 const WM_MEDIA_CHANGED: u32 = WM_APP + 4;
 const WM_APPS_FOUND: u32 = WM_APP + 5;
 const WM_PAGE_DATA: u32 = WM_APP + 6;
+const WM_NOTICES_CHANGED: u32 = WM_APP + 7;
+const WM_CLAUDE_READ: u32 = WM_APP + 8;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
@@ -103,6 +107,7 @@ mod row {
     pub const REFRESH: usize = 6;
     pub const LOCATION: usize = 7;
     pub const PASSWORD: usize = 8;
+    pub const CLEAR: usize = 9;
     /// A row of a list: `LISTED + index into the list that was shown`.
     pub const LISTED: usize = 100;
 }
@@ -111,6 +116,49 @@ mod row {
 const TICK: u32 = 0xE73E;
 const LOCK: u32 = 0xE72E;
 const GEAR: u32 = 0xE713;
+const BELL: u32 = 0xEA8F;
+const BIN: u32 = 0xE74D;
+const CLOCK: u32 = 0xE823;
+const WEEK: u32 = 0xE787;
+const SPEECH: u32 = 0xE8BD;
+const DOWN: u32 = 0xE896;
+const UP: u32 = 0xE898;
+
+/// How many notifications the island's page lists.
+const NOTICES_LISTED: usize = 4;
+
+/// A count of tokens in a few characters: 950, then thousands (N), millions (Tr), billions (T).
+fn short_count(count: u64) -> String {
+    let with = |value: f64, unit: &str| if value >= 100.0 { format!("{value:.0} {unit}") } else { format!("{value:.1} {unit}").replace('.', ",") };
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => with(count as f64 / 1e3, "N"),
+        1_000_000..=999_999_999 => with(count as f64 / 1e6, "Tr"),
+        _ => with(count as f64 / 1e9, "T"),
+    }
+}
+
+/// A stretch of time in its two largest units: 3 ngày 4 giờ, 2 giờ 10 phút, 45 phút.
+fn stretch(seconds: i64) -> String {
+    let minutes = (seconds.max(0) + 59) / 60;
+    let (days, hours, rest) = (minutes / 1440, minutes % 1440 / 60, minutes % 60);
+    match (days, hours) {
+        (0, 0) => format!("{rest} phút"),
+        (0, _) => format!("{hours} giờ {rest} phút"),
+        _ => format!("{days} ngày {hours} giờ"),
+    }
+}
+
+/// How long ago something happened, in one unit; `ticks` in units of 100 ns.
+fn ago(ticks: i64) -> String {
+    let minutes = ticks.max(0) / 600_000_000;
+    match minutes {
+        0 => "vừa xong".to_string(),
+        1..=59 => format!("{minutes} phút"),
+        60..=1439 => format!("{} giờ", minutes / 60),
+        _ => format!("{} ngày", minutes / 1440),
+    }
+}
 
 // ------------------------------------------------------------------ events
 //
@@ -157,6 +205,10 @@ pub enum Event {
     Apps,
     /// Something a page of the island was waiting for has been read.
     PageData,
+    /// A notification arrived, or one went.
+    Notices,
+    /// Claude's usage has been read.
+    Claude,
     /// From an island (its window comes first).
     Island(isize, island::Input),
     Bubble(bubble::Input),
@@ -293,6 +345,14 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             push(Event::PageData);
             return LRESULT(0);
         }
+        WM_NOTICES_CHANGED => {
+            push(Event::Notices);
+            return LRESULT(0);
+        }
+        WM_CLAUDE_READ => {
+            push(Event::Claude);
+            return LRESULT(0);
+        }
         WM_POWERBROADCAST => push(Event::Power),
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION => {
@@ -425,6 +485,7 @@ enum Act {
     LeaveDock,
     AlertVolume,
     AlertTrack,
+    AlertNotice,
     OpenIsland,
     OpenPage(Page),
     CloseIsland,
@@ -441,18 +502,21 @@ const DEMO: &[(f32, Act)] = &[
     (7.5, Act::LeaveDock),
     (8.0, Act::AlertVolume),
     (10.5, Act::AlertTrack),
-    (13.0, Act::OpenIsland),
-    (15.5, Act::OpenPage(Page::Wifi)),
-    (18.0, Act::OpenPage(Page::Sound)),
-    (20.5, Act::OpenPage(Page::Bluetooth)),
-    (23.0, Act::OpenPage(Page::Battery)),
-    (25.5, Act::OpenPage(Page::Calendar)),
-    (28.0, Act::CloseIsland),
-    (28.5, Act::OpenMenu),
-    (31.0, Act::CloseMenu),
-    (31.5, Act::OpenTray),
-    (35.0, Act::CloseTray),
-    (36.0, Act::End),
+    (13.0, Act::AlertNotice),
+    (18.5, Act::OpenIsland),
+    (21.0, Act::OpenPage(Page::Wifi)),
+    (23.5, Act::OpenPage(Page::Sound)),
+    (26.0, Act::OpenPage(Page::Bluetooth)),
+    (28.5, Act::OpenPage(Page::Battery)),
+    (31.0, Act::OpenPage(Page::Notices)),
+    (33.5, Act::OpenPage(Page::Claude)),
+    (37.0, Act::OpenPage(Page::Calendar)),
+    (39.5, Act::CloseIsland),
+    (40.0, Act::OpenMenu),
+    (42.5, Act::CloseMenu),
+    (43.0, Act::OpenTray),
+    (46.5, Act::CloseTray),
+    (47.5, Act::End),
 ];
 
 /// The picture of a window that has flown back out is kept up until the real window is there.
@@ -540,6 +604,13 @@ pub struct App {
     today: (i32, u32, u32),
     media: Option<Media>,
     playing: Option<NowPlaying>,
+    /// The notification watcher, and what is in Windows' notification centre, newest first.
+    notices: Option<Notices>,
+    noticed: Vec<Notice>,
+    /// The reader of Claude's usage, what it last read, and when it was last asked.
+    claude: Option<Claude>,
+    usage: Option<claude::Usage>,
+    claude_asked: Instant,
 
     // What the island's pages show.
     /// The Wi-Fi networks as last listed (the page's rows point into this).
@@ -639,6 +710,11 @@ impl App {
             today: system::today(),
             media: None,
             playing: None,
+            notices: None,
+            noticed: Vec::new(),
+            claude: None,
+            usage: None,
+            claude_asked: Instant::now(),
             wifi_list: Vec::new(),
             wifi_asking: None,
             wifi_note: None,
@@ -786,6 +862,20 @@ impl App {
             self.media = None;
             self.playing = None;
         }
+        let want_notices = self.cfg.island && self.cfg.island_notices;
+        if want_notices && self.notices.is_none() {
+            self.notices = Some(Notices::start(self.hwnd, WM_NOTICES_CHANGED));
+        } else if !want_notices {
+            self.notices = None;
+            self.noticed.clear();
+        }
+        let want_claude = self.cfg.island && self.cfg.island_claude;
+        if want_claude && self.claude.is_none() {
+            self.claude = Some(Claude::start(self.hwnd, WM_CLAUDE_READ));
+        } else if !want_claude {
+            self.claude = None;
+            self.usage = None;
+        }
 
         let first = &self.screens[0].theme;
         if self.bubble.is_none() {
@@ -898,7 +988,7 @@ impl App {
 
     pub fn handle(&mut self, ev: Event) {
         self.touched = true;
-        if !matches!(ev, Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData) {
+        if !matches!(ev, Event::Tick | Event::Shell(..) | Event::WindowsChanged | Event::Moved(_) | Event::Media | Event::Apps | Event::Power | Event::AppBar(_) | Event::Wake | Event::PageData | Event::Notices | Event::Claude) {
             self.busy();
         }
         if matches!(ev, Event::MouseMove(_) | Event::LeftDown(..) | Event::LeftUp(..) | Event::MiddleUp(..) | Event::RightUp(..) | Event::PreviewClick(_) | Event::PreviewHover | Event::Island(..) | Event::Bubble(_) | Event::Launcher(_)) {
@@ -978,8 +1068,12 @@ impl App {
                 }
                 self.follow_wifi();
                 // A page that is open keeps up with what it shows.
-                for page in [Page::Wifi, Page::Sound, Page::Battery] {
+                for page in [Page::Wifi, Page::Sound, Page::Battery, Page::Notices] {
                     self.refresh_pages(page);
+                }
+                // The Claude page has its numbers read again every few seconds while it is open.
+                if self.claude_asked.elapsed().as_secs() >= 5 && self.screens.iter().any(|screen| screen.island.as_ref().and_then(|i| i.page()) == Some(Page::Claude)) {
+                    self.ask_claude();
                 }
                 self.housekeeping();
                 self.note_stats();
@@ -1074,6 +1168,8 @@ impl App {
             }
             Event::Volume | Event::Power => self.read_status(),
             Event::Media => self.take_media(),
+            Event::Notices => self.take_notices(),
+            Event::Claude => self.take_usage(),
             Event::Apps => self.take_found_apps(),
             Event::PageData => {
                 if let Some(read) = self.bluetooth_reading.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -1186,10 +1282,35 @@ impl App {
         if let Some(now) = &latest {
             let new_track = self.playing.as_ref().map(|old| old.title != now.title).unwrap_or(true);
             if new_track && now.playing && !now.title.is_empty() {
-                self.alert(Alert::Track { title: now.title.clone(), artist: now.artist.clone() });
+                self.alert(Alert::Track { title: now.title.clone(), artist: now.artist.clone(), art: now.art.clone() });
             }
         }
         self.playing = latest;
+    }
+
+    /// Takes what the notification watcher has sent; a new one gets a moment on the islands.
+    fn take_notices(&mut self) {
+        let Some((all, fresh)) = self.notices.as_ref().and_then(|n| n.take()) else { return };
+        for notice in fresh {
+            self.alert(Alert::Notice { app: notice.app, title: notice.title, body: notice.body, logo: notice.logo });
+        }
+        self.noticed = all;
+        self.refresh_pages(Page::Notices);
+    }
+
+    /// Takes what the reader of Claude's usage has sent.
+    fn take_usage(&mut self) {
+        let Some(usage) = self.claude.as_ref().and_then(|c| c.take()) else { return };
+        self.usage = Some(usage);
+        self.refresh_pages(Page::Claude);
+    }
+
+    /// Has Claude's usage read again; the numbers come back as `Event::Claude`.
+    fn ask_claude(&mut self) {
+        self.claude_asked = Instant::now();
+        if let Some(claude) = self.claude.as_ref() {
+            claude.look();
+        }
     }
 
     fn take_found_apps(&mut self) {
@@ -1217,6 +1338,9 @@ impl App {
             Action::Previous => self.send_media(media::Command::Previous),
             Action::PlayPause => self.send_media(media::Command::Toggle),
             Action::Next => self.send_media(media::Command::Next),
+            Action::Seek(share) => self.send_media(media::Command::Seek(share)),
+            Action::Shuffle => self.send_media(media::Command::Shuffle),
+            Action::Repeat => self.send_media(media::Command::Repeat),
             Action::Volume(level) => {
                 self.status.set_volume(level);
                 if level > 0.0 && self.last_status.volume.map(|(_, muted)| muted).unwrap_or(false) {
@@ -1246,6 +1370,13 @@ impl App {
             }
             Action::Open(page) => self.open_page(s, page),
             Action::Row(page, id) => self.page_row(s, page, id),
+            // The cross at the end of a notification takes it off the list, and out of Windows' own.
+            Action::Close(Page::Notices, id) if id >= row::LISTED => {
+                if let (Some(notices), Some(notice)) = (self.notices.as_ref(), self.noticed.get(id - row::LISTED)) {
+                    notices.remove(notice.id);
+                }
+            }
+            Action::Close(..) => {}
             Action::Enter(Page::Wifi) => self.wifi_row(s, row::JOIN),
             Action::Enter(_) => {}
         }
@@ -1282,6 +1413,8 @@ impl App {
             Page::Sound => Some(("Âm thanh", self.sound_rows())),
             Page::Bluetooth => Some(("Bluetooth", self.bluetooth_rows())),
             Page::Battery => Some(("Pin", self.battery_rows())),
+            Page::Notices => Some(("Thông báo", self.notice_rows())),
+            Page::Claude => Some(("Claude", self.claude_rows())),
             Page::Home | Page::Calendar => None,
         }
     }
@@ -1296,6 +1429,7 @@ impl App {
                 wifi::refresh();
             }
             Page::Bluetooth => self.read_bluetooth(None),
+            Page::Claude => self.ask_claude(),
             _ => {}
         }
         let Some((title, rows)) = self.page_rows(page) else { return };
@@ -1350,6 +1484,19 @@ impl App {
                 self.refresh_pages(Page::Bluetooth);
             }
             (Page::Battery, row::SETTINGS) => settings_page(self, "ms-settings:powersleep"),
+            (Page::Notices, row::SETTINGS) => settings_page(self, "ms-settings:notifications"),
+            (Page::Notices, row::CLEAR) => {
+                if let Some(notices) = self.notices.as_ref() {
+                    notices.clear();
+                }
+            }
+            // A click on a notification goes to the app that sent it. (Only the cross at its
+            // end takes it off the list.)
+            (Page::Notices, id) if id >= row::LISTED => {
+                if let Some(app_id) = self.noticed.get(id - row::LISTED).map(|notice| notice.app_id.clone()).filter(|app_id| !app_id.is_empty()) {
+                    settings_page(self, &format!("{}{app_id}", shell::APPS_FOLDER));
+                }
+            }
             _ => {}
         }
     }
@@ -1576,6 +1723,60 @@ impl App {
             None => rows.push(Row::note("Máy này không có pin")),
         }
         rows.push(Row::item(row::SETTINGS, GEAR, "Cài đặt pin của Windows…"));
+        rows
+    }
+
+    /// The notifications page: the latest few, newest first. A click on one goes to its app;
+    /// the cross at its end takes it off the list.
+    fn notice_rows(&self) -> Vec<Row> {
+        if self.notices.is_none() {
+            return vec![Row::note("Đang tắt. Bật \"Thông báo của ứng dụng\" trong Cài đặt Bến.")];
+        }
+        let mut rows = Vec::new();
+        let now = media::ticks_now();
+        for (index, notice) in self.noticed.iter().take(NOTICES_LISTED).enumerate() {
+            let said = if notice.title.is_empty() { &notice.app } else { &notice.title };
+            rows.push(Row::item(row::LISTED + index, BELL, said).hint(&format!("{} · {}", notice.app, ago(now - notice.arrived))).closes());
+            if !notice.body.is_empty() {
+                rows.push(Row::note(&notice.body));
+            }
+        }
+        if self.noticed.is_empty() {
+            rows.push(Row::note("Không có thông báo nào"));
+        } else {
+            if self.noticed.len() > NOTICES_LISTED {
+                rows.push(Row::note(&format!("và {} thông báo khác", self.noticed.len() - NOTICES_LISTED)));
+            }
+            rows.push(Row::item(row::CLEAR, BIN, "Xoá tất cả"));
+        }
+        rows
+    }
+
+    /// The Claude page: how much of the plan's limits is used, where Claude Code has noted
+    /// that down, and what Claude Code took today.
+    fn claude_rows(&self) -> Vec<Row> {
+        if self.claude.is_none() {
+            return vec![Row::note("Đang tắt. Bật \"Claude\" trong Cài đặt Bến.")];
+        }
+        let Some(usage) = &self.usage else { return vec![Row::note("Đang đọc…")] };
+        let mut rows = Vec::new();
+        for (glyph, name, limit) in [(CLOCK, "Phiên 5 giờ", usage.session), (WEEK, "Tuần này", usage.week)] {
+            if let Some((percent, left)) = limit {
+                rows.push(Row::item(0, glyph, name).hint(&format!("đã dùng {percent}%")));
+                rows.push(Row::note(&format!("Tính lại sau {}", stretch(left))));
+            }
+        }
+        if usage.session.is_none() && usage.week.is_none() {
+            rows.push(Row::note("Chưa có số liệu giới hạn mới từ Claude Code"));
+        }
+        rows.push(Row::note("Hôm nay"));
+        rows.push(Row::item(0, SPEECH, "Lượt trả lời").hint(&usage.today.replies.to_string()));
+        rows.push(Row::item(0, DOWN, "Token Claude viết ra").hint(&short_count(usage.today.written)));
+        rows.push(Row::item(0, UP, "Token gửi vào").hint(&short_count(usage.today.read)));
+        rows.push(Row::note(&format!("5 giờ qua: {} lượt, viết ra {} token", usage.recent.replies, short_count(usage.recent.written))));
+        if usage.running > 0 {
+            rows.push(Row::note(&format!("{} phiên đang chạy", usage.running)));
+        }
         rows
     }
 
@@ -1989,7 +2190,7 @@ impl App {
         if cfg.preview_size != old.preview_size || !cfg.preview {
             self.close_preview();
         }
-        if done || cfg.island != old.island || cfg.launcher != old.launcher || cfg.island_media != old.island_media {
+        if done || cfg.island != old.island || cfg.launcher != old.launcher || cfg.island_media != old.island_media || cfg.island_notices != old.island_notices || cfg.island_claude != old.island_claude {
             self.setup_surfaces();
         }
         if cfg.ram_limit != old.ram_limit && done {
@@ -2448,7 +2649,8 @@ impl App {
             }
             Act::LeaveDock => self.demo_cursor = None,
             Act::AlertVolume => self.alert(Alert::Volume { level: 0.62, muted: false }),
-            Act::AlertTrack => self.alert(Alert::Track { title: "Bài hát đang phát".to_string(), artist: "Nghệ sĩ".to_string() }),
+            Act::AlertTrack => self.alert(Alert::Track { title: "Bài hát đang phát".to_string(), artist: "Nghệ sĩ".to_string(), art: self.playing.as_ref().and_then(|track| track.art.clone()) }),
+            Act::AlertNotice => self.alert(Alert::Notice { app: "Tin nhắn".to_string(), title: "Lan".to_string(), body: "Tối nay mình ăn gì nhỉ?".to_string(), logo: None }),
             Act::OpenIsland => {
                 if let Some(island) = self.screens[0].island.as_mut() {
                     island.open();
@@ -2548,6 +2750,8 @@ impl App {
         self.scan = None;
         self.bubble = None;
         self.media = None;
+        self.notices = None;
+        self.claude = None;
         system::restore_window_animations();
         // Each screen's dock and island give their strip of screen back as they go.
         self.screens.clear();

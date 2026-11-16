@@ -6,6 +6,9 @@ A liquid-glass shell for Windows 11. It replaces the taskbar with a glass dock a
 
 - **Dock:** pinned and running apps. Icons magnify under the cursor, show live window previews on hover, and can be dragged to reorder. The first icon opens an app launcher with search.
 - **Dynamic island:** clock, date, network and battery. It expands for volume, charging, connectivity and now-playing changes. Hover it to open a control panel with media controls, volume, Wi-Fi, Bluetooth, audio output, battery, a calendar and power buttons.
+- **Now playing:** cover art, a seek bar, shuffle and repeat for whatever player Windows reports (Spotify included). No account or sign-in is needed.
+- **Notifications:** the island shows each app notification as it arrives, and a page lists the recent ones. Click one to open its app, or the ✕ to dismiss it.
+- **Claude:** a page with today's Claude Code usage (replies and tokens), read from the files Claude Code keeps on this computer. It never reads Claude's sign-in.
 - **Floating windows:** new windows open centered at up to 70% of the screen instead of maximized.
 - **Minimize effects:** windows minimize into their own dock icon. A genie-style effect plays when you click the icon.
 - **Themes:** four glass materials, light/dark mode, accent tint.

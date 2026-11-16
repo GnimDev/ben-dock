@@ -23,9 +23,9 @@ use crate::app::{self, Event};
 use crate::config::Config;
 use crate::dates;
 use crate::gfx::Gfx;
-use crate::media::NowPlaying;
+use crate::media::{Art, NowPlaying};
 use crate::motion::{Glide, Motion};
-use crate::scene::{rgba, Bead, Glass, Layer, Pill, Scene, Stage};
+use crate::scene::{rgba, Bead, Glass, Layer, Pill, Scene, Sprite, Stage};
 use crate::shade::Shade;
 use crate::spring::Spring;
 use crate::system::{AppBar, Monitor, Status};
@@ -52,6 +52,8 @@ const TIMER_LEAVE: usize = 3;
 /// How long an alert stays, how long the cursor must rest before the island opens, and how
 /// long after it left before the island closes. Milliseconds.
 const ALERT_MS: u32 = 2400;
+/// Another app's notification takes reading, so it stays longer.
+const NOTICE_MS: u32 = 5200;
 const DWELL_MS: u32 = 110;
 const LEAVE_MS: u32 = 320;
 
@@ -87,7 +89,9 @@ pub enum Alert {
     Power { percent: u8, plugged: bool },
     LowBattery(u8),
     Network(bool),
-    Track { title: String, artist: String },
+    Track { title: String, artist: String, art: Option<Art> },
+    /// Another app's notification.
+    Notice { app: String, title: String, body: String, logo: Option<Art> },
 }
 
 /// The pages of the open panel.
@@ -99,6 +103,8 @@ pub enum Page {
     Bluetooth,
     Battery,
     Calendar,
+    Notices,
+    Claude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -125,23 +131,32 @@ pub struct Row {
     pub hint: String,
     /// A symbol at the far right (0 = none): a tick, a lock.
     pub mark: u32,
+    /// The symbol at the far right is a cross of its own to click: it takes the row away.
+    pub close: bool,
 }
 
 impl Row {
     pub fn item(id: usize, glyph: u32, text: &str) -> Self {
-        Row { id, kind: RowKind::Item, glyph, text: text.to_string(), hint: String::new(), mark: 0 }
+        Row { id, kind: RowKind::Item, glyph, text: text.to_string(), hint: String::new(), mark: 0, close: false }
     }
 
     pub fn note(text: &str) -> Self {
-        Row { id: 0, kind: RowKind::Note, glyph: 0, text: text.to_string(), hint: String::new(), mark: 0 }
+        Row { id: 0, kind: RowKind::Note, glyph: 0, text: text.to_string(), hint: String::new(), mark: 0, close: false }
     }
 
     pub fn field(id: usize, placeholder: &str) -> Self {
-        Row { id, kind: RowKind::Field, glyph: 0, text: placeholder.to_string(), hint: String::new(), mark: 0 }
+        Row { id, kind: RowKind::Field, glyph: 0, text: placeholder.to_string(), hint: String::new(), mark: 0, close: false }
     }
 
     pub fn switch(id: usize, glyph: u32, text: &str, on: bool) -> Self {
-        Row { id, kind: RowKind::Switch(on), glyph, text: text.to_string(), hint: String::new(), mark: 0 }
+        Row { id, kind: RowKind::Switch(on), glyph, text: text.to_string(), hint: String::new(), mark: 0, close: false }
+    }
+
+    /// Gives the row a cross at its far right that is clicked by itself.
+    pub fn closes(mut self) -> Self {
+        self.mark = 0xE711;
+        self.close = true;
+        self
     }
 
     pub fn hint(mut self, hint: &str) -> Self {
@@ -162,6 +177,10 @@ pub enum Action {
     Previous,
     PlayPause,
     Next,
+    /// Jump to this share of the track, 0 to 1.
+    Seek(f32),
+    Shuffle,
+    Repeat,
     Volume(f32),
     Mute,
     Settings,
@@ -173,6 +192,8 @@ pub enum Action {
     Open(Page),
     /// A row of a page was clicked.
     Row(Page, usize),
+    /// The cross at the end of a row was clicked.
+    Close(Page, usize),
     /// Enter was pressed in a page's text field (what was typed is in `Island::typed`).
     Enter(Page),
 }
@@ -200,6 +221,10 @@ enum Zone {
     Previous,
     PlayPause,
     Next,
+    /// The bar that shows how far into the track it is.
+    Seek,
+    Shuffle,
+    Repeat,
     Mute,
     Slider,
     Settings,
@@ -213,6 +238,8 @@ enum Zone {
     Back,
     /// A row of a list page (its index).
     Row(usize),
+    /// The cross at the end of a row (the row's index).
+    Close(usize),
     /// The eye in a text field: show what was typed.
     Eye,
     MonthBefore,
@@ -274,12 +301,28 @@ pub struct Island {
     a_icon: Line,
     a_text: Line,
     a_value: Line,
+    /// A notification's second line.
+    a_body: Line,
+    /// A cover or an app's own mark, in the symbol's place; and which picture it shows.
+    a_art: Sprite,
+    a_art_of: Option<Art>,
 
     // The first page.
     home: Layer,
     p_tile: Pill,
     p_track: Pill,
     p_fill: Pill,
+    /// The cover of what is playing, over its tile; and which picture it shows.
+    p_art: Sprite,
+    p_art_of: Option<Art>,
+    // How far into the track: a bar with its knob, the two times, shuffle and repeat.
+    p_seek_track: Pill,
+    p_seek_fill: Pill,
+    p_seek_knob: Pill,
+    p_elapsed: Line,
+    p_length: Line,
+    p_shuffle: Line,
+    p_repeat: Line,
     cards: Vec<Button>,
     buttons: Vec<Button>,
     /// The drop of light under the cursor, one for each kind of page.
@@ -346,6 +389,10 @@ pub struct Island {
     zones: Zones,
     /// Ends of the volume slider's track, in window pixels.
     slider: (f32, f32),
+    /// Ends of the track's own bar, in window pixels, and the share of the track under the
+    /// cursor while its knob is being dragged.
+    seek: (f32, f32),
+    seeking: Option<f32>,
     volume: (f32, bool),
     hover_opens: bool,
 
@@ -432,6 +479,12 @@ pub fn battery_glyph(percent: u8, charging: bool) -> u32 {
     }
 }
 
+/// A length of time as minutes and seconds: 3:07.
+fn minutes(seconds: f32) -> String {
+    let whole = seconds.max(0.0) as u32;
+    format!("{}:{:02}", whole / 60, whole % 60)
+}
+
 fn volume_glyph(level: f32, muted: bool) -> u32 {
     if muted {
         0xE74F
@@ -491,20 +544,25 @@ impl Island {
             let alert = scene.layer_in(&inside)?;
             let a = alert.content()?;
             let (a_track, a_fill) = (scene.pill_in(&a)?, scene.pill_in(&a)?);
-            let (a_icon, a_text, a_value) = (line(&a)?, line(&a)?, line(&a)?);
+            let (a_icon, a_text, a_value, a_body) = (line(&a)?, line(&a)?, line(&a)?, line(&a)?);
+            let a_art = scene.sprite_in(&a)?;
 
             let home = scene.layer_in(&inside)?;
             let p = home.content()?;
             // Fills first, so they lie under the drop of light and the text.
             let (p_tile, p_track, p_fill) = (scene.pill_in(&p)?, scene.pill_in(&p)?, scene.pill_in(&p)?);
-            let backs = (0..8).map(|_| scene.pill_in(&p)).collect::<Result<Vec<_>>>()?;
+            let p_art = scene.sprite_in(&p)?;
+            let (p_seek_track, p_seek_fill) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
+            let backs = (0..10).map(|_| scene.pill_in(&p)).collect::<Result<Vec<_>>>()?;
             let hot_home = scene.bead_in(&p)?;
-            let p_knob = scene.pill_in(&p)?;
+            let (p_knob, p_seek_knob) = (scene.pill_in(&p)?, scene.pill_in(&p)?);
             let specs = [
                 (Zone::Card(Page::Wifi), 0xE701, "Wi-Fi"),
                 (Zone::Card(Page::Bluetooth), 0xE702, "Bluetooth"),
                 (Zone::Card(Page::Sound), 0xE767, "Âm thanh"),
                 (Zone::Card(Page::Battery), 0xE83F, "Pin"),
+                (Zone::Card(Page::Notices), 0xEA8F, "Thông báo"),
+                (Zone::Card(Page::Claude), 0xE706, "Claude"),
                 (Zone::Settings, 0xE713, "Cài đặt"),
                 (Zone::Lock, 0xE72E, "Khoá"),
                 (Zone::Sleep, 0xE708, "Ngủ"),
@@ -514,7 +572,7 @@ impl Island {
             for (back, (zone, code, text)) in backs.into_iter().zip(specs) {
                 made.push(Button { zone, code, text, back, icon: line(&p)?, label: line(&p)? });
             }
-            let buttons = made.split_off(4);
+            let buttons = made.split_off(6);
             let cards = made;
 
             let list = scene.layer_in(&inside)?;
@@ -543,10 +601,22 @@ impl Island {
                 a_icon,
                 a_text,
                 a_value,
+                a_body,
+                a_art,
+                a_art_of: None,
                 alert,
                 p_tile,
                 p_track,
                 p_fill,
+                p_art,
+                p_art_of: None,
+                p_seek_track,
+                p_seek_fill,
+                p_seek_knob,
+                p_elapsed: line(&p)?,
+                p_length: line(&p)?,
+                p_shuffle: line(&p)?,
+                p_repeat: line(&p)?,
                 cards,
                 buttons,
                 hot: [hot_home, hot_list, hot_month],
@@ -604,6 +674,8 @@ impl Island {
                 cursor: None,
                 zones: Vec::new(),
                 slider: (0.0, 1.0),
+                seek: (0.0, 1.0),
+                seeking: None,
                 volume: (0.0, false),
                 hover_opens: true,
                 scale: 1.0,
@@ -678,6 +750,11 @@ impl Island {
             &mut self.a_icon,
             &mut self.a_text,
             &mut self.a_value,
+            &mut self.a_body,
+            &mut self.p_elapsed,
+            &mut self.p_length,
+            &mut self.p_shuffle,
+            &mut self.p_repeat,
             &mut self.p_time,
             &mut self.p_date,
             &mut self.p_net,
@@ -705,8 +782,10 @@ impl Island {
             button.icon.forget();
             button.label.forget();
         }
-        // Rows are made again from scratch.
+        // Rows are made again from scratch, and so are the pictures.
         self.looks.clear();
+        self.p_art_of = None;
+        self.a_art_of = None;
     }
 
     fn timer(&self, id: usize, ms: u32) {
@@ -747,12 +826,13 @@ impl Island {
                 self.level.snap(self.level.target);
             }
         }
+        let stay = if matches!(alert, Alert::Notice { .. }) { NOTICE_MS } else { ALERT_MS };
         self.current = Some(alert);
         self.alerting = true;
         if self.mode != Mode::Open {
             self.mode = Mode::Alert;
         }
-        self.timer(TIMER_ALERT, ALERT_MS);
+        self.timer(TIMER_ALERT, stay);
     }
 
     /// Closes the open panel (something else took the stage).
@@ -815,6 +895,11 @@ impl Island {
         ((x - a) / (b - a).max(1.0)).clamp(0.0, 1.0)
     }
 
+    fn seek_value(&self, x: f32) -> f32 {
+        let (a, b) = self.seek;
+        ((x - a) / (b - a).max(1.0)).clamp(0.0, 1.0)
+    }
+
     fn go_home(&mut self) {
         self.page = Page::Home;
         self.typed.clear();
@@ -836,13 +921,16 @@ impl Island {
                 if self.dragging {
                     return Action::Volume(self.slider_value(x as f32));
                 }
+                if self.seeking.is_some() {
+                    self.seeking = Some(self.seek_value(x as f32));
+                }
             }
             Input::Leave => {
                 self.hovering = false;
                 self.cursor = None;
                 self.cancel(TIMER_DWELL);
                 // While something is being typed the panel stays, wherever the cursor goes.
-                if self.mode == Mode::Open && !self.dragging && !self.focused {
+                if self.mode == Mode::Open && !self.dragging && self.seeking.is_none() && !self.focused {
                     self.timer(TIMER_LEAVE, LEAVE_MS);
                 }
             }
@@ -857,11 +945,19 @@ impl Island {
                         }
                         return Action::Volume(self.slider_value(x as f32));
                     }
+                    if self.pressed == Some(Zone::Seek) {
+                        // The bar follows the cursor; the track itself jumps once, when the knob is let go.
+                        self.seeking = Some(self.seek_value(x as f32));
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                    }
                 }
             }
             Input::Up(x, y) => {
                 let pressed = self.pressed.take();
-                if self.dragging {
+                let seeking = self.seeking.take().is_some();
+                if self.dragging || seeking {
                     self.dragging = false;
                     unsafe {
                         let _ = ReleaseCapture();
@@ -873,19 +969,23 @@ impl Island {
                         self.cursor = None;
                         self.timer(TIMER_LEAVE, LEAVE_MS);
                     }
-                    return Action::Volume(self.slider_value(fx));
+                    return if seeking { Action::Seek(self.seek_value(fx)) } else { Action::Volume(self.slider_value(fx)) };
                 }
                 if self.mode != Mode::Open {
                     self.cancel(TIMER_DWELL);
+                    // A click on a notification that is showing opens the list of them.
+                    let notice = self.alerting && matches!(self.current, Some(Alert::Notice { .. }));
                     self.mode = Mode::Open;
                     self.page = Page::Home;
-                    return Action::None;
+                    return if notice { Action::Open(Page::Notices) } else { Action::None };
                 }
                 let page = self.page;
                 return match self.zone_at(x as f32, y as f32).filter(|zone| Some(*zone) == pressed) {
                     Some(Zone::Previous) => Action::Previous,
                     Some(Zone::PlayPause) => Action::PlayPause,
                     Some(Zone::Next) => Action::Next,
+                    Some(Zone::Shuffle) => Action::Shuffle,
+                    Some(Zone::Repeat) => Action::Repeat,
                     Some(Zone::Mute) => Action::Mute,
                     Some(Zone::Settings) => Action::Settings,
                     Some(Zone::Lock) => Action::Lock,
@@ -907,6 +1007,10 @@ impl Island {
                         Some(row) if matches!(row.kind, RowKind::Item | RowKind::Switch(_)) => Action::Row(page, row.id),
                         _ => Action::None,
                     },
+                    Some(Zone::Close(index)) => match self.rows.get(index) {
+                        Some(row) => Action::Close(page, row.id),
+                        None => Action::None,
+                    },
                     Some(Zone::Eye) => {
                         self.reveal = !self.reveal;
                         Action::None
@@ -919,7 +1023,7 @@ impl Island {
                         self.shown_month = dates::shift_month(self.shown_month.0, self.shown_month.1, 1);
                         Action::None
                     }
-                    Some(Zone::Slider) | None => Action::None,
+                    Some(Zone::Slider) | Some(Zone::Seek) | None => Action::None,
                 };
             }
             Input::Wheel(delta) => {
@@ -968,7 +1072,7 @@ impl Island {
                 }
             }
             Input::Timer(TIMER_LEAVE) => {
-                if !self.hovering && !self.dragging && !self.focused && self.mode == Mode::Open {
+                if !self.hovering && !self.dragging && self.seeking.is_none() && !self.focused && self.mode == Mode::Open {
                     self.collapse();
                 }
             }
@@ -1079,17 +1183,57 @@ impl Island {
                 Alert::Power { percent, plugged } => (battery_glyph(*percent, *plugged), (if *plugged { "Đang sạc" } else { "Đang dùng pin" }).to_string(), format!("{percent}%"), false),
                 Alert::LowBattery(percent) => (0xE850, "Pin yếu".to_string(), format!("{percent}%"), false),
                 Alert::Network(online) => (0xE701, (if *online { "Đã có mạng" } else { "Mất kết nối mạng" }).to_string(), String::new(), false),
-                Alert::Track { title, artist } => (0xEC4F, title.clone(), artist.clone(), false),
+                Alert::Track { title, artist, .. } => (0xEC4F, title.clone(), artist.clone(), false),
+                // Two lines. With the app's own mark beside them the app need not be named;
+                // a notification of one line is told under the app's name.
+                Alert::Notice { app, title, body, logo } => match (title.is_empty(), body.is_empty(), logo.is_some()) {
+                    (true, ..) => (0xEA8F, app.clone(), body.clone(), false),
+                    (false, true, _) => (0xEA8F, app.clone(), title.clone(), false),
+                    (false, false, true) => (0xEA8F, title.clone(), body.clone(), false),
+                    (false, false, false) => (0xEA8F, format!("{app} · {title}"), body.clone(), false),
+                },
             };
             let warn = matches!(alert, Alert::LowBattery(_)) || matches!(alert, Alert::Network(false));
+            let tall = matches!(alert, Alert::Notice { .. });
+            let picture = match alert {
+                Alert::Track { art, .. } => art.as_ref(),
+                Alert::Notice { logo, .. } => logo.as_ref(),
+                _ => None,
+            };
+            // A notification's two lines need a taller shape.
+            let ah = if tall { h0 + px(24.0) } else { ah };
             self.a_icon.set(scene, gfx, &f.icons_big, &glyph(code), if warn { theme.text_dim } else { theme.accent_text() }, None)?;
-            self.a_text.set(scene, gfx, &f.bold, &words, fg, Some(px(210.0)))?;
-            self.a_value.set(scene, gfx, &f.text, &value, dim, Some(px(150.0)))?;
-            let mut x = px(16.0);
-            let y = mid(&self.a_icon, ah);
-            self.a_icon.place(x, y)?;
-            x += self.a_icon.w + px(10.0);
-            if self.a_text.w > 0.0 {
+            self.a_text.set(scene, gfx, &f.bold, &words, fg, Some(px(if tall { 270.0 } else { 210.0 })))?;
+            self.a_value.set(scene, gfx, &f.text, if tall { "" } else { value.as_str() }, dim, Some(px(150.0)))?;
+            self.a_body.set(scene, gfx, &f.small, if tall { value.as_str() } else { "" }, dim, Some(px(270.0)))?;
+            let mut x = px(if tall { 13.0 } else { 16.0 });
+            // A cover or an app's own mark takes the symbol's place.
+            if let Some(art) = picture {
+                if self.a_art_of.as_ref() != Some(art) {
+                    self.a_art.set_surface(&scene.surface_from_pixels(&art.0)?)?;
+                    self.a_art_of = Some(art.clone());
+                }
+                let side = px(if tall { 30.0 } else { 22.0 });
+                self.a_art.place(x, ((ah - side) * 0.5).round(), side, side)?;
+                x += side + px(10.0);
+            } else {
+                let y = mid(&self.a_icon, ah);
+                self.a_icon.place(x, y)?;
+                x += self.a_icon.w + px(10.0);
+            }
+            self.a_art.set_opacity(if picture.is_some() { 1.0 } else { 0.0 })?;
+            self.a_icon.set_opacity(if picture.is_some() { 0.0 } else { 1.0 })?;
+            if tall {
+                if self.a_body.w > 0.0 {
+                    let low = ah - px(9.0) - self.a_body.h;
+                    self.a_text.place(x, px(8.0))?;
+                    self.a_body.place(x, low)?;
+                } else {
+                    let y = mid(&self.a_text, ah);
+                    self.a_text.place(x, y)?;
+                }
+                x += self.a_text.w.max(self.a_body.w) + px(12.0);
+            } else if self.a_text.w > 0.0 {
                 let y = mid(&self.a_text, ah);
                 self.a_text.place(x, y)?;
                 x += self.a_text.w + px(10.0);
@@ -1168,6 +1312,8 @@ impl Island {
         let mut row_y = px(60.0);
         let media_alpha = if media.is_some() { 1.0 } else { 0.0 };
         let knob = px(34.0);
+        // Which parts of the row under the track are there: the bar, its knob, shuffle, repeat.
+        let (mut timed, mut seekable, mut shuffled, mut repeated) = (false, false, false, false);
         if let Some(track) = media {
             let tile = px(40.0);
             let row_h = px(48.0);
@@ -1176,6 +1322,14 @@ impl Island {
             self.p_note.set(scene, gfx, &f.icons_big, &glyph(0xEC4F), theme.accent_text(), None)?;
             let (nw, nh) = (self.p_note.w, self.p_note.h);
             self.p_note.place(pad + (tile - nw) * 0.5, row_y + (row_h - nh) * 0.5)?;
+            // The cover, when the player gives one, lies over the tile and its note.
+            if let Some(art) = &track.art {
+                if self.p_art_of.as_ref() != Some(art) {
+                    self.p_art.set_surface(&scene.surface_from_pixels(&art.0)?)?;
+                    self.p_art_of = Some(art.clone());
+                }
+                self.p_art.place(pad, row_y + ((row_h - tile) * 0.5).round(), tile, tile)?;
+            }
             let controls = ow - pad - 3.0 * knob;
             let room = controls - (pad + tile + px(12.0)) - px(10.0);
             self.p_title.set(scene, gfx, &f.bold, if track.title.is_empty() { "Đang phát" } else { &track.title }, fg, Some(room))?;
@@ -1197,11 +1351,77 @@ impl Island {
                 line.place(left + (knob - line.w) * 0.5, top + (knob - line.h) * 0.5)?;
                 home_zones.push((zone, left, top, left + knob, top + knob));
             }
-            row_y += px(56.0);
+            row_y += px(52.0);
+            // Under it: how far into the track, with shuffle and repeat at the ends where the
+            // player has them.
+            timed = track.length > 0.0;
+            if timed || track.shuffle.is_some() || track.repeat.is_some() {
+                let (row_h, small) = (px(24.0), px(26.0));
+                let (mut left, mut right) = (pad, ow - pad);
+                if let Some(on) = track.shuffle {
+                    shuffled = true;
+                    self.p_shuffle.set(scene, gfx, &f.icons, &glyph(0xE8B1), if on { theme.accent_text() } else { dim }, None)?;
+                    let (w, h) = (self.p_shuffle.w, self.p_shuffle.h);
+                    self.p_shuffle.place(left + (small - w) * 0.5, row_y + (row_h - h) * 0.5)?;
+                    home_zones.push((Zone::Shuffle, left, row_y - px(3.0), left + small, row_y + row_h + px(3.0)));
+                    left += small + px(6.0);
+                }
+                if let Some(mode) = track.repeat {
+                    repeated = true;
+                    self.p_repeat.set(scene, gfx, &f.icons, &glyph(if mode == 1 { 0xE8ED } else { 0xE8EE }), if mode == 0 { dim } else { theme.accent_text() }, None)?;
+                    let (w, h) = (self.p_repeat.w, self.p_repeat.h);
+                    right -= small;
+                    self.p_repeat.place(right + (small - w) * 0.5, row_y + (row_h - h) * 0.5)?;
+                    home_zones.push((Zone::Repeat, right, row_y - px(3.0), right + small, row_y + row_h + px(3.0)));
+                    right -= px(6.0);
+                }
+                if timed {
+                    seekable = track.seekable;
+                    // While the knob is dragged the bar shows where it would go.
+                    let played = match self.seeking {
+                        Some(share) => share * track.length,
+                        None => (track.position + track.read.filter(|_| track.playing).map(|read| read.elapsed().as_secs_f32()).unwrap_or(0.0)).min(track.length),
+                    };
+                    self.p_elapsed.set(scene, gfx, &f.small, &minutes(played), dim, None)?;
+                    self.p_length.set(scene, gfx, &f.small, &minutes(track.length), dim, None)?;
+                    // Both times get the room of the wider, so the bar keeps still as the digits change.
+                    let (ew, lw) = (self.p_elapsed.w, self.p_length.w);
+                    let room = ew.max(lw);
+                    let y = row_y + mid(&self.p_elapsed, row_h);
+                    self.p_elapsed.place(left + room - ew, y)?;
+                    let y = row_y + mid(&self.p_length, row_h);
+                    self.p_length.place(right - room, y)?;
+                    let (a, b) = (left + room + px(10.0), right - room - px(10.0));
+                    let (thick, dot) = (px(4.0), px(10.0));
+                    let cy = row_y + row_h * 0.5;
+                    let at = a + (b - a) * (played / track.length).clamp(0.0, 1.0);
+                    self.p_seek_track.place(a, (cy - thick * 0.5).round(), b - a, thick, thick * 0.5)?;
+                    self.p_seek_track.set_color(theme.track)?;
+                    self.p_seek_fill.place(a, (cy - thick * 0.5).round(), (at - a).max(thick), thick, thick * 0.5)?;
+                    self.p_seek_fill.set_color(theme.accent_color(1.0))?;
+                    let grab = if self.seeking.is_some() { px(2.0) } else { 0.0 };
+                    self.p_seek_knob.place((at - dot * 0.5 - grab).round(), (cy - dot * 0.5 - grab).round(), dot + 2.0 * grab, dot + 2.0 * grab, dot * 0.5 + grab)?;
+                    self.p_seek_knob.set_color(rgba(1.0, 1.0, 1.0, 1.0))?;
+                    self.seek = (x0 + a, x0 + b);
+                    if seekable {
+                        home_zones.push((Zone::Seek, a - px(8.0), row_y - px(3.0), b + px(8.0), row_y + row_h + px(3.0)));
+                    }
+                }
+                row_y += px(30.0);
+            }
         }
+        let pictured = media.and_then(|track| track.art.as_ref()).is_some();
         self.p_tile.set_opacity(media_alpha)?;
-        for line in [&mut self.p_note, &mut self.p_title, &mut self.p_artist, &mut self.p_prev, &mut self.p_play, &mut self.p_next] {
+        self.p_art.set_opacity(if pictured { 1.0 } else { 0.0 })?;
+        self.p_note.set_opacity(if pictured { 0.0 } else { media_alpha })?;
+        for line in [&mut self.p_title, &mut self.p_artist, &mut self.p_prev, &mut self.p_play, &mut self.p_next] {
             line.set_opacity(media_alpha)?;
+        }
+        for (line, shown) in [(&mut self.p_elapsed, timed), (&mut self.p_length, timed), (&mut self.p_shuffle, shuffled), (&mut self.p_repeat, repeated)] {
+            line.set_opacity(if shown { 1.0 } else { 0.0 })?;
+        }
+        for (pill, shown) in [(&mut self.p_seek_track, timed), (&mut self.p_seek_fill, timed), (&mut self.p_seek_knob, timed && seekable)] {
+            pill.set_opacity(if shown { 1.0 } else { 0.0 })?;
         }
 
         // Row 3: the volume.
@@ -1356,6 +1576,10 @@ impl Island {
                     let ty = y + mid(&look.text, h);
                     look.text.place(text_x, ty)?;
                     if !note {
+                        // A cross at the end is clicked by itself; it comes first, so it is found first.
+                        if row.close && look.mark.w > 0.0 {
+                            list_zones.push((Zone::Close(index), ow - pad - look.mark.w - px(8.0), y, ow - pad + px(6.0), y + h));
+                        }
                         list_zones.push((Zone::Row(index), pad - px(6.0), y, ow - pad + px(6.0), y + h));
                     }
                 }
@@ -1443,7 +1667,7 @@ impl Island {
         }
 
         // The drop of light under the cursor, on the page that is showing.
-        let hot = self.cursor.filter(|_| open && !self.dragging).and_then(|(cx, cy)| self.zones.iter().find(|(zone, l, t, r, b)| !matches!(zone, Zone::Slider | Zone::Eye) && cx >= *l && cx < *r && cy >= *t && cy < *b).copied());
+        let hot = self.cursor.filter(|_| open && !self.dragging && self.seeking.is_none()).and_then(|(cx, cy)| self.zones.iter().find(|(zone, l, t, r, b)| !matches!(zone, Zone::Slider | Zone::Seek | Zone::Eye) && cx >= *l && cx < *r && cy >= *t && cy < *b).copied());
         self.hot_at.tune(motion);
         self.hot_at.aim(hot.map(|(_, l, t, r, b)| (l - x0, t - y0, r - l, b - t)));
         self.hot_at.step(dt);
@@ -1536,6 +1760,7 @@ impl Island {
 
         let level_moving = matches!(self.current, Some(Alert::Volume { .. })) && self.alerting && !self.level.settled(1e-3);
         Ok(self.dragging
+            || self.seeking.is_some()
             || level_moving
             || !self.w.settled(0.05)
             || !self.h.settled(0.05)

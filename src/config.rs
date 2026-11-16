@@ -46,6 +46,8 @@ pub struct Config {
     pub island_hover: bool,
     pub island_alerts: bool,
     pub island_media: bool,
+    pub island_notices: bool,
+    pub island_claude: bool,
 
     // Motion
     pub anim_speed: f32,
@@ -106,6 +108,8 @@ impl Default for Config {
             island_hover: true,
             island_alerts: true,
             island_media: true,
+            island_notices: true,
+            island_claude: true,
             anim_speed: 1.0,
             elastic: 0.5,
             click_minimize: true,
@@ -193,7 +197,9 @@ pub const PARAMS: &[Param] = &[
     param!("island_height", "Đảo động", "Chiều cao khi thu gọn", "Chiều cao của đảo khi thu gọn (điểm ảnh)", n(24.0, 40.0, 1.0), true, num!(island_height)),
     param!("island_hover", "Đảo động", "Rê chuột để mở rộng", "Rê chuột lên đảo thì nó mở rộng thành bảng điều khiển (tắt: phải bấm)", Kind::Toggle, true, flag!(island_hover)),
     param!("island_alerts", "Đảo động", "Thông báo nhanh", "Đảo nở ra báo khi đổi âm lượng, cắm / rút sạc, pin yếu, có / mất mạng", Kind::Toggle, true, flag!(island_alerts)),
-    param!("island_media", "Đảo động", "Nhạc đang phát", "Hiện bài đang phát và nút điều khiển trên đảo", Kind::Toggle, true, flag!(island_media)),
+    param!("island_media", "Đảo động", "Nhạc đang phát", "Hiện bài đang phát, ảnh bìa, thanh tua và nút điều khiển trên đảo", Kind::Toggle, true, flag!(island_media)),
+    param!("island_notices", "Đảo động", "Thông báo của ứng dụng", "Đảo nở ra khi một ứng dụng gửi thông báo, và có trang xem lại các thông báo", Kind::Toggle, true, flag!(island_notices)),
+    param!("island_claude", "Đảo động", "Claude", "Trang Claude trên đảo: lượng dùng hôm nay, đọc từ những gì Claude Code lưu trên máy này", Kind::Toggle, true, flag!(island_claude)),
     param!("icon_size", "Dock", "Cỡ icon", "Cỡ icon khi đứng yên (điểm ảnh, trước khi nhân tỉ lệ màn hình)", n(24.0, 96.0, 1.0), true, num!(icon_size)),
     param!("gap", "Dock", "Khoảng cách giữa icon", "Khoảng cách giữa các icon", n(0.0, 30.0, 1.0), true, num!(gap)),
     param!("padding", "Dock", "Lề trong", "Khoảng cách từ icon tới mép dock", n(4.0, 24.0, 1.0), true, num!(padding)),
