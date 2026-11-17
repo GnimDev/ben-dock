@@ -67,6 +67,24 @@ pub fn behind_icons() -> Option<Behind> {
     }
 }
 
+/// True if the picture Windows draws lies over `window`, a wallpaper of ours that was put
+/// under the icons. Windows makes the window of its picture anew now and then, and lays the
+/// new one right under the icons: over ours.
+pub fn picture_over(window: HWND) -> bool {
+    let mut over = window;
+    unsafe {
+        // (Every window over it in the window they share; there are two or three in all.)
+        for _ in 0..16 {
+            let Some(next) = GetWindow(over, GW_HWNDPREV).ok().filter(|w| !w.is_invalid()) else { return false };
+            if shell::class_name(next) == "WorkerW" {
+                return true;
+            }
+            over = next;
+        }
+    }
+    false
+}
+
 /// The top-level window the icons are in: what "show desktop" lifts.
 pub fn icons_window() -> Option<HWND> {
     unsafe {

@@ -266,6 +266,25 @@ unsafe fn place(thumb: isize, source: Option<RECT>, dest: RECT) {
     }
 }
 
+/// Saves a picture as a file anything can open (a .bmp): BGRA rows, the top one first. For
+/// the tests that draw something to be looked at.
+#[cfg(test)]
+pub(crate) fn save_picture(path: &std::path::Path, w: i32, h: i32, bgra: &[u8]) {
+    let mut file = Vec::with_capacity(54 + bgra.len());
+    file.extend_from_slice(b"BM");
+    file.extend_from_slice(&(54 + bgra.len() as u32).to_le_bytes());
+    file.extend_from_slice(&[0; 4]);
+    file.extend_from_slice(&54u32.to_le_bytes());
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&w.to_le_bytes());
+    file.extend_from_slice(&(-h).to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes());
+    file.extend_from_slice(&32u16.to_le_bytes());
+    file.extend_from_slice(&[0; 24]);
+    file.extend_from_slice(bgra);
+    std::fs::write(path, file).expect("the picture saved");
+}
+
 /// Has the compositor draw a window of ours into a bitmap. BGRA, top row first.
 pub(crate) unsafe fn print(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
     unsafe {

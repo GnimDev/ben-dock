@@ -30,6 +30,7 @@ use windows::Foundation::{IPropertyValue, PropertyValue, Size, TimeSpan};
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::Graphics::Effects::{IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl};
 use windows::Graphics::{IGeometrySource2D, IGeometrySource2D_Impl};
+use windows::Media::Playback::{MediaPlayer, MediaPlayerSurface};
 use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::{E_BOUNDS, E_INVALIDARG, E_NOTIMPL, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -310,6 +311,19 @@ impl Scene {
         Ok(Layer { visual, parent: parent.clone(), last_offset: (f32::NAN, f32::NAN), last_opacity: f32::NAN, last_scale: [f32::NAN; 4] })
     }
 
+
+    /// One colour behind everything else in a window, as a wallpaper of that colour would
+    /// be: for the tests that draw something bare to be looked at. It is there for as long
+    /// as what is returned is kept.
+    #[cfg(test)]
+    pub fn backdrop_in(&self, parent: &VisualCollection, color: Color) -> Result<SpriteVisual> {
+        let visual = self.compositor.CreateSpriteVisual()?;
+        visual.SetBrush(&self.compositor.CreateColorBrushWithColor(color)?)?;
+        visual.SetRelativeSizeAdjustment(FULL)?;
+        parent.InsertAtBottom(&visual)?;
+        Ok(visual)
+    }
+
     /// A rectangle that shows a surface (an icon, a line of text).
     pub fn sprite_in(&self, parent: &VisualCollection) -> Result<Sprite> {
         let visual = self.compositor.CreateSpriteVisual()?;
@@ -317,6 +331,39 @@ impl Scene {
         brush.SetStretch(CompositionStretch::Fill)?;
         visual.SetBrush(&brush)?;
         parent.InsertAtTop(&visual)?;
+        Ok(Sprite { visual, brush, parent: parent.clone(), last: None, last_opacity: f32::NAN })
+    }
+
+    /// Has a sprite throw a soft shadow shaped like what it shows, not like its rectangle:
+    /// for words and pictures that lie on the desktop with no glass under them, where the
+    /// wallpaper behind may be as light as they are. `blur`: how soft the shadow is;
+    /// `drop`: how far under the sprite it lies.
+    pub fn shadow_under(&self, sprite: &Sprite, blur: f32, drop: f32, shade: Color) -> Result<()> {
+        let shadow = self.compositor.CreateDropShadow()?;
+        // (What the sprite shows changes; its brush stays, and the shadow follows it.)
+        shadow.SetMask(&sprite.brush)?;
+        shadow.SetBlurRadius(blur)?;
+        shadow.SetOffset(Vector3 { X: 0.0, Y: drop, Z: 0.0 })?;
+        shadow.SetColor(shade)?;
+        sprite.visual.SetShadow(&shadow)
+    }
+
+    /// What a player of video shows, as something sprites can show (see `film_in`).
+    /// `width`, `height`: the size its pictures are drawn at, in pixels.
+    pub fn film(&self, player: &MediaPlayer, width: f32, height: f32) -> Result<MediaPlayerSurface> {
+        player.SetSurfaceSize(Size { Width: width.max(1.0), Height: height.max(1.0) })?;
+        player.GetSurface(&self.compositor)
+    }
+
+    /// A rectangle that shows a video (see `film`) and is filled by it: nothing is squeezed,
+    /// and what does not fit is cut off evenly on both sides. It lies under everything else
+    /// in `parent`.
+    pub fn film_in(&self, parent: &VisualCollection, film: &MediaPlayerSurface) -> Result<Sprite> {
+        let visual = self.compositor.CreateSpriteVisual()?;
+        let brush = self.compositor.CreateSurfaceBrushWithSurface(&film.CompositionSurface()?)?;
+        brush.SetStretch(CompositionStretch::UniformToFill)?;
+        visual.SetBrush(&brush)?;
+        parent.InsertAtBottom(&visual)?;
         Ok(Sprite { visual, brush, parent: parent.clone(), last: None, last_opacity: f32::NAN })
     }
 

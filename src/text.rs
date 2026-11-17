@@ -104,6 +104,11 @@ impl Line {
         self.sprite.place(x.round(), y.round(), self.w, self.h)
     }
 
+    /// Has the line throw a soft shadow shaped like its letters (see `Scene::shadow_under`).
+    pub fn cast_shadow(&self, scene: &Scene, blur: f32, drop: f32, shade: windows::UI::Color) -> Result<()> {
+        scene.shadow_under(&self.sprite, blur, drop, shade)
+    }
+
     pub fn set_opacity(&mut self, opacity: f32) -> Result<()> {
         self.sprite.set_opacity(opacity)
     }

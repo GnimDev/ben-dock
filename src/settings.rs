@@ -4,13 +4,23 @@
 //!
 //! The rows are sorted into tabs, listed down the left side (see `TABS`): a
 //! tab shows the groups of settings that belong to one part of the app.
+//!
+//! The widgets are not rows. Their tab is a library: a tile for each, with a
+//! small picture of it (painted by `widget::emblem`), its name and its switch.
+//!
+//! One setting is not a number: which video the wallpaper plays. It has a row
+//! of its own with a button that opens Windows' dialog for choosing a file.
 
 use crate::config::{self, Config, Kind, PARAMS};
 use crate::app::{self, Event};
 use crate::gfx::{color, rect};
 use crate::system;
 use crate::util::wide;
+use crate::wallpaper;
+use crate::widget;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -19,13 +29,20 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Vector2;
 
 const CLASS_NAME: &str = "BenSettingsWindow";
+/// Told to the window when a video has been chosen in the dialog (it waits in `PICKED`).
+const WM_VIDEO_PICKED: u32 = WM_APP + 1;
+/// The kinds of file the dialog offers.
+const VIDEO_FILES: &str = "*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.wmv;*.avi";
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 
 // Layout, in logical pixels.
@@ -41,23 +58,40 @@ const BUTTON_H: f32 = 30.0;
 const SIDE_W: f32 = 196.0;
 const TAB_H: f32 = 38.0;
 const SIDE_PAD: f32 = 10.0;
+/// A widget's tile in the library: how wide and how tall it is, the room between two, how
+/// many stand side by side, and the size of the picture on it.
+const TILE_W: f32 = 134.0;
+const TILE_H: f32 = 126.0;
+const TILE_GAP: f32 = 12.0;
+const TILES_ACROSS: usize = 3;
+const EMBLEM: f32 = 60.0;
 
-/// One tab: its name, its symbol in Windows' icon font, and the groups of settings
-/// (`Param::section`) it shows, in this order.
+/// One tab: its name, its symbol in Windows' icon font, the groups of settings
+/// (`Param::section`) it shows, in this order, and a few words that stand at the end of its
+/// first heading (none: "").
 struct Tab {
     name: &'static str,
     glyph: u32,
     sections: &'static [&'static str],
+    hint: &'static str,
 }
 
-const TABS: [Tab; 6] = [
-    Tab { name: "Giao diện", glyph: 0xE771, sections: &["Giao diện", "Chuyển động"] },
-    Tab { name: "Dock", glyph: 0xE90E, sections: &["Dock"] },
-    Tab { name: "Đảo và bốn góc", glyph: 0xECA5, sections: &["Đảo động", "Bốn góc"] },
-    Tab { name: "Màn hình nền", glyph: 0xE91B, sections: &["Widget", "Hình nền"] },
-    Tab { name: "Cửa sổ", glyph: 0xE7C4, sections: &["Cửa sổ"] },
-    Tab { name: "Hành vi", glyph: 0xE713, sections: &["Hành vi"] },
+const TABS: [Tab; 7] = [
+    Tab { name: "Giao diện", glyph: 0xE771, sections: &["Giao diện", "Chuyển động"], hint: "" },
+    Tab { name: "Dock", glyph: 0xE90E, sections: &["Dock"], hint: "" },
+    Tab { name: "Đảo và bốn góc", glyph: 0xECA5, sections: &["Đảo động", "Bốn góc"], hint: "" },
+    Tab { name: "Thư viện widget", glyph: 0xE8F1, sections: &["Widget", "Hẹn giờ tập trung"], hint: "Kéo widget trên màn hình nền để xếp chỗ" },
+    Tab { name: "Hình nền", glyph: 0xE91B, sections: &["Hình nền"], hint: "" },
+    Tab { name: "Cửa sổ", glyph: 0xE7C4, sections: &["Cửa sổ"], hint: "" },
+    Tab { name: "Hành vi", glyph: 0xE713, sections: &["Hành vi"], hint: "" },
 ];
+
+/// The widget a setting puts on the desktop, if it is one of those ("widget_clock": the
+/// clock). Such a setting is shown as a tile of the library, not as a row.
+fn widget_of(key: &str) -> Option<widget::Kind> {
+    let name = key.strip_prefix("widget_")?;
+    widget::Kind::ALL.into_iter().find(|kind| kind.name() == name)
+}
 
 /// The tab a group of settings is shown on. A group no tab names goes on the last one, so
 /// that a new setting can never be left out of the window.
@@ -69,6 +103,10 @@ fn tab_of(section: &str) -> usize {
 enum Control {
     /// Index into `PARAMS`.
     Param(usize),
+    /// A widget's tile in the library; the index of its switch in `PARAMS`.
+    Tile(usize),
+    /// Which video the wallpaper plays, and a button to choose another.
+    Video,
     Header(&'static str),
     Autostart,
     Reset,
@@ -92,6 +130,13 @@ struct State {
     text_center: IDWriteTextFormat,
     header: IDWriteTextFormat,
     icons: IDWriteTextFormat,
+    /// The digits on the picture of the large clock.
+    digits: IDWriteTextFormat,
+    /// The pictures of the widgets, in the order of `widget::Kind::ALL`; painted when first
+    /// shown, in this window's own colours.
+    emblems: Vec<ID2D1Bitmap>,
+    /// The video the wallpaper plays, if one has been chosen.
+    video: Option<String>,
     cfg: Config,
     /// The tab on show, and its rows.
     tab: usize,
@@ -109,6 +154,11 @@ thread_local! {
     /// The tab that was on show when the window was last closed: it opens there again.
     static LAST_TAB: Cell<usize> = const { Cell::new(0) };
 }
+
+/// The dialog for choosing a video is open (one at a time), and the file chosen in it,
+/// until the window has taken it.
+static PICKING: AtomicBool = AtomicBool::new(false);
+static PICKED: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
@@ -131,13 +181,37 @@ fn tab_rows(tab: usize) -> (Vec<Row>, f32) {
     }
     for section in sections {
         let mut headed = false;
+        // How many tiles stand in the line of tiles that is being filled (see `Control::Tile`).
+        let mut tiles = 0;
         for (index, p) in PARAMS.iter().enumerate().filter(|(_, p)| p.in_window && p.section == section) {
             if !std::mem::replace(&mut headed, true) {
                 rows.push(Row { control: Control::Header(p.section), x, y });
                 y += HEADER_H;
             }
+            if widget_of(p.key).is_some() {
+                if tiles == TILES_ACROSS {
+                    // The line is full: the next one begins under it.
+                    y += TILE_H + TILE_GAP;
+                    tiles = 0;
+                }
+                rows.push(Row { control: Control::Tile(index), x: x + MARGIN + tiles as f32 * (TILE_W + TILE_GAP), y });
+                tiles += 1;
+                continue;
+            }
+            // A row goes under the tiles before it.
+            if std::mem::take(&mut tiles) > 0 {
+                y += TILE_H;
+            }
             rows.push(Row { control: Control::Param(index), x, y });
             y += ROW_H;
+            if p.key == "wallpaper" {
+                // Under the choice of wallpaper: which video, for when it is to be one.
+                rows.push(Row { control: Control::Video, x, y });
+                y += ROW_H;
+            }
+        }
+        if tiles > 0 {
+            y += TILE_H + 4.0;
         }
     }
     // Starting with Windows is not a line of ben.ini, but it is how the app behaves.
@@ -240,6 +314,9 @@ fn create(cfg: &Config) -> Result<()> {
         )?;
 
         let dark = system::system_is_dark();
+        // (BEN_LIGHT: a test looks at the light window whatever Windows is set to.)
+        #[cfg(test)]
+        let dark = dark && std::env::var("BEN_LIGHT").is_err();
         let on: i32 = dark as i32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const i32 as *const _, 4);
 
@@ -308,6 +385,15 @@ fn create(cfg: &Config) -> Result<()> {
                 format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 format
             },
+            digits: {
+                let format = dwrite.CreateTextFormat(PCWSTR(wide("Segoe UI Variable Display").as_ptr()), None, DWRITE_FONT_WEIGHT_LIGHT, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 25.0 * scale, PCWSTR(wide("").as_ptr()))?;
+                format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                format
+            },
+            emblems: Vec::new(),
+            video: wallpaper::video_path(),
             cfg: cfg.clone(),
             tab,
             rows,
@@ -320,7 +406,9 @@ fn create(cfg: &Config) -> Result<()> {
         STATE.with(|s| *s.borrow_mut() = Some(state));
         #[cfg(test)]
         if QUIET.get() {
-            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // (With BEN_OUT it is looked at through pictures, and need not be on any screen.)
+            let stay = if std::env::var("BEN_OUT").is_ok() { SET_WINDOW_POS_FLAGS(0) } else { SWP_NOMOVE };
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), -20000, 100, 0, 0, stay | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
             return Ok(());
         }
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -345,7 +433,11 @@ fn control_rect(row: &Row, control: Control) -> (f32, f32, f32, f32) {
                 (right - w, cy - 13.0, right, cy + 13.0)
             }
         },
+        // A tile's switch is in the middle of its foot.
+        Control::Tile(_) => (row.x + TILE_W * 0.5 - 20.0, row.y + TILE_H - 32.0, row.x + TILE_W * 0.5 + 20.0, row.y + TILE_H - 10.0),
         Control::Autostart => (right - 40.0, cy - 11.0, right, cy + 11.0),
+        // The button that opens the dialog.
+        Control::Video => (right - 108.0, cy - 13.0, right, cy + 13.0),
         // The two buttons are as wide as the list of tabs they stand under.
         Control::Reset | Control::OpenFile => (row.x + SIDE_PAD, row.y, row.x + SIDE_W - SIDE_PAD, row.y + BUTTON_H),
         Control::Header(_) => (0.0, 0.0, 0.0, 0.0),
@@ -426,11 +518,32 @@ impl State {
                         Kind::Choice(names) => {
                             if inside(area, x, y) {
                                 let pick = ((x - area.0) / ((area.2 - area.0) / names.len() as f32)).floor();
+                                // A video has to be chosen before it can be the wallpaper.
+                                if p.key == "wallpaper" && p.clean(pick) as u32 == wallpaper::VIDEO && self.video.is_none() {
+                                    pick_video(self.hwnd);
+                                    return;
+                                }
                                 (p.set)(&mut self.cfg, p.clean(pick));
                                 self.changed(true);
                                 return;
                             }
                         }
+                    }
+                }
+                Control::Tile(index) => {
+                    // Anywhere on the tile will do, not only on its switch.
+                    if inside((row.x, row.y, row.x + TILE_W, row.y + TILE_H), x, y) {
+                        let p = &PARAMS[index];
+                        let on = (p.get)(&self.cfg) >= 0.5;
+                        (p.set)(&mut self.cfg, if on { 0.0 } else { 1.0 });
+                        self.changed(true);
+                        return;
+                    }
+                }
+                Control::Video => {
+                    if inside(area, x, y) {
+                        pick_video(self.hwnd);
+                        return;
                     }
                 }
                 Control::Autostart => {
@@ -459,6 +572,15 @@ impl State {
                 Control::Header(_) => {}
             }
         }
+    }
+
+    /// A video was chosen in the dialog: it is kept, and becomes the wallpaper.
+    fn video_picked(&mut self) {
+        let Some(path) = PICKED.lock().ok().and_then(|mut picked| picked.take()) else { return };
+        wallpaper::choose_video(&path);
+        self.video = Some(path);
+        self.cfg.wallpaper = wallpaper::VIDEO as f32;
+        self.changed(true);
     }
 
     fn mouse_move(&mut self, x: f32) {
@@ -493,8 +615,27 @@ impl State {
         let track = if dark { color(1.0, 1.0, 1.0, 0.16) } else { color(0.0, 0.0, 0.0, 0.14) };
         let line = if dark { color(1.0, 1.0, 1.0, 0.08) } else { color(0.0, 0.0, 0.0, 0.08) };
         let side = if dark { color(0.0, 0.0, 0.0, 0.16) } else { color(0.0, 0.0, 0.0, 0.035) };
+        let plate = if dark { color(1.0, 1.0, 1.0, 0.055) } else { color(1.0, 1.0, 1.0, 0.72) };
         let accent = color(ar, ag, ab, 1.0);
         let knob = color(1.0, 1.0, 1.0, 1.0);
+
+        if self.emblems.is_empty() {
+            // The pictures of the widgets, painted once, in this window's own colours.
+            let palette = widget::Palette::plain(self.accent, [fg.r, fg.g, fg.b, fg.a], [track.r, track.g, track.b, track.a]);
+            let size = (EMBLEM * s).round().max(1.0) as u32;
+            let props = D2D1_BITMAP_PROPERTIES { pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED }, dpiX: 96.0, dpiY: 96.0 };
+            let made: Result<Vec<ID2D1Bitmap>> = widget::Kind::ALL
+                .into_iter()
+                .map(|kind| {
+                    let canvas = widget::emblem(kind, size, &palette);
+                    unsafe { self.target.CreateBitmap(D2D_SIZE_U { width: size, height: size }, Some(canvas.bgra.as_ptr() as *const _), size * 4, &props) }
+                })
+                .collect();
+            match made {
+                Ok(emblems) => self.emblems = emblems,
+                Err(e) => crate::log!("the widgets' pictures could not be made: {e}"),
+            }
+        }
 
         let t = &self.target;
         let brush = &self.brush;
@@ -542,12 +683,45 @@ impl State {
                 write(tab.name, if picked { &self.header } else { &self.text }, (area.0 + 44.0, area.1, area.2 - 4.0, area.3), &fg);
             }
 
-            for row in &self.rows {
+            for (index, row) in self.rows.iter().enumerate() {
                 let label_area = (row.x + MARGIN, row.y, row.x + COLUMN_W - MARGIN, row.y + ROW_H);
                 let area = control_rect(row, row.control);
                 match row.control {
                     Control::Header(name) => {
-                        write(&name.to_uppercase(), &self.header, (row.x + MARGIN, row.y + 8.0, row.x + COLUMN_W - MARGIN, row.y + HEADER_H), &dim);
+                        let line = (row.x + MARGIN, row.y + 8.0, row.x + COLUMN_W - MARGIN, row.y + HEADER_H);
+                        write(&name.to_uppercase(), &self.header, line, &dim);
+                        if index == 0 {
+                            write(TABS[self.tab].hint, &self.text_right, line, &dim);
+                        }
+                    }
+                    Control::Tile(index) => {
+                        let p = &PARAMS[index];
+                        let on = (p.get)(&self.cfg) >= 0.5;
+                        let tile = (row.x, row.y, row.x + TILE_W, row.y + TILE_H);
+                        // The tile: a plate. One whose widget is on the desktop is lit with
+                        // the accent colour and rimmed in it; the others stand back.
+                        brush.SetColor(&plate);
+                        t.FillRoundedRectangle(&round(tile, 12.0), brush);
+                        if on {
+                            brush.SetColor(&color(ar, ag, ab, 0.13));
+                            t.FillRoundedRectangle(&round(tile, 12.0), brush);
+                            brush.SetColor(&color(ar, ag, ab, 0.9));
+                            t.DrawRoundedRectangle(&round((tile.0 + 0.75, tile.1 + 0.75, tile.2 - 0.75, tile.3 - 0.75), 11.25), brush, 1.5 * s, None);
+                        }
+                        let (left, top) = (row.x + (TILE_W - EMBLEM) * 0.5, row.y + 10.0);
+                        let kind = widget_of(p.key);
+                        if let Some(emblem) = kind.and_then(|kind| widget::Kind::ALL.iter().position(|other| *other == kind)).and_then(|at| self.emblems.get(at)) {
+                            t.DrawBitmap(emblem, Some(&px((left, top, left + EMBLEM, top + EMBLEM))), if on { 1.0 } else { 0.42 }, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        }
+                        if kind == Some(widget::Kind::Big) {
+                            // Its digits are text: the hour, and the minutes fainter beside it.
+                            let (middle, foot) = (left + EMBLEM * 0.5, top + EMBLEM * 0.72);
+                            let faint = |c: &D2D1_COLOR_F, by: f32| color(c.r, c.g, c.b, c.a * by);
+                            write("14", &self.digits, (left - 4.0, top, middle - 1.0, foot), &faint(&fg, if on { 1.0 } else { 0.42 }));
+                            write("05", &self.digits, (middle + 1.0, top, left + EMBLEM + 4.0, foot), &faint(&fg, if on { 0.55 } else { 0.26 }));
+                        }
+                        write(p.label, &self.text_center, (row.x + 4.0, row.y + 72.0, row.x + TILE_W - 4.0, row.y + 92.0), if on { &fg } else { &dim });
+                        switch(area, on);
                     }
                     Control::Param(index) => {
                         let p = &PARAMS[index];
@@ -586,6 +760,16 @@ impl State {
                             }
                         }
                     }
+                    Control::Video => {
+                        write("Video", &self.text, label_area, &fg);
+                        // The name of the file, between the word and the button (what does
+                        // not fit is cut off at its beginning: the end tells more).
+                        let name = self.video.as_deref().map(|path| path.rsplit(['\\', '/']).next().unwrap_or(path)).unwrap_or("Chưa chọn video");
+                        write(name, &self.text_right, (row.x + MARGIN + 52.0, row.y, area.0 - 12.0, row.y + ROW_H), &dim);
+                        brush.SetColor(&track);
+                        t.FillRoundedRectangle(&round(area, 6.0), brush);
+                        write("Chọn video…", &self.text_center, area, &fg);
+                    }
                     Control::Autostart => {
                         write("Khởi động cùng Windows", &self.text, label_area, &fg);
                         switch(area, self.autostart);
@@ -603,6 +787,56 @@ impl State {
                 crate::log!("settings window draw failed: {e}");
             }
         }
+    }
+}
+
+/// Opens Windows' dialog for choosing a video file, over `owner`. The dialog has a thread of
+/// its own, so that the dock goes on moving while it is open; when a file has been chosen,
+/// `owner` is told with `WM_VIDEO_PICKED`. One dialog at a time.
+fn pick_video(owner: HWND) {
+    if PICKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let owner = owner.0 as isize;
+    let run = move || {
+        let owner = HWND(owner as *mut _);
+        // SAFETY: ordinary COM calls on interfaces this thread owns, between starting COM
+        // on it and stopping it.
+        let chosen = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let chosen = ask_for_video(owner);
+            CoUninitialize();
+            chosen
+        };
+        PICKING.store(false, Ordering::Release);
+        if let Some(path) = chosen {
+            if let Ok(mut picked) = PICKED.lock() {
+                *picked = Some(path);
+            }
+            unsafe {
+                let _ = PostMessageW(Some(owner), WM_VIDEO_PICKED, WPARAM(0), LPARAM(0));
+            }
+        }
+    };
+    if std::thread::Builder::new().name("video dialog".into()).spawn(run).is_err() {
+        PICKING.store(false, Ordering::Release);
+    }
+}
+
+/// Shows the dialog and waits for it. Returns the full path of the file that was chosen,
+/// or `None` if the dialog was closed without one.
+unsafe fn ask_for_video(owner: HWND) -> Option<String> {
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let (name, kinds, title) = (wide("Video"), wide(VIDEO_FILES), wide("Chọn video làm hình nền"));
+        dialog.SetFileTypes(&[COMDLG_FILTERSPEC { pszName: PCWSTR(name.as_ptr()), pszSpec: PCWSTR(kinds.as_ptr()) }]).ok()?;
+        dialog.SetTitle(PCWSTR(title.as_ptr())).ok()?;
+        // (An error here is the dialog closed without a choice.)
+        dialog.Show(Some(owner)).ok()?;
+        let path = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = path.to_string().ok();
+        CoTaskMemFree(Some(path.0 as *const _));
+        text
     }
 }
 
@@ -645,6 +879,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_state(|s| s.mouse_up());
             return LRESULT(0);
         }
+        WM_VIDEO_PICKED => {
+            with_state(|s| s.video_picked());
+            return LRESULT(0);
+        }
         WM_DESTROY => {
             STATE.with(|s| {
                 if let Ok(mut s) = s.try_borrow_mut() {
@@ -665,15 +903,25 @@ mod tests {
     /// Not a check of anything: opens the window behind every other one and goes through
     /// its tabs, a second and a half each, so that they can be looked at.
     /// Run by hand: cargo test --release settings_tab_by_tab -- --ignored
+    /// (With BEN_OUT naming a folder, the window is put on a screen that is not there
+    /// instead, and a picture of each tab is saved in that folder: nothing shows on the real
+    /// screens. BEN_LIGHT=1 for the light window.)
     #[test]
     #[ignore]
     fn settings_tab_by_tab() {
         QUIET.set(true);
-        open(&Config::default());
+        let out = std::env::var("BEN_OUT").ok().map(std::path::PathBuf::from);
+        // (A few widgets off, to see a tile of each kind.)
+        let mut cfg = Config::default();
+        (cfg.widget_todo, cfg.widget_sound) = (true, false);
+        open(&cfg);
+        let hwnd = STATE.with(|s| s.borrow().as_ref().map(|s| s.hwnd)).expect("the window");
         let started = std::time::Instant::now();
         let mut msg = MSG::default();
+        let mut saved = 0;
         loop {
-            let tab = (started.elapsed().as_secs_f32() / 1.5) as usize;
+            let hold = if out.is_some() { 0.4 } else { 1.5 };
+            let tab = (started.elapsed().as_secs_f32() / hold) as usize;
             if tab >= TABS.len() {
                 break;
             }
@@ -684,6 +932,18 @@ mod tests {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
+            // A picture of the tab once it has been on show for most of its time.
+            if let (Some(out), true) = (out.as_ref(), saved == tab && started.elapsed().as_secs_f32() > (tab as f32 + 0.7) * hold) {
+                let mut frame = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut frame);
+                }
+                let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+                let pixels = unsafe { crate::camera::print(hwnd, w, h) }.expect("a picture of the window");
+                crate::camera::save_picture(&out.join(format!("tab{tab}.bmp")), w, h, &pixels);
+                println!("tab {tab}: {w}x{h}");
+                saved += 1;
+            }
         }
     }
 
@@ -696,11 +956,13 @@ mod tests {
             assert!(height > 0.0 && height <= content_size().1);
             for row in rows {
                 match row.control {
-                    Control::Param(index) => shown[index] += 1,
+                    Control::Param(index) | Control::Tile(index) => shown[index] += 1,
                     Control::Autostart => autostart += 1,
                     _ => {}
                 }
-                assert_eq!(row.x, SIDE_W);
+                if !matches!(row.control, Control::Tile(_)) {
+                    assert_eq!(row.x, SIDE_W);
+                }
             }
         }
         for (index, p) in PARAMS.iter().enumerate() {
@@ -715,11 +977,59 @@ mod tests {
             assert!(TABS.iter().any(|tab| tab.sections.contains(&p.section)), "no tab names the group '{}'", p.section);
         }
         for tab in 0..TABS.len() {
-            assert!(tab_rows(tab).0.iter().any(|row| matches!(row.control, Control::Param(_))), "tab '{}' is empty", TABS[tab].name);
+            assert!(tab_rows(tab).0.iter().any(|row| matches!(row.control, Control::Param(_) | Control::Tile(_))), "tab '{}' is empty", TABS[tab].name);
             // A tab starts with the heading of its first group.
             assert!(matches!(tab_rows(tab).0[0].control, Control::Header(_)));
         }
         assert_eq!(tab_of("a group that is new"), TABS.len() - 1);
+    }
+
+    #[test]
+    fn every_widget_has_a_tile_and_the_tiles_fit_side_by_side() {
+        let rows: Vec<Row> = (0..TABS.len()).flat_map(|tab| tab_rows(tab).0).collect();
+        let tiles: Vec<&Row> = rows.iter().filter(|row| matches!(row.control, Control::Tile(_))).collect();
+        // One for each widget there is, and each for a widget of its own.
+        assert_eq!(tiles.len(), widget::Kind::ALL.len());
+        for kind in widget::Kind::ALL {
+            assert_eq!(tiles.iter().filter(|row| matches!(row.control, Control::Tile(index) if widget_of(PARAMS[index].key) == Some(kind))).count(), 1, "{kind:?}");
+        }
+        assert_eq!(widget_of("widget_clock"), Some(widget::Kind::Clock));
+        assert_eq!(widget_of("widget_sundial"), None);
+        assert_eq!(widget_of("wallpaper"), None);
+        for (index, a) in tiles.iter().enumerate() {
+            // Inside the column, clear of its edges.
+            assert!(a.x >= SIDE_W + MARGIN && a.x + TILE_W <= SIDE_W + COLUMN_W - MARGIN + 0.01, "a tile at {}", a.x);
+            // Its switch is on it.
+            let switch = control_rect(a, a.control);
+            assert!(switch.0 >= a.x && switch.2 <= a.x + TILE_W && switch.1 >= a.y && switch.3 <= a.y + TILE_H);
+            for b in &tiles[..index] {
+                assert!(a.x + TILE_W <= b.x || b.x + TILE_W <= a.x || a.y + TILE_H <= b.y || b.y + TILE_H <= a.y, "two tiles on each other");
+            }
+        }
+        // What follows the tiles on their tab begins under the last of them.
+        let lowest = tiles.iter().map(|row| row.y + TILE_H).fold(0.0, f32::max);
+        let library = TABS.iter().position(|tab| tab.sections.contains(&"Widget")).unwrap();
+        for row in tab_rows(library).0.iter().filter(|row| matches!(row.control, Control::Param(_))) {
+            assert!(row.y >= lowest, "a row at {} on the tiles", row.y);
+        }
+    }
+
+    #[test]
+    fn the_video_has_a_row_of_its_own_under_the_choice_of_wallpaper() {
+        let rows: Vec<Row> = (0..TABS.len()).flat_map(|tab| tab_rows(tab).0).collect();
+        let video: Vec<usize> = rows.iter().enumerate().filter(|(_, row)| row.control == Control::Video).map(|(index, _)| index).collect();
+        assert_eq!(video.len(), 1);
+        let (above, row) = (&rows[video[0] - 1], &rows[video[0]]);
+        assert!(matches!(above.control, Control::Param(index) if PARAMS[index].key == "wallpaper"));
+        assert_eq!(row.y, above.y + ROW_H);
+        // The choice above it has "Video" where the wallpaper says a video is.
+        let Control::Param(index) = above.control else { unreachable!() };
+        let Kind::Choice(names) = PARAMS[index].kind else { panic!("the wallpaper is a choice") };
+        assert_eq!(names.get(wallpaper::VIDEO as usize), Some(&"Video"));
+        // Its button stands at the end of the row, clear of the name of the file.
+        let button = control_rect(row, row.control);
+        assert!(button.0 > row.x + COLUMN_W * 0.5 && button.2 <= row.x + COLUMN_W - MARGIN + 0.01);
+        assert!(button.1 >= row.y && button.3 <= row.y + ROW_H);
     }
 
     #[test]

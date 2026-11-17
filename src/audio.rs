@@ -95,6 +95,18 @@ impl Meter {
         // SAFETY: an ordinary COM call on an interface this struct owns.
         unsafe { self.meter.GetPeakValue().ok() }
     }
+
+    /// The same for the left and the right side of the sound apart, each from 0 to 1 (a
+    /// device with one side only gives the same for both).
+    pub fn peaks(&self) -> Option<(f32, f32)> {
+        // SAFETY: ordinary COM calls on an interface this struct owns.
+        unsafe {
+            let sides = self.meter.GetMeteringChannelCount().ok()?.max(1) as usize;
+            let mut levels = vec![0.0f32; sides];
+            self.meter.GetChannelsPeakValues(&mut levels).ok()?;
+            Some((levels[0], levels[sides.min(2) - 1]))
+        }
+    }
 }
 
 /// Asks Windows for the active playback devices.
@@ -221,5 +233,33 @@ fn policy_config() -> Option<IUnknown> {
             return None;
         }
         Some(IUnknown::from_raw(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+    /// Not a check of anything: reads the needle of the level meter for a second and says
+    /// what it stood at, as one number and to the left and right apart. Nothing is played
+    /// and nothing is listened to; with nothing playing, everything is 0.
+    /// Run by hand: cargo test --profile quick the_meter_is_read -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_meter_is_read() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let meter = Meter::new().expect("a playback device with a meter");
+        let (mut loudest, mut sides) = (0.0f32, (0.0f32, 0.0f32));
+        for _ in 0..20 {
+            loudest = loudest.max(meter.peak().expect("the needle"));
+            let (left, right) = meter.peaks().expect("the needle of each side");
+            assert!((0.0..=1.0).contains(&left) && (0.0..=1.0).contains(&right));
+            sides = (sides.0.max(left), sides.1.max(right));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        println!("the loudest in a second: {loudest:.3}; left {:.3}, right {:.3}", sides.0, sides.1);
     }
 }

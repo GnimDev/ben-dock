@@ -79,6 +79,9 @@ pub struct Config {
     pub win_key: bool,
     /// A bubble beside the dock sends every window out of the way.
     pub desktop_button: bool,
+    /// The cursor pushed into a bottom corner of the screen does the same: 0 = neither
+    /// corner, 1 = the left one, 2 = the right one, 3 = either.
+    pub hot_corners: f32,
 
     // Windows
     /// A window that has just opened floats in the middle of its screen instead of filling it.
@@ -93,6 +96,8 @@ pub struct Config {
     pub preview_size: f32,
 
     // Widgets on the desktop
+    pub widget_big: bool,
+    pub widget_sound: bool,
     pub widget_clock: bool,
     pub widget_calendar: bool,
     pub widget_monitor: bool,
@@ -105,7 +110,7 @@ pub struct Config {
     pub widget_progress: bool,
 
     // The live wallpaper
-    /// 0 = off (the desktop's own picture), 1 = dark water, 2 = blue water.
+    /// 0 = off (the desktop's own picture), 1 = dark water, 2 = blue water, 3 = a video.
     pub wallpaper: f32,
     pub wallpaper_cursor: bool,
     pub wallpaper_music: bool,
@@ -165,7 +170,8 @@ impl Default for Config {
             launcher: true,
             launcher_icon: 56.0,
             win_key: true,
-            desktop_button: true,
+            desktop_button: false,
+            hot_corners: 3.0,
             float_windows: true,
             float_size: 0.7,
             minimize_effect: 2.0,
@@ -173,7 +179,9 @@ impl Default for Config {
             preview: true,
             preview_delay: 0.4,
             preview_size: 220.0,
-            widget_clock: true,
+            widget_big: true,
+            widget_sound: true,
+            widget_clock: false,
             widget_calendar: true,
             widget_monitor: true,
             widget_todo: false,
@@ -291,6 +299,7 @@ pub const PARAMS: &[Param] = &[
     param!("launcher_icon", "Hành vi", "Cỡ icon trong khay ứng dụng", "Cỡ icon trong khay ứng dụng (điểm ảnh)", n(40.0, 96.0, 4.0), true, num!(launcher_icon)),
     param!("win_key", "Hành vi", "Phím Windows mở khay ứng dụng", "Bấm phím Windows một mình thì mở khay ứng dụng của Bến thay cho menu Start (gõ ngay để tìm ứng dụng). Phím Windows bấm cùng phím khác (Win+D, Win+E...) vẫn như cũ, và Ctrl+Esc vẫn mở menu Start. Cần bật nút khay ứng dụng", Kind::Toggle, true, flag!(win_key)),
     param!("desktop_button", "Hành vi", "Nút về màn hình chính cạnh dock", "Một bong bóng tròn cạnh dock: bấm vào thì mọi cửa sổ thu xuống, về màn hình chính. Chỉ hiện khi đang có cửa sổ mở trên màn hình", Kind::Toggle, true, flag!(desktop_button)),
+    param!("hot_corners", "Hành vi", "Góc về màn hình chính", "Đẩy con trỏ vào đúng góc dưới của màn hình và để yên một thoáng thì mọi cửa sổ thu xuống, về màn hình chính; làm lần nữa thì các cửa sổ trở lại. 0 = tắt, 1 = góc dưới bên trái, 2 = góc dưới bên phải, 3 = cả hai góc", Kind::Choice(&["Tắt", "Trái", "Phải", "Cả hai"]), true, num!(hot_corners)),
     param!("float_windows", "Cửa sổ", "Cửa sổ mới mở dạng nổi", "Cửa sổ vừa mở không phóng to hết màn hình mà nổi ở giữa, chỉ chiếm một phần màn hình. Bến chỉ làm việc này một lần, lúc cửa sổ mở ra; sau đó phóng to hay kéo cỡ tuỳ ý. Cửa sổ vốn đã nhỏ, cửa sổ không đổi cỡ được và trò chơi, video toàn màn hình thì giữ nguyên", Kind::Toggle, true, flag!(float_windows)),
     param!("float_size", "Cửa sổ", "Cỡ cửa sổ nổi", "Cửa sổ nổi chiếm nhiều nhất bao nhiêu phần chiều rộng và chiều cao của màn hình (0.7 = 70%)", n(0.4, 0.95, 0.01), true, num!(float_size)),
     param!("minimize_effect", "Cửa sổ", "Hiệu ứng thu nhỏ", "Khi bấm icon trên dock để thu nhỏ hoặc mở lại cửa sổ: 0 = hoạt ảnh của Windows, 1 = co lại dần về icon, 2 = chảy vào icon qua một cái phễu cong, như hiệu ứng thần đèn trên Mac, 3 = trượt xuống icon. Thu nhỏ bằng nút trên cửa sổ hay bằng bàn phím cũng dùng hiệu ứng này (Bến tắt hoạt ảnh của Windows cho các cửa sổ đang mở). Mở lại bằng Alt+Tab hay cách khác vẫn là hoạt ảnh của Windows, và cách nào cửa sổ cũng bay về đúng icon của nó trên dock", Kind::Choice(&["Của Windows", "Co lại", "Chảy", "Trượt"]), true, num!(minimize_effect)),
@@ -298,17 +307,19 @@ pub const PARAMS: &[Param] = &[
     param!("preview", "Cửa sổ", "Xem trước cửa sổ khi rê chuột", "Rê chuột lên icon của ứng dụng đang mở thì hiện hình thu nhỏ các cửa sổ của nó", Kind::Toggle, true, flag!(preview)),
     param!("preview_delay", "Cửa sổ", "Chờ bao lâu thì hiện xem trước", "Rê chuột bao nhiêu giây thì hiện xem trước", n(0.1, 1.5, 0.05), true, num!(preview_delay)),
     param!("preview_size", "Cửa sổ", "Cỡ hình xem trước", "Chiều rộng mỗi hình xem trước (điểm ảnh)", n(120.0, 400.0, 10.0), true, num!(preview_size)),
-    param!("widget_clock", "Widget", "Đồng hồ", "Widget đồng hồ trên màn hình nền: giờ lớn và ngày tháng. Mọi widget đều kéo được tới chỗ khác; vị trí được nhớ trong widgets.txt", Kind::Toggle, true, flag!(widget_clock)),
-    param!("widget_calendar", "Widget", "Lịch tháng", "Widget lịch: tháng này, hôm nay được tô màu nhấn", Kind::Toggle, true, flag!(widget_calendar)),
-    param!("widget_monitor", "Widget", "Theo dõi máy", "Widget theo dõi máy: bộ xử lý (kèm biểu đồ), bộ nhớ, ổ đĩa, tốc độ mạng và pin", Kind::Toggle, true, flag!(widget_monitor)),
+    param!("widget_big", "Widget", "Đồng hồ lớn", "Widget đồng hồ lớn nằm thẳng trên hình nền, không có kính bên dưới: giờ và phút bằng chữ số rất to và mảnh, ngày tháng bên dưới, và một hạt sáng chạy ngang theo giây. Mọi widget đều kéo được tới chỗ khác; vị trí được nhớ trong widgets.txt", Kind::Toggle, true, flag!(widget_big)),
+    param!("widget_sound", "Widget", "Sóng nhạc", "Widget sóng nhạc nằm thẳng trên hình nền: những vạch mảnh nhô lên theo âm thanh máy đang phát rồi lan từ giữa ra hai bên (bên trái theo loa trái, bên phải theo loa phải), soi bóng xuống bên dưới. Bến chỉ hỏi Windows mức âm lượng đang phát, không thu âm", Kind::Toggle, true, flag!(widget_sound)),
+    param!("widget_clock", "Widget", "Đồng hồ kim", "Widget đồng hồ dạng thẻ kính: giờ, thứ, ngày và một mặt đồng hồ kim có hạt sáng chạy quanh theo giây", Kind::Toggle, true, flag!(widget_clock)),
+    param!("widget_calendar", "Widget", "Lịch tháng", "Widget lịch: tháng này, hôm nay sáng lên bằng màu nhấn", Kind::Toggle, true, flag!(widget_calendar)),
+    param!("widget_monitor", "Widget", "Theo dõi máy", "Widget theo dõi máy: bộ xử lý (kèm biểu đồ một phút vừa qua), bộ nhớ, ổ đĩa và pin dạng vòng tròn, và tốc độ mạng", Kind::Toggle, true, flag!(widget_monitor)),
     param!("widget_todo", "Widget", "Việc cần làm", "Widget việc cần làm: đọc từ todo.txt cạnh ben.exe, mỗi dòng một việc, dòng bắt đầu bằng 'x ' là việc đã xong. Bấm một việc để đánh dấu xong, bấm cây bút để sửa danh sách", Kind::Toggle, true, flag!(widget_todo)),
-    param!("widget_focus", "Widget", "Hẹn giờ tập trung", "Widget hẹn giờ tập trung (Pomodoro): bấm để chạy hoặc tạm dừng, bấm mũi tên vòng để đặt lại. Hết giờ tập trung thì chuyển sang giờ nghỉ và ngược lại", Kind::Toggle, true, flag!(widget_focus)),
-    param!("focus_minutes", "Widget", "Số phút tập trung", "Một lượt tập trung dài mấy phút", n(5.0, 90.0, 5.0), true, num!(focus_minutes)),
-    param!("break_minutes", "Widget", "Số phút nghỉ", "Nghỉ mấy phút sau mỗi lượt tập trung", n(1.0, 30.0, 1.0), true, num!(break_minutes)),
+    param!("widget_focus", "Widget", "Hẹn giờ tập trung", "Widget hẹn giờ tập trung (Pomodoro), hình tròn: bấm để chạy hoặc tạm dừng, bấm mũi tên vòng để đặt lại. Hết giờ tập trung thì chuyển sang giờ nghỉ và ngược lại", Kind::Toggle, true, flag!(widget_focus)),
     param!("widget_note", "Widget", "Ghi chú", "Widget ghi chú: hiện nội dung note.txt cạnh ben.exe. Bấm vào để mở file và sửa", Kind::Toggle, true, flag!(widget_note)),
-    param!("widget_progress", "Widget", "Tiến độ thời gian", "Widget tiến độ: hôm nay, tuần này, tháng này và năm nay đã trôi qua bao nhiêu phần trăm", Kind::Toggle, true, flag!(widget_progress)),
-    param!("wallpaper", "Hình nền", "Hình nền nước động", "Mặt nước động thay cho ảnh nền của Windows: 0 = tắt (giữ ảnh nền của Windows), 1 = nước tối, 2 = nước xanh. Ảnh nền của Windows không bị đổi: tắt đi là thấy lại", Kind::Choice(&["Tắt", "Nước tối", "Nước xanh"]), true, num!(wallpaper)),
-    param!("wallpaper_cursor", "Hình nền", "Gợn sóng theo chuột", "Con trỏ lướt trên màn hình nền để lại gợn sóng, bấm chuột làm vòng sóng toả ra", Kind::Toggle, true, flag!(wallpaper_cursor)),
+    param!("widget_progress", "Widget", "Tiến độ thời gian", "Widget tiến độ: hôm nay, tuần này, tháng này và năm nay đã trôi qua bao nhiêu phần trăm, vẽ thành bốn vòng tròn lồng nhau", Kind::Toggle, true, flag!(widget_progress)),
+    param!("focus_minutes", "Hẹn giờ tập trung", "Số phút tập trung", "Một lượt tập trung dài mấy phút", n(5.0, 90.0, 5.0), true, num!(focus_minutes)),
+    param!("break_minutes", "Hẹn giờ tập trung", "Số phút nghỉ", "Nghỉ mấy phút sau mỗi lượt tập trung", n(1.0, 30.0, 1.0), true, num!(break_minutes)),
+    param!("wallpaper", "Hình nền", "Hình nền động", "Hình nền động thay cho ảnh nền của Windows: 0 = tắt (giữ ảnh nền của Windows), 1 = nước tối, 2 = nước xanh, 3 = video. Video là file ghi trong video.txt cạnh ben.exe (một dòng: đường dẫn đầy đủ), chọn bằng nút \"Chọn video\" trong cửa sổ Cài đặt; nó phát không tiếng, lặp lại mãi, và đứng yên khi màn hình nền bị che hết hoặc máy đang khoá. Ảnh nền của Windows không bị đổi: tắt đi là thấy lại", Kind::Choice(&["Tắt", "Nước tối", "Nước xanh", "Video"]), true, num!(wallpaper)),
+    param!("wallpaper_cursor", "Hình nền", "Gợn sóng theo chuột", "Con trỏ lướt trên màn hình nền để lại gợn sóng, bấm chuột làm vòng sóng toả ra (trên mặt nước cũng như trên video)", Kind::Toggle, true, flag!(wallpaper_cursor)),
     param!("wallpaper_music", "Hình nền", "Gợn sóng theo nhạc", "Khi máy đang phát nhạc, mỗi nhịp mạnh làm một giọt rơi xuống mặt nước. Bến chỉ hỏi Windows mức âm lượng đang phát, không thu âm", Kind::Toggle, true, flag!(wallpaper_music)),
     param!("wallpaper_strength", "Hình nền", "Độ mạnh của sóng", "Sóng mạnh hay nhẹ. 1.0 = mặc định", n(0.3, 2.0, 0.05), true, num!(wallpaper_strength)),
     param!("stats", "Chẩn đoán", "", "Ghi tốc độ khung hình và lượng RAM vào ben.log", Kind::Toggle, false, flag!(stats)),

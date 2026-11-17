@@ -14,6 +14,7 @@ use crate::config::{self, Config};
 use crate::background::{self, Background, Button, Resident};
 use crate::corner::{self, Corner, Kind};
 use crate::desktop;
+use crate::hot::Hot;
 use crate::dock::{self, Dock, Released, LAUNCHER_KEY};
 use crate::dropzone;
 use crate::fx::{self, Fx};
@@ -50,6 +51,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetDoubleClickTime, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_LBUTTON};
 use windows::Win32::UI::Shell::ABN_POSCHANGED;
@@ -76,6 +78,10 @@ const TUCK_DOCK: Duration = Duration::from_secs(2);
 const TUCK_ISLAND: Duration = Duration::from_secs(8);
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+/// The session was locked, or unlocked (asked for with `WTSRegisterSessionNotification`).
+const WM_WTSSESSION_CHANGE_MSG: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 7;
+const WTS_SESSION_UNLOCK: usize = 8;
 const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
 const TIMER_ID: usize = 1;
 /// A one-shot timer that only wakes the main loop (see `App::wake_in`).
@@ -247,6 +253,8 @@ pub enum Event {
     Volume,
     /// The charger went in or out, or the battery level moved.
     Power,
+    /// The screen was locked (true), or unlocked.
+    Locked(bool),
     /// What is playing changed.
     Media,
     /// The background reader of the app list has something new.
@@ -269,6 +277,8 @@ pub enum Event {
     Launcher(launcher::Input),
     /// The Windows key was tapped on its own (see `winkey.rs`).
     WinKey,
+    /// The cursor was pushed into a corner that shows the desktop (see `hot.rs`).
+    HotCorner,
     /// An app in the background came, went or changed its icon (see `background.rs`).
     Background,
     /// The settings window changed something. `true` once the change is final (control released).
@@ -438,6 +448,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         WM_POWERBROADCAST => push(Event::Power),
+        WM_WTSSESSION_CHANGE_MSG if wparam.0 == WTS_SESSION_LOCK || wparam.0 == WTS_SESSION_UNLOCK => push(Event::Locked(wparam.0 == WTS_SESSION_LOCK)),
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION => {
             // Signing out or shutting down: put the taskbar setting back now, there is no later.
@@ -664,6 +675,8 @@ struct Screen {
     island: Option<Island>,
     /// The pieces of glass in the screen's corners that are switched on.
     corners: Vec<Corner>,
+    /// The bottom corners that show the desktop when the cursor is pushed into them.
+    hot: Vec<Hot>,
     /// Bottom edge of the dock's strip on screen, as last granted by the shell.
     bottom_line: i32,
     /// A full-screen app fills this screen; a maximised window is showing on it; a window of
@@ -802,6 +815,12 @@ pub struct App {
     /// The live wallpaper, when it is switched on; and when making it was last tried.
     wallpaper: Option<Wallpaper>,
     wallpaper_tried: Instant,
+    /// The screen is locked: the desktop cannot be seen, whatever the windows say.
+    locked: bool,
+    /// The needle of Windows' level meter, for the widget that shows the sound, and when
+    /// the device Windows plays through was last looked for (see `hear`).
+    meter: Option<audio::Meter>,
+    meter_sought: Instant,
     /// The timer that looks at the cursor and the sound for the wallpaper is running.
     polling: bool,
     /// When something tucked out of view is next due to change (a timer is set for it).
@@ -925,6 +944,9 @@ impl App {
             focus: tasks::Focus::new(25.0),
             wallpaper: None,
             wallpaper_tried: Instant::now(),
+            locked: false,
+            meter: None,
+            meter_sought: Instant::now(),
             polling: false,
             tuck_due: None,
             hooks: Vec::new(),
@@ -990,6 +1012,10 @@ impl App {
             // The poll is the safety net: it also re-hides the taskbar if Explorer brings it
             // back, and moves the clock on.
             SetTimer(Some(hwnd), TIMER_ID, 1000, None);
+            // Be told when the screen is locked: nothing on the desktop is worth moving then.
+            if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                crate::log!("will not be told when the screen is locked ({e}); the wallpaper keeps moving behind the lock screen");
+            }
 
             // Be told the moment a window is minimised, restored or moved.
             for (first, last) in [(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND)] {
@@ -1036,7 +1062,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners_top: hide, hide_corners_bottom: hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), hot: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners_top: hide, hide_corners_bottom: hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -1067,6 +1093,20 @@ impl App {
             }
             for corner in &mut screen.corners {
                 corner.place(&screen.monitor, &self.cfg, &screen.theme, screen.bottom_line);
+            }
+            // The corners that show the desktop: 1 = the left one, 2 = the right one, 3 = both.
+            let hot = self.cfg.hot_corners.round() as u32;
+            for (left, wanted) in [(true, hot & 1 != 0), (false, hot & 2 != 0)] {
+                match (wanted, screen.hot.iter().position(|corner| corner.left() == left)) {
+                    (true, None) => match Hot::new(left) {
+                        Ok(corner) => screen.hot.push(corner),
+                        Err(e) => crate::log!("a corner that shows the desktop is unavailable: {e}"),
+                    },
+                    (false, Some(index)) => {
+                        screen.hot.remove(index);
+                    }
+                    _ => {}
+                }
             }
             if screen.dock.set_launcher_button(self.cfg.launcher, &self.motion) {
                 self.refresh_due = true;
@@ -1158,10 +1198,12 @@ impl App {
     }
 
     /// Makes the widgets that are switched on and takes away those that are not. A new one
-    /// goes where it was last put, or to its place down the right side of the first screen.
+    /// goes where it was last put, or to its own place on the first screen (see `widget::Kind::home`).
     fn setup_widgets(&mut self) {
         let cfg = &self.cfg;
         let wanted = [
+            (widget::Kind::Big, cfg.widget_big),
+            (widget::Kind::Sound, cfg.widget_sound),
             (widget::Kind::Clock, cfg.widget_clock),
             (widget::Kind::Calendar, cfg.widget_calendar),
             (widget::Kind::Monitor, cfg.widget_monitor),
@@ -1195,12 +1237,7 @@ impl App {
                 _ => {}
             }
         }
-        if self.widgets.is_empty() {
-            self.mark = None;
-            self.desktop_lifted = false;
-        } else if self.mark.is_none() {
-            self.mark = desktop::Mark::new().ok();
-        }
+        self.keep_mark();
         // What they show, from the first moment.
         if self.cfg.widget_todo && self.todo.look() {
             self.tasks = tasks::parse_tasks(&self.todo.text);
@@ -1214,6 +1251,32 @@ impl App {
             self.net = self.traffic.read();
         }
         self.focus.resize(self.cfg.focus_minutes, self.cfg.break_minutes);
+        if self.cfg.widget_sound && self.meter.is_none() {
+            self.meter = audio::Meter::new();
+            self.meter_sought = Instant::now();
+        }
+        self.poll_desktop();
+    }
+
+    /// How loud what the computer plays is, to the left and to the right, for the widget
+    /// that shows it. `None` while there is nothing to show it on: the widget is off, or
+    /// the screen it lies on is covered by a maximised window or filled by a full-screen app.
+    fn hear(&mut self) -> Option<(f32, f32)> {
+        let at = self.widgets.iter().find(|widget| widget.kind() == widget::Kind::Sound)?.at();
+        let screen = &self.screens[self.screen_at(at)];
+        // (With the desktop lifted over the windows, by "show desktop", the widget is in view
+        // whatever is maximised under it.)
+        if self.locked || (!self.desktop_lifted && (screen.filled || screen.covered)) {
+            return None;
+        }
+        // The meter belongs to one device. Without one, or while it is silent, look again
+        // now and then for the device Windows plays through: it may have changed.
+        let level = self.meter.as_ref().and_then(|meter| meter.peaks());
+        if level.map(|(left, right)| left.max(right)).unwrap_or(0.0) <= 0.0 && self.meter_sought.elapsed().as_secs() >= 4 {
+            self.meter_sought = Instant::now();
+            self.meter = audio::Meter::new();
+        }
+        level
     }
 
     /// A click or a drag on a widget.
@@ -1271,30 +1334,51 @@ impl App {
     /// restarted, a screen came or went).
     fn setup_wallpaper(&mut self) {
         let look = self.cfg.wallpaper.round() as u32;
-        if self.wallpaper.as_ref().map(|wallpaper| wallpaper.look() != look || !wallpaper.fits()).unwrap_or(false) {
+        // (A video: the file that was chosen. Another one chosen, and it is made again too.)
+        let video = if look == wallpaper::VIDEO { wallpaper::video_path() } else { None };
+        if self.wallpaper.as_ref().map(|wallpaper| wallpaper.look() != look || wallpaper.video() != video.as_deref() || !wallpaper.fits()).unwrap_or(false) {
             self.wallpaper = None;
         }
         if look != 0 && self.wallpaper.is_none() {
             self.wallpaper_tried = Instant::now();
-            match Wallpaper::new(&self.scene, &self.cfg) {
-                Ok(wallpaper) => self.wallpaper = Some(wallpaper),
-                Err(e) => crate::log!("the live wallpaper is unavailable: {e}"),
+            // (Without a video chosen there is nothing to play: the desktop keeps its picture.)
+            if look != wallpaper::VIDEO || video.is_some() {
+                match Wallpaper::new(&self.scene, &self.cfg, video) {
+                    Ok(wallpaper) => self.wallpaper = Some(wallpaper),
+                    Err(e) => crate::log!("the live wallpaper is unavailable: {e}"),
+                }
             }
         }
+        self.keep_mark();
         self.poll_desktop();
+    }
+
+    /// Keeps the mark that tells when the desktop is lifted over the windows (see
+    /// `desktop::Mark`) for as long as something of the app's lies on the desktop: widgets,
+    /// or a wallpaper.
+    fn keep_mark(&mut self) {
+        if self.widgets.is_empty() && self.wallpaper.is_none() {
+            self.mark = None;
+            self.desktop_lifted = false;
+        } else if self.mark.is_none() {
+            self.mark = desktop::Mark::new().ok();
+        }
     }
 
     /// True while some of the desktop can be seen on some screen: no full-screen app fills
     /// it, and no maximised window covers it (or one does, but strips along the edges are
-    /// kept free for the dock and the island, and the desktop shows there).
+    /// kept free for the dock and the island, and the desktop shows there). Lifted over the
+    /// windows by "show desktop", all of it can be seen, whatever lies under it.
     fn desktop_seen(&self) -> bool {
-        self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && (!screen.covered || self.cfg.reserve_dock || self.cfg.reserve_island))
+        self.demo.is_some() || self.desktop_lifted || self.screens.iter().any(|screen| !screen.filled && (!screen.covered || self.cfg.reserve_dock || self.cfg.reserve_island))
     }
 
-    /// Starts or stops the timer that looks at the cursor and the sound for the wallpaper.
-    /// It runs while there is a wallpaper and a screen it can be seen on.
+    /// Starts or stops the timer that looks at the cursor and the sound for the wallpaper,
+    /// and at the sound for the widget that shows it. It runs while there is a wallpaper or
+    /// that widget, and a screen the desktop can be seen on.
     fn poll_desktop(&mut self) {
-        let wanted = self.wallpaper.is_some() && self.desktop_seen();
+        let sound = self.widgets.iter().any(|widget| widget.kind() == widget::Kind::Sound);
+        let wanted = (self.wallpaper.is_some() || sound) && self.desktop_seen();
         if wanted != self.polling {
             self.polling = wanted;
             unsafe {
@@ -1500,6 +1584,10 @@ impl App {
             Event::Tick => {
                 self.refresh_due = true;
                 self.taskbar.keep_hidden();
+                // (Whatever was shown since may lie over the corners that show the desktop.)
+                for hot in self.screens.iter().flat_map(|screen| screen.hot.iter()) {
+                    hot.raise();
+                }
                 self.read_status();
                 self.clock = system::clock();
                 self.today = system::today();
@@ -1671,6 +1759,7 @@ impl App {
                 }
             }
             Event::Volume | Event::Power => self.read_status(),
+            Event::Locked(locked) => self.locked = locked,
             Event::Media => self.take_media(),
             Event::Notices => self.take_notices(),
             Event::Background => self.take_residents(),
@@ -1699,6 +1788,7 @@ impl App {
                     }
                 }
             }
+            Event::HotCorner => self.act(0, Action::Desktop),
             Event::WinKey => {
                 // On the screen the cursor is on, where the person is looking.
                 let mut pt = POINT::default();
@@ -3333,6 +3423,10 @@ impl App {
             screen.dock.set_bar(auto && !dock_stays);
             // The bubble that shows the desktop has nothing to do when the desktop is showing.
             screen.dock.set_desk(self.cfg.desktop_button && screen.showing);
+            // The corners that show the desktop go when a full-screen app has the screen.
+            for hot in &mut screen.hot {
+                hot.place(screen.monitor.rect, screen.monitor.scale(), !screen.filled);
+            }
             if let Some(island) = screen.island.as_mut() {
                 island.set_mini(mini);
             }
@@ -3422,10 +3516,12 @@ impl App {
         if !self.widgets.is_empty() {
             let now = Instant::now();
             let (seconds, weekday) = system::time_of_day();
+            let sound = self.hear();
             let info = widget::Info {
                 time: &self.clock.time,
                 date: &self.clock.date,
                 today: self.today,
+                now: (seconds / 3600, seconds / 60 % 60, seconds % 60),
                 vital: self.vital,
                 history: &self.history,
                 disk: self.disk,
@@ -3435,6 +3531,7 @@ impl App {
                 note: &self.note.text,
                 focus: (self.focus.stage, self.focus.seconds_left(now), self.focus.share(now), self.focus.running()),
                 gone: tasks::gone_by(self.today.0, self.today.1, self.today.2, weekday, seconds),
+                sound,
             };
             let theme = &self.screens[0].theme;
             for widget in &mut self.widgets {
@@ -3447,8 +3544,10 @@ impl App {
 
         // The wallpaper's water: the cursor stirs it wherever the desktop itself is under it,
         // and sound does while, on some screen, no maximised window lies over it.
-        let showing = self.desktop_seen();
-        let open = self.demo.is_some() || self.screens.iter().any(|screen| !screen.filled && !screen.covered);
+        let showing = self.desktop_seen() && !self.locked;
+        // (Lifted over the windows by "show desktop", the desktop is in view whatever is
+        // maximised under it.)
+        let open = self.demo.is_some() || self.desktop_lifted || self.screens.iter().any(|screen| !screen.filled && !screen.covered);
         if let Some(wallpaper) = self.wallpaper.as_mut() {
             let feel = wallpaper::Feel {
                 showing,
@@ -3806,6 +3905,7 @@ impl App {
         }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ID);
+            let _ = WTSUnRegisterSessionNotification(self.hwnd);
             let _ = DeregisterShellHookWindow(self.hwnd);
             for hook in self.hooks.drain(..) {
                 let _ = UnhookWinEvent(hook);

@@ -1945,23 +1945,6 @@ mod tests {
     fn the_island_for_looking_at() {
         use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
-        /// A picture file anything can open: BGRA rows, the top one first.
-        fn save(path: &std::path::Path, w: i32, h: i32, bgra: &[u8]) {
-            let mut file = Vec::with_capacity(54 + bgra.len());
-            file.extend_from_slice(b"BM");
-            file.extend_from_slice(&(54 + bgra.len() as u32).to_le_bytes());
-            file.extend_from_slice(&[0; 4]);
-            file.extend_from_slice(&54u32.to_le_bytes());
-            file.extend_from_slice(&40u32.to_le_bytes());
-            file.extend_from_slice(&w.to_le_bytes());
-            file.extend_from_slice(&(-h).to_le_bytes());
-            file.extend_from_slice(&1u16.to_le_bytes());
-            file.extend_from_slice(&32u16.to_le_bytes());
-            file.extend_from_slice(&[0; 24]);
-            file.extend_from_slice(bgra);
-            std::fs::write(path, file).expect("the picture saved");
-        }
-
         let out = std::path::PathBuf::from(std::env::var("BEN_OUT").expect("BEN_OUT: the folder for the pictures"));
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -2007,7 +1990,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             let (w, h) = (island.win.0 as i32, island.win.1 as i32);
             let pixels = unsafe { crate::camera::print(island.hwnd, w, h) }.expect("a picture of the window");
-            save(&out.join(format!("{name}.bmp")), w, h, &pixels);
+            crate::camera::save_picture(&out.join(format!("{name}.bmp")), w, h, &pixels);
             println!("{name}: window {w}x{h}, glass {}x{}", island.w.pos.round(), island.h.pos.round());
         };
         island.open();
