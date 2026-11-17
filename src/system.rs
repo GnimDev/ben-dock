@@ -160,6 +160,20 @@ pub fn accent_color() -> (f32, f32, f32) {
     (0.0, 0.47, 0.84)
 }
 
+/// The file of the theme Windows is using now.
+pub fn windows_theme_file() -> Option<std::path::PathBuf> {
+    let (subkey, value) = (wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes"), wide("CurrentTheme"));
+    let mut data = [0u16; 1024];
+    let mut size = (data.len() * 2) as u32;
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), PCWSTR(value.as_ptr()), RRF_RT_REG_SZ, None, Some(data.as_mut_ptr() as *mut _), Some(&mut size)) };
+    if r != ERROR_SUCCESS {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&data[..(size as usize / 2).min(data.len())]);
+    let text = text.trim_end_matches('\0');
+    (!text.is_empty()).then(|| std::path::PathBuf::from(text))
+}
+
 // ---------------------------------------------------------------- autostart
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";

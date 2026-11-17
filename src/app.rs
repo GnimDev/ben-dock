@@ -14,6 +14,7 @@ use crate::config::{self, Config};
 use crate::background::{self, Background, Button, Resident};
 use crate::corner::{self, Corner, Kind};
 use crate::desktop;
+use crate::frames::Frames;
 use crate::hot::Hot;
 use crate::dock::{self, Dock, Released, LAUNCHER_KEY};
 use crate::dropzone;
@@ -346,7 +347,7 @@ pub fn take_events() -> Vec<Event> {
 }
 
 /// Called by Windows (on this thread, while it pumps messages) when any window on the desktop
-/// starts or stops being minimised, or finishes being moved.
+/// starts or stops being minimised, finishes being moved, or comes to the front.
 unsafe extern "system" fn win_event(_hook: HWINEVENTHOOK, event: u32, hwnd: HWND, object: i32, _child: i32, _thread: u32, _time: u32) {
     // Object 0 is the window itself (not one of its parts).
     if object != 0 || hwnd.is_invalid() {
@@ -355,6 +356,8 @@ unsafe extern "system" fn win_event(_hook: HWINEVENTHOOK, event: u32, hwnd: HWND
     match event {
         EVENT_SYSTEM_MINIMIZESTART => push(Event::Minimized(hwnd.0 as isize)),
         EVENT_SYSTEM_MINIMIZEEND => push(Event::Restored(hwnd.0 as isize)),
+        // (Also a dialog, which the shell says nothing about: the windows are read again.)
+        EVENT_SYSTEM_FOREGROUND => push(Event::WindowsChanged),
         _ => push(Event::Moved(hwnd.0 as isize)),
     }
 }
@@ -735,6 +738,8 @@ pub struct App {
     replace_due: bool,
     /// The app window that was last in front (a menu of ours in front does not count).
     last_front: HWND,
+    /// Other programs' windows that wear the theme (see `frames.rs`).
+    frames: Frames,
     /// Last-modified time of ben.ini as last read, to notice edits made by hand.
     cfg_stamp: Option<SystemTime>,
 
@@ -896,6 +901,7 @@ impl App {
             refresh_due: true,
             replace_due: false,
             last_front: HWND::default(),
+            frames: Frames::default(),
             cfg_stamp: config::config_modified(),
             status: system::StatusReader::new(),
             last_status: system::Status::default(),
@@ -1017,11 +1023,12 @@ impl App {
                 crate::log!("will not be told when the screen is locked ({e}); the wallpaper keeps moving behind the lock screen");
             }
 
-            // Be told the moment a window is minimised, restored or moved.
-            for (first, last) in [(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND)] {
+            // Be told the moment a window is minimised, restored or moved, or comes to the
+            // front.
+            for (first, last) in [(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND), (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND)] {
                 let hook = SetWinEventHook(first, last, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
                 if hook.is_invalid() {
-                    crate::log!("SetWinEventHook({first}) failed; minimise effects will not play");
+                    crate::log!("SetWinEventHook({first}) failed; minimise effects will not play, or a dialog takes the theme's frame a moment late");
                 } else {
                     app.hooks.push(hook);
                 }
@@ -1178,6 +1185,9 @@ impl App {
         }
         self.start_scan();
         self.setup_wallpaper();
+        // At start, and whenever the surfaces are set up again, keep File Explorer's glass
+        // in step (nothing happens unless it is switched on and ExplorerBlurMica is there).
+        self.sync_glass();
         self.setup_widgets();
     }
 
@@ -3052,6 +3062,11 @@ impl App {
             }
         }
         self.retheme(false);
+        // (When this setting is turned on, the theme may not have changed, so retheme does
+        // not reach the glass: give ExplorerBlurMica the colours here too.)
+        if cfg.explorer_glass && !old.explorer_glass {
+            self.sync_glass();
+        }
         if cfg.preview_size != old.preview_size || !cfg.preview {
             self.close_preview();
         }
@@ -3109,6 +3124,19 @@ impl App {
             preview.set_theme(first);
         }
         self.menu_item = None;
+        // (Other programs' windows that wear the theme are given the new one.)
+        self.refresh_due = true;
+        // (File Explorer's glass, left to ExplorerBlurMica, is given the new colours.)
+        self.sync_glass();
+    }
+
+    /// Gives ExplorerBlurMica the theme's colours, when File Explorer's glass is switched on
+    /// (see `blurmica`). Does nothing, and costs one look at the registry, when it is off or
+    /// the program is not installed.
+    fn sync_glass(&self) {
+        if self.cfg.explorer_glass {
+            crate::blurmica::sync(&self.cfg);
+        }
     }
 
     // ---------------------------------------------------------------- update
@@ -3136,6 +3164,8 @@ impl App {
             self.last_front = real_front;
         }
         let front = self.last_front;
+        // Other programs' windows wear the theme, where the settings say so.
+        self.frames.tend(&self.cfg, &self.screens[0].theme, front);
 
         // Each dock gets the windows on its own screen (a window on a screen without a dock
         // goes to the first).
@@ -3900,6 +3930,8 @@ impl App {
     pub fn shutdown(&mut self) {
         // From here on Explorer's answer stands again, and so does Windows' own animation.
         MIN_RECTS.with(|table| table.borrow_mut().clear());
+        // Other programs' windows get back the frames Windows gives them.
+        self.frames.undress();
         for (id, on) in std::mem::take(&mut self.transitions) {
             if !on {
                 shell::set_transitions(HWND(id as *mut _), true);

@@ -24,6 +24,12 @@ pub struct Config {
     /// The set of colours: 0 = Windows' accent colour on plain glass, 1 and up = one of the
     /// app's own (see `theme::SCHEMES`).
     pub scheme: f32,
+    /// Other programs' windows wear the theme too: their borders, and their title bars (see
+    /// `frames.rs`).
+    pub frame_borders: bool,
+    pub frame_titles: bool,
+    /// The File Explorer window that has the keyboard is made of blurred glass.
+    pub explorer_glass: bool,
 
     // Dock (logical pixels, multiplied by the display scale)
     pub icon_size: f32,
@@ -137,6 +143,9 @@ impl Default for Config {
             accent_tint: 0.10,
             shadow: true,
             scheme: 0.0,
+            frame_borders: false,
+            frame_titles: false,
+            explorer_glass: false,
             icon_size: 46.0,
             gap: 8.0,
             padding: 9.0,
@@ -260,6 +269,9 @@ const fn n(min: f32, max: f32, step: f32) -> Kind {
 
 pub const PARAMS: &[Param] = &[
     param!("scheme", "Theme", "Theme", "Bộ màu của Bến: 0 = theo màu nhấn của Windows, 1 = Bến nước, 2 = Bình minh, 3 = Hoàng hôn, 4 = Rừng tràm, 5 = Sương sớm, 6 = Đèn lồng, 7 = Giấy dó, 8 = Đầm sen. Mỗi bộ có màu nhấn, màu kính và màu nước của hình nền riêng. Chọn trong cửa sổ Cài đặt thì chất liệu, sáng / tối, độ đục, độ nhoè, nhuộm màu nhấn và độ bo góc của dock cũng được đặt theo bộ đó (sau đó vẫn chỉnh riêng từng thứ được); sửa số này trong file thì chỉ đổi màu", Kind::Choice(&["Theo Windows", "Bến nước", "Bình minh", "Hoàng hôn", "Rừng tràm", "Sương sớm", "Đèn lồng", "Giấy dó", "Đầm sen"]), true, num!(scheme)),
+    param!("frame_borders", "Đồng bộ Windows", "Viền cửa sổ theo theme", "Viền của mọi cửa sổ mang màu của theme: cửa sổ đang dùng có viền màu nhấn, các cửa sổ khác viền dịu hơn. Bến tự tô và trả lại như cũ khi tắt; Windows không lưu gì", Kind::Toggle, true, flag!(frame_borders)),
+    param!("frame_titles", "Đồng bộ Windows", "Thanh tiêu đề theo theme", "Thanh tiêu đề của các cửa sổ mang màu kính của theme, chữ trên đó theo màu chữ của theme. Ứng dụng tự vẽ thanh tiêu đề (trình duyệt, nhiều ứng dụng mới) thì chỉ đổi viền. Bến tự tô và trả lại như cũ khi tắt", Kind::Toggle, true, flag!(frame_titles)),
+    param!("explorer_glass", "Đồng bộ Windows", "Kính cho File Explorer", "Cho File Explorer bằng kính mờ hợp tông với theme. File Explorer không cho đổi từ bên ngoài, nên phần kính do chương trình mã nguồn mở ExplorerBlurMica làm (tải và cài riêng, xem github.com/Maplespe/ExplorerBlurMica); Bến chỉ ghi màu của theme vào cấu hình của nó cho khớp. Bật mà chưa cài thì chưa thấy gì. Đổi màu xong phải mở lại cửa sổ File Explorer mới thấy. Bến ghi đè cấu hình màu của ExplorerBlurMica khi bật mục này", Kind::Toggle, true, flag!(explorer_glass)),
     param!("style", "Giao diện", "Chất liệu", "Chất liệu của các bề mặt: 0 = kính lỏng (trong, viền sáng), 1 = sương mờ (đục hơn, dễ đọc hơn), 2 = mực (kính đen như đảo của iPhone), 3 = đặc (không làm nhoè phía sau, nhẹ máy nhất)", Kind::Choice(&["Kính lỏng", "Sương mờ", "Mực", "Đặc"]), true, num!(style)),
     param!("theme", "Giao diện", "Sáng / tối", "Sáng hay tối: 0 = theo Windows, 1 = tối, 2 = sáng", Kind::Choice(&["Theo Windows", "Tối", "Sáng"]), true, num!(theme)),
     param!("tint_opacity", "Giao diện", "Độ đục của kính", "Độ đục của kính: 0 = trong nhất, 1 = đục nhất", n(0.0, 1.0, 0.01), true, num!(tint_opacity)),

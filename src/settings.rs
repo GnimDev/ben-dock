@@ -10,7 +10,10 @@
 //!
 //! Nor are the themes: the first tab shows a picture of each of the app's own
 //! sets of colours (painted by `theme::swatch`), and a click on one puts it to
-//! use, with the glass it was made for (see `theme::choose`).
+//! use, with the glass it was made for (see `theme::choose`). Under them are the ways
+//! the rest of Windows is made to match: two switches for the frames of other programs'
+//! windows (see `frames.rs`), and two buttons that hand Windows a theme file of its own
+//! kind (see `wintheme.rs`).
 //!
 //! One setting is not a number: which video the wallpaper plays. It has a row
 //! of its own with a button that opens Windows' dialog for choosing a file.
@@ -23,6 +26,7 @@ use crate::theme;
 use crate::util::wide;
 use crate::wallpaper;
 use crate::widget;
+use crate::wintheme;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -85,7 +89,7 @@ struct Tab {
 }
 
 const TABS: [Tab; 8] = [
-    Tab { name: "Theme", glyph: 0xE790, sections: &["Theme"], hint: "Chọn rồi tinh chỉnh ở Giao diện" },
+    Tab { name: "Theme", glyph: 0xE790, sections: &["Theme", "Đồng bộ Windows"], hint: "Chọn rồi tinh chỉnh ở Giao diện" },
     Tab { name: "Giao diện", glyph: 0xE771, sections: &["Giao diện", "Chuyển động"], hint: "" },
     Tab { name: "Dock", glyph: 0xE90E, sections: &["Dock"], hint: "" },
     Tab { name: "Đảo và bốn góc", glyph: 0xECA5, sections: &["Đảo động", "Bốn góc"], hint: "" },
@@ -141,6 +145,11 @@ enum Control {
     Scheme(usize),
     /// A few words about the theme in use, under the gallery.
     Story,
+    /// Windows is handed a theme file made from the theme in use: its accent colour, and
+    /// light or dark.
+    WinTheme,
+    /// Windows is handed back the theme it had before the first of ours.
+    WinBack,
     /// Which video the wallpaper plays, and a button to choose another.
     Video,
     Header(&'static str),
@@ -188,6 +197,8 @@ struct State {
     /// Slider being dragged.
     drag: Option<usize>,
     autostart: bool,
+    /// ExplorerBlurMica is installed (the glass of File Explorer can be had).
+    blur_installed: bool,
 }
 
 thread_local! {
@@ -261,6 +272,13 @@ fn tab_rows(tab: usize) -> (Vec<Row>, f32) {
                 // Under the choice of wallpaper: which video, for when it is to be one.
                 rows.push(Row { control: Control::Video, x, y });
                 y += ROW_H;
+            }
+            if p.key == "explorer_glass" {
+                // Under the switches for the windows' frames: what Windows itself is given.
+                for control in [Control::WinTheme, Control::WinBack] {
+                    rows.push(Row { control, x, y });
+                    y += ROW_H;
+                }
             }
         }
         if tiles > 0 {
@@ -457,6 +475,7 @@ fn create(cfg: &Config) -> Result<()> {
             accent: system::accent_color(),
             drag: None,
             autostart: system::autostart_enabled(),
+            blur_installed: crate::blurmica::installed(),
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
         #[cfg(test)]
@@ -493,8 +512,8 @@ fn control_rect(row: &Row, control: Control) -> (f32, f32, f32, f32) {
         // All of a theme takes the click: its picture and its name.
         Control::Scheme(_) => (row.x, row.y, row.x + TILE_W, row.y + THEME_H),
         Control::Autostart => (right - 40.0, cy - 11.0, right, cy + 11.0),
-        // The button that opens the dialog.
-        Control::Video => (right - 108.0, cy - 13.0, right, cy + 13.0),
+        // The button that opens the dialog; those that hand Windows a theme.
+        Control::Video | Control::WinTheme | Control::WinBack => (right - 108.0, cy - 13.0, right, cy + 13.0),
         // The two buttons are as wide as the list of tabs they stand under.
         Control::Reset | Control::OpenFile => (row.x + SIDE_PAD, row.y, row.x + SIDE_W - SIDE_PAD, row.y + BUTTON_H),
         Control::Header(_) | Control::Story => (0.0, 0.0, 0.0, 0.0),
@@ -607,6 +626,29 @@ impl State {
                 Control::Video => {
                     if inside(area, x, y) {
                         pick_video(self.hwnd);
+                        return;
+                    }
+                }
+                Control::WinTheme => {
+                    if inside(area, x, y) {
+                        // Windows takes a theme by having its file opened, and then shows it
+                        // among its own themes.
+                        let name = themes().get(self.cfg.scheme.round() as usize).copied().unwrap_or("");
+                        if let Some(path) = wintheme::make(name, &self.cfg) {
+                            crate::shell::launch_soon(&path.to_string_lossy());
+                        }
+                        // (The theme Windows had has been kept: the row under this one says so.)
+                        unsafe {
+                            let _ = InvalidateRect(Some(self.hwnd), None, false);
+                        }
+                        return;
+                    }
+                }
+                Control::WinBack => {
+                    if inside(area, x, y) {
+                        if wintheme::before().exists() {
+                            crate::shell::launch_soon(&wintheme::before().to_string_lossy());
+                        }
                         return;
                     }
                 }
@@ -840,7 +882,14 @@ impl State {
                                 t.FillEllipse(&circle(thumb_x, cy, if grabbed { 4.0 } else { 5.0 }), brush);
                                 write(&p.format(value), &self.text_right, (area.2, row.y, area.2 + VALUE_W, row.y + ROW_H), &dim);
                             }
-                            Kind::Toggle => switch(area, value >= 0.5),
+                            Kind::Toggle => {
+                                // (The glass of File Explorer needs ExplorerBlurMica; say so
+                                // where it is not installed, so the switch is not a dead end.)
+                                if p.key == "explorer_glass" && !self.blur_installed {
+                                    write("Cần cài ExplorerBlurMica", &self.text_right, (row.x + MARGIN, row.y, area.0 - 8.0, row.y + ROW_H), &dim);
+                                }
+                                switch(area, value >= 0.5);
+                            }
                             Kind::Choice(names) => {
                                 brush.SetColor(&track);
                                 t.FillRoundedRectangle(&round(area, 7.0), brush);
@@ -866,6 +915,19 @@ impl State {
                         brush.SetColor(&track);
                         t.FillRoundedRectangle(&round(area, 6.0), brush);
                         write("Chọn video…", &self.text_center, area, &fg);
+                    }
+                    Control::WinTheme | Control::WinBack => {
+                        // A button that has nothing to hand over stands back: no theme of the
+                        // app's own is in use, or nothing has been kept from before.
+                        let (label, button, ready) = if row.control == Control::WinTheme {
+                            ("Màu nhấn, sáng / tối của Windows", "Áp dụng…", theme::Scheme::of(&self.cfg).accent.is_some())
+                        } else {
+                            ("Windows như trước khi áp dụng", "Trả lại…", wintheme::before().exists())
+                        };
+                        write(label, &self.text, label_area, &fg);
+                        brush.SetColor(&track);
+                        t.FillRoundedRectangle(&round(area, 6.0), brush);
+                        write(button, &self.text_center, area, if ready { &fg } else { &dim });
                     }
                     Control::Autostart => {
                         write("Khởi động cùng Windows", &self.text, label_area, &fg);
@@ -1163,6 +1225,25 @@ mod tests {
         assert_eq!(STORIES.len(), theme::SCHEMES.len());
         let story = rows.iter().find(|row| row.control == Control::Story).expect("the line");
         assert!(pictures.iter().all(|picture| picture.y + THEME_H <= story.y) && story.y + ROW_H <= height);
+    }
+
+    #[test]
+    fn under_the_gallery_are_the_ways_windows_is_made_to_match() {
+        let (rows, height) = tab_rows(0);
+        let at = |wanted: &dyn Fn(&Row) -> bool| rows.iter().position(|row| wanted(row)).expect("the row");
+        let key = |row: &Row, key: &str| matches!(row.control, Control::Param(index) if PARAMS[index].key == key);
+        // In this order: the line about the theme, a heading, the three switches, the two buttons.
+        let order = [at(&|row| row.control == Control::Story), at(&|row| matches!(row.control, Control::Header("Đồng bộ Windows"))), at(&|row| key(row, "frame_borders")), at(&|row| key(row, "frame_titles")), at(&|row| key(row, "explorer_glass")), at(&|row| row.control == Control::WinTheme), at(&|row| row.control == Control::WinBack)];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+        assert!(order.windows(2).all(|pair| rows[pair[0]].y < rows[pair[1]].y));
+        assert!(rows[order[6]].y + ROW_H <= height);
+        // Each button once, at the end of its row.
+        for control in [Control::WinTheme, Control::WinBack] {
+            assert_eq!((0..TABS.len()).flat_map(|tab| tab_rows(tab).0).filter(|row| row.control == control).count(), 1);
+            let row = &rows[at(&|row| row.control == control)];
+            let button = control_rect(row, control);
+            assert!(button.0 > row.x + COLUMN_W * 0.5 && button.2 <= row.x + COLUMN_W - MARGIN + 0.01 && button.1 >= row.y && button.3 <= row.y + ROW_H);
+        }
     }
 
     #[test]
