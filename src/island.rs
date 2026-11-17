@@ -1939,7 +1939,8 @@ mod tests {
     /// look at. Nothing shows on the real screens and nothing takes the focus.
     /// Run by hand: cargo test --profile quick the_island_for_looking_at -- --ignored
     /// (BEN_OUT: the folder for the pictures. BEN_APPS: a file naming a program on each
-    /// line, whose icons are shown. BEN_LIGHT=1 for the light look.)
+    /// line, whose icons are shown. BEN_LIGHT=1 for the light look, BEN_SCHEME for one of the
+    /// app's own themes.)
     #[test]
     #[ignore]
     fn the_island_for_looking_at() {
@@ -1953,6 +1954,10 @@ mod tests {
         let scene = Scene::new(&gfx).expect("a compositor");
         let mut cfg = Config::default();
         cfg.theme = if std::env::var("BEN_LIGHT").is_ok() { 2.0 } else { 1.0 };
+        // (BEN_SCHEME: one of the app's own themes, as it is when it has just been chosen.)
+        if let Some(scheme) = std::env::var("BEN_SCHEME").ok().and_then(|v| v.parse().ok()) {
+            theme::choose(scheme, &mut cfg);
+        }
         let theme = theme::build(&cfg, true, (0.0, 0.47, 0.84), 1.0);
         let motion = Motion::new(1.0, 0.5, false);
         let rect = RECT { left: -8000, top: 0, right: -8000 + 1920, bottom: 1080 };

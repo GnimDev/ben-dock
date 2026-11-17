@@ -18,9 +18,12 @@ pub struct Config {
     pub tint_opacity: f32,
     /// Blur of what is behind the glass. 0 = no blur.
     pub blur_radius: f32,
-    /// How much of the Windows accent colour the glass takes on.
+    /// How much of the accent colour the glass takes on.
     pub accent_tint: f32,
     pub shadow: bool,
+    /// The set of colours: 0 = Windows' accent colour on plain glass, 1 and up = one of the
+    /// app's own (see `theme::SCHEMES`).
+    pub scheme: f32,
 
     // Dock (logical pixels, multiplied by the display scale)
     pub icon_size: f32,
@@ -110,7 +113,8 @@ pub struct Config {
     pub widget_progress: bool,
 
     // The live wallpaper
-    /// 0 = off (the desktop's own picture), 1 = dark water, 2 = blue water, 3 = a video.
+    /// 0 = off (the desktop's own picture), 1 = dark water, 2 = bright water (both in the
+    /// colours of the theme), 3 = a video.
     pub wallpaper: f32,
     pub wallpaper_cursor: bool,
     pub wallpaper_music: bool,
@@ -132,6 +136,7 @@ impl Default for Config {
             blur_radius: 26.0,
             accent_tint: 0.10,
             shadow: true,
+            scheme: 0.0,
             icon_size: 46.0,
             gap: 8.0,
             padding: 9.0,
@@ -254,11 +259,12 @@ const fn n(min: f32, max: f32, step: f32) -> Kind {
 }
 
 pub const PARAMS: &[Param] = &[
+    param!("scheme", "Theme", "Theme", "Bộ màu của Bến: 0 = theo màu nhấn của Windows, 1 = Bến nước, 2 = Bình minh, 3 = Hoàng hôn, 4 = Rừng tràm, 5 = Sương sớm, 6 = Đèn lồng, 7 = Giấy dó, 8 = Đầm sen. Mỗi bộ có màu nhấn, màu kính và màu nước của hình nền riêng. Chọn trong cửa sổ Cài đặt thì chất liệu, sáng / tối, độ đục, độ nhoè, nhuộm màu nhấn và độ bo góc của dock cũng được đặt theo bộ đó (sau đó vẫn chỉnh riêng từng thứ được); sửa số này trong file thì chỉ đổi màu", Kind::Choice(&["Theo Windows", "Bến nước", "Bình minh", "Hoàng hôn", "Rừng tràm", "Sương sớm", "Đèn lồng", "Giấy dó", "Đầm sen"]), true, num!(scheme)),
     param!("style", "Giao diện", "Chất liệu", "Chất liệu của các bề mặt: 0 = kính lỏng (trong, viền sáng), 1 = sương mờ (đục hơn, dễ đọc hơn), 2 = mực (kính đen như đảo của iPhone), 3 = đặc (không làm nhoè phía sau, nhẹ máy nhất)", Kind::Choice(&["Kính lỏng", "Sương mờ", "Mực", "Đặc"]), true, num!(style)),
     param!("theme", "Giao diện", "Sáng / tối", "Sáng hay tối: 0 = theo Windows, 1 = tối, 2 = sáng", Kind::Choice(&["Theo Windows", "Tối", "Sáng"]), true, num!(theme)),
     param!("tint_opacity", "Giao diện", "Độ đục của kính", "Độ đục của kính: 0 = trong nhất, 1 = đục nhất", n(0.0, 1.0, 0.01), true, num!(tint_opacity)),
     param!("blur_radius", "Giao diện", "Độ nhoè phía sau", "Kính làm nhoè những gì nằm sau nó bao nhiêu (0 = không nhoè)", n(0.0, 60.0, 1.0), true, num!(blur_radius)),
-    param!("accent_tint", "Giao diện", "Nhuộm màu nhấn", "Kính ngả sang màu nhấn của Windows bao nhiêu: 0 = không, 1 = nhiều nhất", n(0.0, 1.0, 0.01), true, num!(accent_tint)),
+    param!("accent_tint", "Giao diện", "Nhuộm màu nhấn", "Kính ngả sang màu nhấn (của theme, hoặc của Windows khi không chọn theme) bao nhiêu: 0 = không, 1 = nhiều nhất", n(0.0, 1.0, 0.01), true, num!(accent_tint)),
     param!("shadow", "Giao diện", "Đổ bóng", "Bóng mềm dưới các bề mặt", Kind::Toggle, true, flag!(shadow)),
     param!("anim_speed", "Chuyển động", "Tốc độ", "Tốc độ của mọi chuyển động. 1.0 = mặc định", n(0.5, 2.0, 0.05), true, num!(anim_speed)),
     param!("elastic", "Chuyển động", "Độ đàn hồi", "Mọi thứ nảy và co giãn nhiều hay ít: 0 = dừng êm không nảy, 1 = nảy nhiều nhất", n(0.0, 1.0, 0.05), true, num!(elastic)),
@@ -318,7 +324,7 @@ pub const PARAMS: &[Param] = &[
     param!("widget_progress", "Widget", "Tiến độ thời gian", "Widget tiến độ: hôm nay, tuần này, tháng này và năm nay đã trôi qua bao nhiêu phần trăm, vẽ thành bốn vòng tròn lồng nhau", Kind::Toggle, true, flag!(widget_progress)),
     param!("focus_minutes", "Hẹn giờ tập trung", "Số phút tập trung", "Một lượt tập trung dài mấy phút", n(5.0, 90.0, 5.0), true, num!(focus_minutes)),
     param!("break_minutes", "Hẹn giờ tập trung", "Số phút nghỉ", "Nghỉ mấy phút sau mỗi lượt tập trung", n(1.0, 30.0, 1.0), true, num!(break_minutes)),
-    param!("wallpaper", "Hình nền", "Hình nền động", "Hình nền động thay cho ảnh nền của Windows: 0 = tắt (giữ ảnh nền của Windows), 1 = nước tối, 2 = nước xanh, 3 = video. Video là file ghi trong video.txt cạnh ben.exe (một dòng: đường dẫn đầy đủ), chọn bằng nút \"Chọn video\" trong cửa sổ Cài đặt; nó phát không tiếng, lặp lại mãi, và đứng yên khi màn hình nền bị che hết hoặc máy đang khoá. Ảnh nền của Windows không bị đổi: tắt đi là thấy lại", Kind::Choice(&["Tắt", "Nước tối", "Nước xanh", "Video"]), true, num!(wallpaper)),
+    param!("wallpaper", "Hình nền", "Hình nền động", "Hình nền động thay cho ảnh nền của Windows: 0 = tắt (giữ ảnh nền của Windows), 1 = nước tối, 2 = nước sáng, 3 = video. Nước có màu theo theme (không chọn theme: hồ nước ban đêm và biển xanh). Video là file ghi trong video.txt cạnh ben.exe (một dòng: đường dẫn đầy đủ), chọn bằng nút \"Chọn video\" trong cửa sổ Cài đặt; nó phát không tiếng, lặp lại mãi, và đứng yên khi màn hình nền bị che hết hoặc máy đang khoá. Ảnh nền của Windows không bị đổi: tắt đi là thấy lại", Kind::Choice(&["Tắt", "Nước tối", "Nước sáng", "Video"]), true, num!(wallpaper)),
     param!("wallpaper_cursor", "Hình nền", "Gợn sóng theo chuột", "Con trỏ lướt trên màn hình nền để lại gợn sóng, bấm chuột làm vòng sóng toả ra (trên mặt nước cũng như trên video)", Kind::Toggle, true, flag!(wallpaper_cursor)),
     param!("wallpaper_music", "Hình nền", "Gợn sóng theo nhạc", "Khi máy đang phát nhạc, mỗi nhịp mạnh làm một giọt rơi xuống mặt nước. Bến chỉ hỏi Windows mức âm lượng đang phát, không thu âm", Kind::Toggle, true, flag!(wallpaper_music)),
     param!("wallpaper_strength", "Hình nền", "Độ mạnh của sóng", "Sóng mạnh hay nhẹ. 1.0 = mặc định", n(0.3, 2.0, 0.05), true, num!(wallpaper_strength)),

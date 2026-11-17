@@ -8,6 +8,10 @@
 //! The widgets are not rows. Their tab is a library: a tile for each, with a
 //! small picture of it (painted by `widget::emblem`), its name and its switch.
 //!
+//! Nor are the themes: the first tab shows a picture of each of the app's own
+//! sets of colours (painted by `theme::swatch`), and a click on one puts it to
+//! use, with the glass it was made for (see `theme::choose`).
+//!
 //! One setting is not a number: which video the wallpaper plays. It has a row
 //! of its own with a button that opens Windows' dialog for choosing a file.
 
@@ -15,6 +19,7 @@ use crate::config::{self, Config, Kind, PARAMS};
 use crate::app::{self, Event};
 use crate::gfx::{color, rect};
 use crate::system;
+use crate::theme;
 use crate::util::wide;
 use crate::wallpaper;
 use crate::widget;
@@ -65,6 +70,9 @@ const TILE_H: f32 = 126.0;
 const TILE_GAP: f32 = 12.0;
 const TILES_ACROSS: usize = 3;
 const EMBLEM: f32 = 60.0;
+/// A theme in the gallery: as wide as a widget's tile, its picture (`theme::SWATCH`) with
+/// its name under it. How tall the two are together.
+const THEME_H: f32 = theme::SWATCH.1 + 28.0;
 
 /// One tab: its name, its symbol in Windows' icon font, the groups of settings
 /// (`Param::section`) it shows, in this order, and a few words that stand at the end of its
@@ -76,7 +84,8 @@ struct Tab {
     hint: &'static str,
 }
 
-const TABS: [Tab; 7] = [
+const TABS: [Tab; 8] = [
+    Tab { name: "Theme", glyph: 0xE790, sections: &["Theme"], hint: "Chọn rồi tinh chỉnh ở Giao diện" },
     Tab { name: "Giao diện", glyph: 0xE771, sections: &["Giao diện", "Chuyển động"], hint: "" },
     Tab { name: "Dock", glyph: 0xE90E, sections: &["Dock"], hint: "" },
     Tab { name: "Đảo và bốn góc", glyph: 0xECA5, sections: &["Đảo động", "Bốn góc"], hint: "" },
@@ -93,6 +102,29 @@ fn widget_of(key: &str) -> Option<widget::Kind> {
     widget::Kind::ALL.into_iter().find(|kind| kind.name() == name)
 }
 
+/// The names of the app's own sets of colours, in their order: the choices of the setting
+/// "scheme". They are shown as pictures in a gallery, not as a row.
+fn themes() -> &'static [&'static str] {
+    match PARAMS.iter().find(|p| p.key == "scheme").map(|p| p.kind) {
+        Some(Kind::Choice(names)) => names,
+        _ => &[],
+    }
+}
+
+/// A few words about each of them, in the same order: they stand under the gallery for the
+/// one in use.
+const STORIES: [&str; 9] = [
+    "Kính trơn, màu nhấn lấy từ Windows.",
+    "Xanh của logo trên kính sẫm màu nước sâu.",
+    "Nắng cam đầu ngày trên kính màu kem.",
+    "Tím trên sông lúc chiều tà, nước còn giữ chút nắng ấm.",
+    "Xanh ngọc dưới tán rừng ngập nước, kính sương mờ.",
+    "Xám lục trên kính trắng lạnh, mọi thứ phía sau dịu đi.",
+    "Đỏ đèn lồng trên kính đen viền vàng, sông đêm phố cổ.",
+    "Mực chàm trên giấy: không nhoè, góc vuông vức.",
+    "Hồng cánh sen trên màu xanh thẫm của nước đầm.",
+];
+
 /// The tab a group of settings is shown on. A group no tab names goes on the last one, so
 /// that a new setting can never be left out of the window.
 fn tab_of(section: &str) -> usize {
@@ -105,6 +137,10 @@ enum Control {
     Param(usize),
     /// A widget's tile in the library; the index of its switch in `PARAMS`.
     Tile(usize),
+    /// A theme in the gallery: its place in `theme::SCHEMES`.
+    Scheme(usize),
+    /// A few words about the theme in use, under the gallery.
+    Story,
     /// Which video the wallpaper plays, and a button to choose another.
     Video,
     Header(&'static str),
@@ -135,6 +171,10 @@ struct State {
     /// The pictures of the widgets, in the order of `widget::Kind::ALL`; painted when first
     /// shown, in this window's own colours.
     emblems: Vec<ID2D1Bitmap>,
+    /// The accent colour they were painted in.
+    emblems_in: (f32, f32, f32),
+    /// The pictures of the themes, in the order of `theme::SCHEMES`; painted when first shown.
+    swatches: Vec<ID2D1Bitmap>,
     /// The video the wallpaper plays, if one has been chosen.
     video: Option<String>,
     cfg: Config,
@@ -143,6 +183,7 @@ struct State {
     rows: Vec<Row>,
     scale: f32,
     dark: bool,
+    /// The accent colour Windows has (the theme in use may have one of its own).
     accent: (f32, f32, f32),
     /// Slider being dragged.
     drag: Option<usize>,
@@ -187,6 +228,18 @@ fn tab_rows(tab: usize) -> (Vec<Row>, f32) {
             if !std::mem::replace(&mut headed, true) {
                 rows.push(Row { control: Control::Header(p.section), x, y });
                 y += HEADER_H;
+            }
+            if p.key == "scheme" {
+                // The gallery: a picture of each theme, side by side like the tiles.
+                let lines = themes().len().div_ceil(TILES_ACROSS);
+                for theme in 0..themes().len() {
+                    let (across, down) = (theme % TILES_ACROSS, theme / TILES_ACROSS);
+                    rows.push(Row { control: Control::Scheme(theme), x: x + MARGIN + across as f32 * (TILE_W + TILE_GAP), y: y + 4.0 + down as f32 * (THEME_H + TILE_GAP) });
+                }
+                y += 4.0 + lines as f32 * (THEME_H + TILE_GAP);
+                rows.push(Row { control: Control::Story, x, y });
+                y += ROW_H;
+                continue;
             }
             if widget_of(p.key).is_some() {
                 if tiles == TILES_ACROSS {
@@ -393,6 +446,8 @@ fn create(cfg: &Config) -> Result<()> {
                 format
             },
             emblems: Vec::new(),
+            emblems_in: (0.0, 0.0, 0.0),
+            swatches: Vec::new(),
             video: wallpaper::video_path(),
             cfg: cfg.clone(),
             tab,
@@ -435,12 +490,14 @@ fn control_rect(row: &Row, control: Control) -> (f32, f32, f32, f32) {
         },
         // A tile's switch is in the middle of its foot.
         Control::Tile(_) => (row.x + TILE_W * 0.5 - 20.0, row.y + TILE_H - 32.0, row.x + TILE_W * 0.5 + 20.0, row.y + TILE_H - 10.0),
+        // All of a theme takes the click: its picture and its name.
+        Control::Scheme(_) => (row.x, row.y, row.x + TILE_W, row.y + THEME_H),
         Control::Autostart => (right - 40.0, cy - 11.0, right, cy + 11.0),
         // The button that opens the dialog.
         Control::Video => (right - 108.0, cy - 13.0, right, cy + 13.0),
         // The two buttons are as wide as the list of tabs they stand under.
         Control::Reset | Control::OpenFile => (row.x + SIDE_PAD, row.y, row.x + SIDE_W - SIDE_PAD, row.y + BUTTON_H),
-        Control::Header(_) => (0.0, 0.0, 0.0, 0.0),
+        Control::Header(_) | Control::Story => (0.0, 0.0, 0.0, 0.0),
     }
 }
 
@@ -540,6 +597,13 @@ impl State {
                         return;
                     }
                 }
+                Control::Scheme(index) => {
+                    if inside(area, x, y) {
+                        theme::choose(index, &mut self.cfg);
+                        self.changed(true);
+                        return;
+                    }
+                }
                 Control::Video => {
                     if inside(area, x, y) {
                         pick_video(self.hwnd);
@@ -569,7 +633,7 @@ impl State {
                         return;
                     }
                 }
-                Control::Header(_) => {}
+                Control::Header(_) | Control::Story => {}
             }
         }
     }
@@ -608,7 +672,8 @@ impl State {
     fn paint(&mut self) {
         let s = self.scale;
         let dark = self.dark;
-        let (ar, ag, ab) = self.accent;
+        // (The accent colour of the theme in use, as everywhere else in the app.)
+        let (ar, ag, ab) = theme::accent(&self.cfg, self.accent);
         let bg = if dark { color(0.125, 0.125, 0.135, 1.0) } else { color(0.955, 0.955, 0.965, 1.0) };
         let fg = if dark { color(1.0, 1.0, 1.0, 0.92) } else { color(0.0, 0.0, 0.0, 0.88) };
         let dim = if dark { color(1.0, 1.0, 1.0, 0.56) } else { color(0.0, 0.0, 0.0, 0.56) };
@@ -619,11 +684,26 @@ impl State {
         let accent = color(ar, ag, ab, 1.0);
         let knob = color(1.0, 1.0, 1.0, 1.0);
 
-        if self.emblems.is_empty() {
-            // The pictures of the widgets, painted once, in this window's own colours.
-            let palette = widget::Palette::plain(self.accent, [fg.r, fg.g, fg.b, fg.a], [track.r, track.g, track.b, track.a]);
+        let props = D2D1_BITMAP_PROPERTIES { pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED }, dpiX: 96.0, dpiY: 96.0 };
+        if self.swatches.is_empty() {
+            // The pictures of the themes, painted once.
+            let made: Result<Vec<ID2D1Bitmap>> = (0..theme::SCHEMES.len())
+                .map(|index| {
+                    let canvas = theme::swatch(index, s, dark, self.accent);
+                    unsafe { self.target.CreateBitmap(D2D_SIZE_U { width: canvas.w, height: canvas.h }, Some(canvas.bgra.as_ptr() as *const _), canvas.w * 4, &props) }
+                })
+                .collect();
+            match made {
+                Ok(swatches) => self.swatches = swatches,
+                Err(e) => crate::log!("the themes' pictures could not be made: {e}"),
+            }
+        }
+        if self.emblems.is_empty() || self.emblems_in != (ar, ag, ab) {
+            // The pictures of the widgets, in this window's own colours; painted again when
+            // another theme brings another accent colour.
+            self.emblems_in = (ar, ag, ab);
+            let palette = widget::Palette::plain((ar, ag, ab), [fg.r, fg.g, fg.b, fg.a], [track.r, track.g, track.b, track.a]);
             let size = (EMBLEM * s).round().max(1.0) as u32;
-            let props = D2D1_BITMAP_PROPERTIES { pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED }, dpiX: 96.0, dpiY: 96.0 };
             let made: Result<Vec<ID2D1Bitmap>> = widget::Kind::ALL
                 .into_iter()
                 .map(|kind| {
@@ -722,6 +802,23 @@ impl State {
                         }
                         write(p.label, &self.text_center, (row.x + 4.0, row.y + 72.0, row.x + TILE_W - 4.0, row.y + 92.0), if on { &fg } else { &dim });
                         switch(area, on);
+                    }
+                    Control::Scheme(index) => {
+                        let picked = self.cfg.scheme.round() as usize == index;
+                        let picture = (row.x, row.y, row.x + theme::SWATCH.0, row.y + theme::SWATCH.1);
+                        if let Some(swatch) = self.swatches.get(index) {
+                            t.DrawBitmap(swatch, Some(&px(picture)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        }
+                        if picked {
+                            // The one in use: a ring of its accent colour, a little way off.
+                            brush.SetColor(&accent);
+                            t.DrawRoundedRectangle(&round((picture.0 - 3.0, picture.1 - 3.0, picture.2 + 3.0, picture.3 + 3.0), 13.0), brush, 2.0 * s, None);
+                        }
+                        write(themes().get(index).copied().unwrap_or(""), &self.text_center, (area.0, picture.3 + 5.0, area.2, area.3), if picked { &fg } else { &dim });
+                    }
+                    Control::Story => {
+                        let about = STORIES.get(self.cfg.scheme.round() as usize).copied().unwrap_or("");
+                        write(about, &self.text, label_area, &dim);
                     }
                     Control::Param(index) => {
                         let p = &PARAMS[index];
@@ -945,6 +1042,31 @@ mod tests {
                 saved += 1;
             }
         }
+        // A click on a theme of the gallery takes it, with the glass it was made for; the
+        // window then wears that theme's accent colour (picked.bmp).
+        let Some(out) = out else { return };
+        with_state(|state| {
+            state.show_tab(0);
+            let row = state.rows.iter().find(|row| row.control == Control::Scheme(4)).copied().expect("the theme");
+            state.mouse_down(row.x + 20.0, row.y + 20.0);
+            assert_eq!((state.cfg.scheme, state.cfg.style, state.cfg.corner_radius), (4.0, 1.0, 38.0));
+        });
+        let clicked = std::time::Instant::now();
+        while clicked.elapsed().as_secs_f32() < 0.3 {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut frame = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut frame);
+        }
+        let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+        let pixels = unsafe { crate::camera::print(hwnd, w, h) }.expect("a picture of the window");
+        crate::camera::save_picture(&out.join("picked.bmp"), w, h, &pixels);
     }
 
     #[test]
@@ -957,10 +1079,12 @@ mod tests {
             for row in rows {
                 match row.control {
                     Control::Param(index) | Control::Tile(index) => shown[index] += 1,
+                    // (The themes stand for one setting together.)
+                    Control::Scheme(0) => shown[PARAMS.iter().position(|p| p.key == "scheme").unwrap()] += 1,
                     Control::Autostart => autostart += 1,
                     _ => {}
                 }
-                if !matches!(row.control, Control::Tile(_)) {
+                if !matches!(row.control, Control::Tile(_) | Control::Scheme(_)) {
                     assert_eq!(row.x, SIDE_W);
                 }
             }
@@ -977,7 +1101,7 @@ mod tests {
             assert!(TABS.iter().any(|tab| tab.sections.contains(&p.section)), "no tab names the group '{}'", p.section);
         }
         for tab in 0..TABS.len() {
-            assert!(tab_rows(tab).0.iter().any(|row| matches!(row.control, Control::Param(_) | Control::Tile(_))), "tab '{}' is empty", TABS[tab].name);
+            assert!(tab_rows(tab).0.iter().any(|row| matches!(row.control, Control::Param(_) | Control::Tile(_) | Control::Scheme(_))), "tab '{}' is empty", TABS[tab].name);
             // A tab starts with the heading of its first group.
             assert!(matches!(tab_rows(tab).0[0].control, Control::Header(_)));
         }
@@ -1012,6 +1136,33 @@ mod tests {
         for row in tab_rows(library).0.iter().filter(|row| matches!(row.control, Control::Param(_))) {
             assert!(row.y >= lowest, "a row at {} on the tiles", row.y);
         }
+    }
+
+    #[test]
+    fn every_theme_has_a_picture_in_the_gallery_and_a_click_on_it_takes_it() {
+        let gallery = TABS.iter().position(|tab| tab.sections.contains(&"Theme")).unwrap();
+        // The window opens on it.
+        assert_eq!(gallery, 0);
+        let (rows, height) = tab_rows(gallery);
+        let pictures: Vec<&Row> = rows.iter().filter(|row| matches!(row.control, Control::Scheme(_))).collect();
+        assert_eq!(pictures.len(), theme::SCHEMES.len());
+        assert_eq!(themes().len(), theme::SCHEMES.len());
+        for (index, a) in pictures.iter().enumerate() {
+            assert!(a.control == Control::Scheme(index));
+            // Inside the column and the window, under the heading, clear of the others.
+            assert!(a.x >= SIDE_W + MARGIN && a.x + theme::SWATCH.0 <= SIDE_W + COLUMN_W - MARGIN + 0.01, "a theme at {}", a.x);
+            assert!(a.y >= rows[0].y + HEADER_H && a.y + THEME_H <= height);
+            for b in &pictures[..index] {
+                assert!(a.x + TILE_W <= b.x || b.x + TILE_W <= a.x || a.y + THEME_H <= b.y || b.y + THEME_H <= a.y, "two themes on each other");
+            }
+            // The whole of it takes the click.
+            assert_eq!(control_rect(a, a.control), (a.x, a.y, a.x + TILE_W, a.y + THEME_H));
+        }
+        assert_eq!(theme::SWATCH.0, TILE_W);
+        // A few words about each, and under the gallery a line for those of the one in use.
+        assert_eq!(STORIES.len(), theme::SCHEMES.len());
+        let story = rows.iter().find(|row| row.control == Control::Story).expect("the line");
+        assert!(pictures.iter().all(|picture| picture.y + THEME_H <= story.y) && story.y + ROW_H <= height);
     }
 
     #[test]

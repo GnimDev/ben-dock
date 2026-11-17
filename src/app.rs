@@ -1336,7 +1336,9 @@ impl App {
         let look = self.cfg.wallpaper.round() as u32;
         // (A video: the file that was chosen. Another one chosen, and it is made again too.)
         let video = if look == wallpaper::VIDEO { wallpaper::video_path() } else { None };
-        if self.wallpaper.as_ref().map(|wallpaper| wallpaper.look() != look || wallpaper.video() != video.as_deref() || !wallpaper.fits()).unwrap_or(false) {
+        // (Water: in the colours of the theme. Another theme, and it is made again too.)
+        let water = (look != wallpaper::VIDEO).then(|| *theme::water(&self.cfg, look == 2));
+        if self.wallpaper.as_ref().map(|wallpaper| wallpaper.look() != look || wallpaper.colours() != water || wallpaper.video() != video.as_deref() || !wallpaper.fits()).unwrap_or(false) {
             self.wallpaper = None;
         }
         if look != 0 && self.wallpaper.is_none() {

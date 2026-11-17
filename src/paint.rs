@@ -155,6 +155,20 @@ impl Canvas {
         });
     }
 
+    /// A rounded sheet, its colour running from `top` to `bottom` down it.
+    pub fn sheet(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, top: Rgba, bottom: Rgba) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let radius = radius.min(w * 0.5).min(h * 0.5);
+        let (mx, my) = (x + w * 0.5, y + h * 0.5);
+        self.each(x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0, |px, py| {
+            let (dx, dy) = ((px - mx).abs() - (w * 0.5 - radius), (py - my).abs() - (h * 0.5 - radius));
+            let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - radius;
+            (mix(top, bottom, (py - y) / h), 0.5 - outside)
+        });
+    }
+
     /// A straight line with round ends.
     pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, thick: f32, color: Rgba) {
         let half = thick * 0.5;

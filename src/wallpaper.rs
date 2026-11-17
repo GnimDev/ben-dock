@@ -1,6 +1,7 @@
 //! The live wallpaper: water, seen from above, in place of the desktop's picture.
 //!
-//! From the back: a colour that deepens towards the bottom; light playing on
+//! The water has the colours of the theme (see `theme::Water`): a dark one and
+//! a bright one. From the back: a colour that deepens towards the bottom; light playing on
 //! it, which is one small picture laid side by side with itself twice over,
 //! at two sizes, each sliding its own way (the compositor moves them, the app
 //! does nothing for it); and on top the rings (see `water.rs`), which are
@@ -29,6 +30,7 @@ use crate::desktop::{self, Behind};
 use crate::reel;
 use crate::scene::{rgba, Bead, Drift, Scene, Sprite, Stage};
 use crate::system;
+use crate::theme;
 use crate::util::{data_dir, wide};
 use crate::water::{self, Water};
 use std::path::PathBuf;
@@ -53,19 +55,6 @@ const CELL: f32 = 5.0;
 const MOST_CELLS: f32 = 170_000.0;
 /// Side of the picture of light, in its own pixels.
 const TILE: usize = 512;
-
-/// What the water is like: its colour at the top and at the bottom, the colour of the light
-/// that plays on it, and how strong each of the two layers of that light is.
-struct Look {
-    top: (f32, f32, f32),
-    bottom: (f32, f32, f32),
-    light: (f32, f32, f32),
-    layers: [f32; 2],
-}
-
-/// A pool at night, and the sea on a clear day.
-const DARK: Look = Look { top: (0.020, 0.043, 0.066), bottom: (0.008, 0.020, 0.034), light: (0.50, 0.78, 0.86), layers: [0.16, 0.11] };
-const BLUE: Look = Look { top: (0.035, 0.300, 0.540), bottom: (0.016, 0.140, 0.330), light: (0.72, 0.93, 1.00), layers: [0.30, 0.20] };
 
 /// The file that says which video to play: its first line is the video's full path.
 pub fn video_file() -> PathBuf {
@@ -218,8 +207,9 @@ pub struct Wallpaper {
     _light: Option<CompositionDrawingSurface>,
     water: Water,
     pixels: Vec<u8>,
-    /// Which water this is (the setting it was made for).
+    /// Which water this is (the setting it was made for), and its colours (none: a video).
     look: u32,
+    colours: Option<theme::Water>,
     /// The window's top-left corner on screen, its size, and the side of a cell, in pixels.
     origin: (i32, i32),
     size: (i32, i32),
@@ -311,7 +301,8 @@ impl Wallpaper {
 
     fn build(scene: &Scene, cfg: &Config, video: Option<String>, hwnd: HWND, thread: u32, behind: Behind, origin: (i32, i32), size: (i32, i32)) -> Result<Self> {
         let look_of = cfg.wallpaper.round() as u32;
-        let look = if look_of == 2 { &BLUE } else { &DARK };
+        // The water in the colours of the theme: the bright one, or the dark one.
+        let look = theme::water(cfg, look_of == 2);
         let (w, h) = (size.0 as f32, size.1 as f32);
         let stage = scene.stage(hwnd)?;
         let content = stage.content()?;
@@ -377,7 +368,7 @@ impl Wallpaper {
             }
             let _ = ShowWindow(hwnd, SW_SHOWNA);
         }
-        crate::log!("wallpaper: {}, {}x{} px in {}x{} cells, behind the icons of {:?}", ["", "dark water", "blue water", "a video"].get(look_of as usize).copied().unwrap_or("dark water"), size.0, size.1, cells_w, cells_h, behind.parent.0);
+        crate::log!("wallpaper: {}, {}x{} px in {}x{} cells, behind the icons of {:?}", ["", "dark water", "bright water", "a video"].get(look_of as usize).copied().unwrap_or("dark water"), size.0, size.1, cells_w, cells_h, behind.parent.0);
         Ok(Wallpaper {
             hwnd,
             thread,
@@ -392,6 +383,7 @@ impl Wallpaper {
             water,
             pixels,
             look: look_of,
+            colours: (look_of != VIDEO).then_some(*look),
             origin,
             size,
             cell,
@@ -412,6 +404,11 @@ impl Wallpaper {
     /// Which water this is (the value of the setting it was made for).
     pub fn look(&self) -> u32 {
         self.look
+    }
+
+    /// The colours of its water, if it is water.
+    pub fn colours(&self) -> Option<theme::Water> {
+        self.colours
     }
 
     /// The video it plays, if it is one.
@@ -735,8 +732,8 @@ mod tests {
     /// Not a check of anything: puts the wallpaper on the real desktop for a few seconds,
     /// drops a few things in and draws the cursor across it, so that it can be looked at.
     /// Run by hand: cargo test --release live_on_the_desktop -- --ignored
-    /// (BEN_WATER=2 for the blue water, BEN_SECONDS for how long. BEN_WATER=3 with
-    /// BEN_VIDEO naming a file for a video.)
+    /// (BEN_WATER=2 for the bright water, BEN_SCHEME for the colours of one of the themes,
+    /// BEN_SECONDS for how long. BEN_WATER=3 with BEN_VIDEO naming a file for a video.)
     #[test]
     #[ignore]
     fn live_on_the_desktop() {
@@ -748,6 +745,7 @@ mod tests {
         let scene = Scene::new(&gfx).expect("a compositor");
         let mut cfg = Config::default();
         cfg.wallpaper = number("BEN_WATER", 1.0);
+        cfg.scheme = number("BEN_SCHEME", 0.0);
         let mut wallpaper = Wallpaper::new(&scene, &cfg, std::env::var("BEN_VIDEO").ok()).expect("the wallpaper");
         assert!(wallpaper.fits());
         let (w, h) = (wallpaper.size.0 as f32, wallpaper.size.1 as f32);

@@ -1464,7 +1464,8 @@ mod tests {
     /// Not a check of anything: puts every widget on the real desktop for a few seconds,
     /// with made-up things to show, so that they can be looked at.
     /// Run by hand: cargo test --release widgets_on_the_desktop -- --ignored
-    /// (BEN_LIGHT=1 for the light look, BEN_SECONDS for how long, BEN_SCALE for a screen
+    /// (BEN_LIGHT=1 for the light look, BEN_SCHEME for one of the app's own themes, BEN_SECONDS
+    /// for how long, BEN_SCALE for a screen
     /// that is scaled. With BEN_OUT naming a folder, the widgets are put on a screen that is
     /// not there instead, and a picture of each is saved in that folder: nothing shows on
     /// the real screens. BEN_BACK=r,g,b, each 0 to 255, puts a colour behind each, as a
@@ -1477,6 +1478,10 @@ mod tests {
         let scene = Scene::new(&gfx).expect("a compositor");
         let mut cfg = Config::default();
         cfg.theme = if std::env::var("BEN_LIGHT").is_ok() { 2.0 } else { 1.0 };
+        // (BEN_SCHEME: one of the app's own themes, as it is when it has just been chosen.)
+        if let Some(scheme) = std::env::var("BEN_SCHEME").ok().and_then(|v| v.parse().ok()) {
+            theme::choose(scheme, &mut cfg);
+        }
         let theme = theme::build(&cfg, true, (0.0, 0.47, 0.84), 1.0);
         let motion = Motion::new(1.0, 0.5, false);
         let out = std::env::var("BEN_OUT").ok().map(std::path::PathBuf::from);
