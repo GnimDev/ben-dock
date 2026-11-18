@@ -445,6 +445,19 @@ thread_local! {
     static TRACKING: Cell<isize> = const { Cell::new(0) };
 }
 
+/// The cursor held against the screen's top edge this long, no further than `TOP_REACH`
+/// (logical pixels) from the screen's middle, peeks an island that is tucked away: it comes
+/// back as the time alone (see `App::update`). Brushing past on the way to a tab does nothing.
+pub const TOP_STAY: std::time::Duration = std::time::Duration::from_millis(150);
+const TOP_REACH: f32 = 110.0;
+
+/// True if the cursor is pushed against the screen's top edge where the island is. `cursor`,
+/// `ceiling` (the screen's top row) and `middle` (the screen's middle across) are in the same
+/// coordinates; `scale` is the display's.
+pub fn pushed_to_top(cursor: (f32, f32), ceiling: f32, middle: f32, scale: f32) -> bool {
+    cursor.1 >= ceiling && cursor.1 <= ceiling + 2.0 && (cursor.0 - middle).abs() <= TOP_REACH * scale
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let me = hwnd.0 as isize;
     let send = |input: Input| app::post(Event::Island(me, input));
@@ -1933,6 +1946,27 @@ mod tests {
     use super::*;
     use crate::theme;
     use std::time::Duration;
+
+    #[test]
+    fn the_cursor_peeks_only_when_pushed_against_the_top_near_the_middle() {
+        // A screen 1920 wide whose top row is 0, at 100 %.
+        let pushed = |x: f32, y: f32| pushed_to_top((x, y), 0.0, 960.0, 1.0);
+        assert!(pushed(960.0, 0.0) && pushed(960.0, 2.0));
+        // A few rows down is not against the edge: a tab can be reached for.
+        assert!(!pushed(960.0, 3.0) && !pushed(960.0, 20.0));
+        // As far as the island reaches to each side, and no further.
+        assert!(pushed(960.0 - TOP_REACH, 0.0) && pushed(960.0 + TOP_REACH, 1.0));
+        assert!(!pushed(960.0 - TOP_REACH - 1.0, 0.0) && !pushed(1900.0, 0.0) && !pushed(0.0, 0.0));
+        // On a screen that is scaled the reach is as many logical pixels.
+        assert!(pushed_to_top((1280.0 + TOP_REACH * 1.5, 0.0), 0.0, 1280.0, 1.5));
+        assert!(!pushed_to_top((1280.0 + TOP_REACH * 1.5 + 2.0, 0.0), 0.0, 1280.0, 1.5));
+        // The same in a window's own coordinates: the top row need not be 0, and a cursor
+        // above it is on another screen.
+        assert!(pushed_to_top((500.0, -1040.0), -1040.0, 500.0, 1.0));
+        assert!(!pushed_to_top((500.0, -1041.0), -1040.0, 500.0, 1.0));
+        // Long enough to tell a push from a brush, short enough to feel at once.
+        assert!(TOP_STAY >= Duration::from_millis(100) && TOP_STAY <= Duration::from_millis(300));
+    }
 
     /// Not a check of anything: opens an island on a screen that is not there, with apps
     /// running in the background on its first page, and saves pictures of its window to

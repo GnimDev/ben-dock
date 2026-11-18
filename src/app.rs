@@ -693,6 +693,9 @@ struct Screen {
     /// island stopped being shown whole (None: it is).
     dock_left: Option<Instant>,
     island_left: Option<Instant>,
+    /// Since when the cursor has been pushed against the top edge where the island is
+    /// (None: it is not there).
+    top_since: Option<Instant>,
     /// 0 = shown, 1 = out of view: the dock, the island, the corners beside the island and
     /// the corners beside the dock each.
     hide: Spring,
@@ -828,6 +831,8 @@ pub struct App {
     meter_sought: Instant,
     /// The timer that looks at the cursor and the sound for the wallpaper is running.
     polling: bool,
+    /// An island is tucked away on some screen: the top edge there is watched for the cursor.
+    watch_top: bool,
     /// When something tucked out of view is next due to change (a timer is set for it).
     tuck_due: Option<Instant>,
     hooks: Vec<HWINEVENTHOOK>,
@@ -954,6 +959,7 @@ impl App {
             meter: None,
             meter_sought: Instant::now(),
             polling: false,
+            watch_top: false,
             tuck_due: None,
             hooks: Vec::new(),
             winkey: None,
@@ -1069,7 +1075,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
         }
-        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), hot: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, hide, hide_island: hide, hide_corners_top: hide, hide_corners_bottom: hide })
+        Ok(Screen { monitor, theme, appbar, dock, island: None, corners: Vec::new(), hot: Vec::new(), bottom_line: monitor.rect.bottom, filled: false, covered: false, showing: false, auto: false, dock_left: None, island_left: None, top_since: None, hide, hide_island: hide, hide_corners_top: hide, hide_corners_bottom: hide })
     }
 
     /// Creates or removes the islands, the menus and the tray to match the settings.
@@ -1387,10 +1393,12 @@ impl App {
 
     /// Starts or stops the timer that looks at the cursor and the sound for the wallpaper,
     /// and at the sound for the widget that shows it. It runs while there is a wallpaper or
-    /// that widget, and a screen the desktop can be seen on.
+    /// that widget, and a screen the desktop can be seen on. It also runs while an island is
+    /// tucked away: no window of the app's is at the top edge then, so nothing else says
+    /// that the cursor has come there for it.
     fn poll_desktop(&mut self) {
         let sound = self.widgets.iter().any(|widget| widget.kind() == widget::Kind::Sound);
-        let wanted = (self.wallpaper.is_some() || sound) && self.desktop_seen();
+        let wanted = ((self.wallpaper.is_some() || sound) && self.desktop_seen()) || self.watch_top;
         if wanted != self.polling {
             self.polling = wanted;
             unsafe {
@@ -3383,6 +3391,8 @@ impl App {
             _ => ("☁ Thời tiết".to_string(), ""),
         };
         let (vital_text, vital_sub) = (format!("CPU {}%", self.vital.processor), format!("RAM {}%", self.vital.memory));
+        // (Whether the top edge of some screen has to be watched for the cursor.)
+        let mut watch_top = false;
         for (s, screen) in self.screens.iter_mut().enumerate() {
             let mut cursor = have_cursor.then(|| ((pt.x - screen.dock.win_x) as f32, (pt.y - screen.dock.win_y) as f32));
             if s == 0 && fake.is_some() {
@@ -3398,7 +3408,8 @@ impl App {
             // What does not stay is tucked away: the cursor at the bar on the bottom edge (or
             // on the dock, if that stayed) brings it back, the dock goes again two seconds
             // after the cursor has left, and the island stays eight seconds more as the time
-            // alone.
+            // alone. The cursor held against the top edge where the island is brings the
+            // island alone back, as the time alone, for those eight seconds.
             let (dock_stays, island_stays, top_stays, bottom_stays) = if screen.covered {
                 (self.cfg.show_when_maximized || self.cfg.reserve_dock, self.cfg.island_when_maximized || self.cfg.reserve_island, self.cfg.reserve_island, self.cfg.reserve_dock)
             } else {
@@ -3432,9 +3443,22 @@ impl App {
                 }
                 let dock_shown = screen.dock_left.is_none_or(|at| now.duration_since(at) < TUCK_DOCK);
                 let full = dock_shown || screen.island.as_ref().is_some_and(|island| island.engaged());
+                // Held against the top edge where the island is (not on the way past, and not
+                // with a window in tow): the island's time as the time alone starts over.
+                let peekable = !island_stays && screen.island.is_some();
+                watch_top |= peekable;
+                let middle = (screen.monitor.rect.left + screen.monitor.rect.right) as f32 * 0.5 - screen.dock.win_x as f32;
+                let ceiling = (screen.monitor.rect.top - screen.dock.win_y) as f32;
+                let pushed = peekable && cursor.is_some_and(|at| island::pushed_to_top(at, ceiling, middle, screen.monitor.scale())) && unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0;
+                if !pushed {
+                    screen.top_since = None;
+                } else if screen.top_since.is_none() {
+                    screen.top_since = Some(now);
+                }
+                let at_top = screen.top_since.is_some_and(|since| now.duration_since(since) >= island::TOP_STAY);
                 if full {
                     screen.island_left = None;
-                } else if screen.island_left.is_none() {
+                } else if at_top || screen.island_left.is_none() {
                     screen.island_left = Some(now);
                 }
                 let lingering = !full && screen.island_left.is_some_and(|at| now.duration_since(at) < TUCK_ISLAND);
@@ -3527,6 +3551,12 @@ impl App {
                     Err(e) => errors.push(e),
                 }
             }
+        }
+
+        // With an island tucked away somewhere, the top edge is watched for the cursor.
+        if watch_top != self.watch_top {
+            self.watch_top = watch_top;
+            self.poll_desktop();
         }
 
         // A timer rings when the soonest of the waits above is over.
